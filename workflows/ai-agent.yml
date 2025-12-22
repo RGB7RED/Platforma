@@ -1,0 +1,25 @@
+name: AI Agent – Issue Listener
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  acknowledge:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Acknowledge issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: "🟢 Задача принята. Агент начал обработку."
+            });
