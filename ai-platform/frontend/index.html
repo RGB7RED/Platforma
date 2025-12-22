@@ -1,1 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🤖 AI Collaboration Platform</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-content">
+                <div class="logo">
+                    <div class="logo-icon">🤖</div>
+                    <h1>AI Platform</h1>
+                </div>
+                <div class="user-info" id="userInfo">
+                    <!-- Заполняется JavaScript -->
+                </div>
+            </div>
+            <p class="app-subtitle">Collaborative AI Task Processing System</p>
+        </header>
 
+        <!-- Main Content -->
+        <main class="app-main">
+            <!-- Welcome Screen -->
+            <section class="welcome-screen" id="welcomeScreen">
+                <div class="welcome-card">
+                    <h2>Welcome to AI Collaboration Platform</h2>
+                    <p class="welcome-description">
+                        Describe your task and let AI agents work together to create a complete solution.
+                    </p>
+                    
+                    <div class="task-examples">
+                        <h3>Example Tasks:</h3>
+                        <ul class="examples-list">
+                            <li>Create a REST API for todo management with authentication</li>
+                            <li>Build a data analysis script for CSV files</li>
+                            <li>Design a React component library</li>
+                            <li>Create a FastAPI microservice with PostgreSQL</li>
+                        </ul>
+                    </div>
+
+                    <div class="welcome-actions">
+                        <button class="primary-btn start-task-btn" id="startTaskBtn">
+                            🚀 Start New Task
+                        </button>
+                        <button class="secondary-btn view-tasks-btn" id="viewTasksBtn">
+                            📋 View Previous Tasks
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Task Creation Form -->
+            <section class="task-creation hidden" id="taskCreation">
+                <div class="task-form-card">
+                    <h2>Create New Task</h2>
+                    
+                    <div class="form-group">
+                        <label for="taskDescription">Task Description</label>
+                        <textarea 
+                            id="taskDescription" 
+                            class="task-description-input"
+                            placeholder="Describe what you want to create...&#10;Be specific about requirements, technologies, and features."
+                            rows="5"
+                            maxlength="10000"></textarea>
+                        <div class="char-counter">
+                            <span id="charCount">0</span>/10000 characters
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="taskPriority">Priority</label>
+                        <select id="taskPriority" class="task-priority-select">
+                            <option value="normal">Normal</option>
+                            <option value="high">High</option>
+                            <option value="urgent">Urgent</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="codexVersion">Codex Version</label>
+                        <select id="codexVersion" class="codex-version-select">
+                            <option value="1.0.0-mvp">MVP v1.0.0</option>
+                            <option value="latest">Latest</option>
+                            <option value="custom">Custom</option>
+                        </select>
+                    </div>
+
+                    <div class="form-actions">
+                        <button class="secondary-btn cancel-btn" id="cancelTaskBtn">
+                            Cancel
+                        </button>
+                        <button class="primary-btn submit-task-btn" id="submitTaskBtn">
+                            Start AI Processing
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Task Progress -->
+            <section class="task-progress hidden" id="taskProgress">
+                <div class="progress-header">
+                    <h2>Task Progress</h2>
+                    <div class="task-id-display" id="taskIdDisplay">
+                        Task ID: <span id="currentTaskId">-</span>
+                    </div>
+                </div>
+
+                <!-- Progress Visualization -->
+                <div class="progress-visualization">
+                    <div class="progress-bar-container">
+                        <div class="progress-bar-labels">
+                            <span>Research</span>
+                            <span>Design</span>
+                            <span>Implementation</span>
+                            <span>Review</span>
+                            <span>Complete</span>
+                        </div>
+                        <div class="progress-bar-track">
+                            <div class="progress-bar-fill" id="progressBarFill"></div>
+                            <div class="progress-stages">
+                                <div class="stage-marker" data-stage="research"></div>
+                                <div class="stage-marker" data-stage="design"></div>
+                                <div class="stage-marker" data-stage="implementation"></div>
+                                <div class="stage-marker" data-stage="review"></div>
+                                <div class="stage-marker" data-stage="complete"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="progress-details">
+                        <div class="progress-percentage" id="progressPercentage">0%</div>
+                        <div class="progress-time" id="progressTime">Started: Just now</div>
+                    </div>
+                </div>
+
+                <!-- Real-time Updates -->
+                <div class="realtime-updates">
+                    <h3>Real-time Updates</h3>
+                    <div class="updates-container" id="updatesContainer">
+                        <!-- Updates will be added here -->
+                    </div>
+                </div>
+
+                <!-- Active AI Agents -->
+                <div class="active-agents">
+                    <h3>Active AI Agents</h3>
+                    <div class="agents-grid" id="agentsGrid">
+                        <!-- Agents will be added here -->
+                    </div>
+                </div>
+
+                <!-- Task Controls -->
+                <div class="task-controls">
+                    <button class="secondary-btn pause-btn" id="pauseTaskBtn">
+                        ⏸️ Pause
+                    </button>
+                    <button class="secondary-btn cancel-task-btn" id="cancelCurrentTaskBtn">
+                        ❌ Cancel
+                    </button>
+                    <button class="primary-btn refresh-btn" id="refreshProgressBtn">
+                        🔄 Refresh
+                    </button>
+                </div>
+            </section>
+
+            <!-- Task Results -->
+            <section class="task-results hidden" id="taskResults">
+                <div class="results-header">
+                    <h2>Task Results</h2>
+                    <div class="result-status" id="resultStatus">
+                        <span class="status-badge success">✓ Completed</span>
+                    </div>
+                </div>
+
+                <!-- Results Summary -->
+                <div class="results-summary">
+                    <div class="summary-card files-card">
+                        <div class="summary-icon">📁</div>
+                        <div class="summary-content">
+                            <h4>Files Generated</h4>
+                            <div class="summary-value" id="filesCount">0</div>
+                        </div>
+                    </div>
+
+                    <div class="summary-card artifacts-card">
+                        <div class="summary-icon">📋</div>
+                        <div class="summary-content">
+                            <h4>Artifacts Created</h4>
+                            <div class="summary-value" id="artifactsCount">0</div>
+                        </div>
+                    </div>
+
+                    <div class="summary-card time-card">
+                        <div class="summary-icon">⏱️</div>
+                        <div class="summary-content">
+                            <h4>Time Taken</h4>
+                            <div class="summary-value" id="timeTaken">0s</div>
+                        </div>
+                    </div>
+
+                    <div class="summary-card iterations-card">
+                        <div class="summary-icon">🔄</div>
+                        <div class="summary-content">
+                            <h4>Iterations</h4>
+                            <div class="summary-value" id="iterationsCount">0</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Generated Files -->
+                <div class="generated-files">
+                    <h3>Generated Files</h3>
+                    <div class="files-container">
+                        <div class="files-sidebar">
+                            <div class="file-categories" id="fileCategories">
+                                <!-- Categories will be added here -->
+                            </div>
+                        </div>
+                        <div class="files-content">
+                            <div class="file-list" id="fileList">
+                                <!-- Files will be added here -->
+                            </div>
+                            <div class="file-preview" id="filePreview">
+                                <div class="file-preview-header">
+                                    <h4 id="previewFileName">Select a file to preview</h4>
+                                    <button class="secondary-btn copy-btn" id="copyFileBtn" disabled>
+                                        📋 Copy
+                                    </button>
+                                </div>
+                                <pre class="file-content-preview" id="fileContentPreview">
+// Select a file to view its content
+                                </pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Download Options -->
+                <div class="download-options">
+                    <h3>Download Project</h3>
+                    <div class="download-buttons">
+                        <button class="primary-btn download-zip-btn" id="downloadZipBtn">
+                            📦 Download as ZIP
+                        </button>
+                        <button class="secondary-btn download-git-btn" id="downloadGitBtn">
+                            🐙 Export to Git
+                        </button>
+                        <button class="secondary-btn copy-project-btn" id="copyProjectBtn">
+                            📋 Copy to Clipboard
+                        </button>
+                    </div>
+                    <div class="download-info">
+                        <p>The ZIP file contains all generated files with proper structure.</p>
+                    </div>
+                </div>
+
+                <!-- New Task Button -->
+                <div class="new-task-section">
+                    <button class="primary-btn new-task-btn" id="newTaskFromResultsBtn">
+                        🚀 Start New Task
+                    </button>
+                </div>
+            </section>
+
+            <!-- Previous Tasks -->
+            <section class="previous-tasks hidden" id="previousTasks">
+                <div class="tasks-header">
+                    <h2>Previous Tasks</h2>
+                    <button class="secondary-btn back-to-main-btn" id="backToMainBtn">
+                        ← Back to Main
+                    </button>
+                </div>
+
+                <div class="tasks-list" id="tasksList">
+                    <!-- Tasks will be added here -->
+                </div>
+
+                <div class="tasks-empty" id="tasksEmpty">
+                    <div class="empty-state">
+                        <div class="empty-icon">📭</div>
+                        <h3>No Tasks Yet</h3>
+                        <p>Start your first task to see it here!</p>
+                        <button class="primary-btn start-first-task-btn" id="startFirstTaskBtn">
+                            Start First Task
+                        </button>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="app-footer">
+            <div class="footer-content">
+                <div class="footer-info">
+                    <p>AI Collaboration Platform v1.0.0 MVP</p>
+                    <p>Powered by Multi-Agent AI System</p>
+                </div>
+                <div class="footer-links">
+                    <a href="#" class="footer-link" id="feedbackLink">Feedback</a>
+                    <a href="#" class="footer-link" id="helpLink">Help</a>
+                    <a href="#" class="footer-link" id="aboutLink">About</a>
+                </div>
+            </div>
+        </footer>
+
+        <!-- Loading Overlay -->
+        <div class="loading-overlay hidden" id="loadingOverlay">
+            <div class="loading-content">
+                <div class="loading-spinner"></div>
+                <p id="loadingMessage">Processing your task...</p>
+                <p class="loading-subtext" id="loadingSubtext">
+                    AI agents are collaborating on your request
+                </p>
+            </div>
+        </div>
+
+        <!-- Notification Toast -->
+        <div class="notification-toast hidden" id="notificationToast">
+            <div class="toast-content">
+                <span class="toast-icon" id="toastIcon">ℹ️</span>
+                <span class="toast-message" id="toastMessage"></span>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
