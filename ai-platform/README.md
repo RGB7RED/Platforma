@@ -47,6 +47,15 @@ Required environment variables are documented in
 - Template: [`backend/.env.example`](backend/.env.example)
 - Reference: [`docs/ENV.md`](docs/ENV.md)
 
+## Container persistence v1 (read-only)
+
+When `DATABASE_URL` is configured, the backend stores container events, artifacts, and state in
+Postgres. Read-only endpoints:
+
+- `GET /api/tasks/{task_id}/events?limit=200&order=desc`
+- `GET /api/tasks/{task_id}/artifacts?type=&limit=200&order=desc`
+- `GET /api/tasks/{task_id}/state`
+
 ## Troubleshooting
 
 - **ModuleNotFoundError:** confirm Railway root directory is `ai-platform/backend`.

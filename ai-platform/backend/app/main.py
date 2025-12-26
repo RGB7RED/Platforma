@@ -93,6 +93,52 @@ def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
         task_data["artifacts_count"] = sum(len(a) for a in container.artifacts.values())
     return task_data
 
+
+def normalize_payload(payload: Any) -> Any:
+    return jsonable_encoder(payload)
+
+
+def validate_order(order: str) -> str:
+    normalized = order.lower()
+    if normalized not in {"asc", "desc"}:
+        raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
+    return normalized
+
+
+async def ensure_task_exists(task_id: str) -> Dict[str, Any]:
+    task_data = await db.get_task_row(task_id)
+    if task_data is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task_data
+
+
+def build_container_state(
+    *,
+    status: str,
+    progress: float,
+    current_stage: Optional[str],
+    container: Optional[Container] = None,
+    active_role: Optional[str] = None,
+    current_task: Optional[str] = None,
+    include_created_at: bool = False,
+) -> Dict[str, Any]:
+    now_iso = db.now_utc().isoformat()
+    state = {
+        "status": status,
+        "progress": progress,
+        "current_stage": current_stage,
+        "active_role": active_role or (container.metadata.get("active_role") if container else None),
+        "current_task": current_task or (container.current_task if container else None),
+        "container_state": container.state.value if container else None,
+        "container_progress": container.progress if container else None,
+        "timestamps": {
+            "updated_at": now_iso,
+        },
+    }
+    if include_created_at:
+        state["timestamps"]["created_at"] = now_iso
+    return normalize_payload(state)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
@@ -119,6 +165,8 @@ async def lifespan(app: FastAPI):
         logger.info("DATABASE_URL detected, enabling Postgres persistence")
         try:
             await db.init_db(database_url)
+            await db.init_container_tables()
+            logger.info("Container persistence enabled")
         except Exception:
             logger.exception("Failed to initialize database connection")
             raise
@@ -257,6 +305,20 @@ async def create_task(request: TaskRequest, req: Request):
             codex_version=request.codex_version,
             client_ip=client_ip,
         )
+        await db.append_event(
+            task_id,
+            "TaskCreated",
+            normalize_payload({"user_id": user_id, "codex_version": request.codex_version}),
+        )
+        await db.set_container_state(
+            task_id,
+            build_container_state(
+                status="created",
+                progress=0.0,
+                current_stage=None,
+                include_created_at=True,
+            ),
+        )
     else:
         # Сохраняем задачу
         storage.active_tasks[task_id] = {
@@ -300,6 +362,58 @@ async def get_task_status(task_id: str):
     
     task_data = storage.active_tasks[task_id]
     return enrich_task_data(task_id, task_data)
+
+
+@app.get("/api/tasks/{task_id}/events")
+async def get_task_events(task_id: str, limit: int = 200, order: str = "desc"):
+    """Получение событий контейнера"""
+    if not db.is_enabled():
+        raise HTTPException(status_code=501, detail="Database persistence not enabled")
+
+    await ensure_task_exists(task_id)
+    normalized_order = validate_order(order)
+    events = await db.get_events(task_id, limit=limit, order=normalized_order)
+    return {
+        "task_id": task_id,
+        "total": len(events),
+        "events": normalize_payload(events),
+    }
+
+
+@app.get("/api/tasks/{task_id}/artifacts")
+async def get_task_artifacts(
+    task_id: str,
+    type: Optional[str] = None,
+    limit: int = 200,
+    order: str = "desc",
+):
+    """Получение артефактов контейнера"""
+    if not db.is_enabled():
+        raise HTTPException(status_code=501, detail="Database persistence not enabled")
+
+    await ensure_task_exists(task_id)
+    normalized_order = validate_order(order)
+    artifacts = await db.get_artifacts(task_id, type=type, limit=limit, order=normalized_order)
+    return {
+        "task_id": task_id,
+        "total": len(artifacts),
+        "artifacts": normalize_payload(artifacts),
+    }
+
+
+@app.get("/api/tasks/{task_id}/state")
+async def get_task_state(task_id: str):
+    """Получение состояния контейнера"""
+    if not db.is_enabled():
+        raise HTTPException(status_code=501, detail="Database persistence not enabled")
+
+    await ensure_task_exists(task_id)
+    state_row = await db.get_container_state(task_id)
+    return {
+        "task_id": task_id,
+        "state": normalize_payload(state_row["state"]) if state_row else {},
+        "updated_at": normalize_payload(state_row["updated_at"]) if state_row else None,
+    }
 
 @app.get("/api/tasks/{task_id}/files")
 async def get_task_files(task_id: str):
@@ -436,106 +550,199 @@ async def process_task_background(task_id: str, description: str):
     """Фоновая обработка задачи ИИ-агентами"""
     try:
         logger.info(f"Starting AI processing for task {task_id}")
-        
+
+        async def apply_task_update(fields: Dict[str, Any]) -> None:
+            if db.is_enabled():
+                task_data = await db.update_task_row(task_id, fields)
+                if task_data:
+                    await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
+            else:
+                storage.active_tasks[task_id].update(fields)
+                await manager.send_progress(task_id, storage.active_tasks[task_id])
+
         # Обновляем статус
-        if db.is_enabled():
-            task_data = await db.update_task_row(
-                task_id,
-                {
-                    "status": "processing",
-                    "progress": 0.1,
-                    "current_stage": "initializing",
-                },
-            )
-            if task_data:
-                await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
-        else:
-            storage.active_tasks[task_id].update({
+        await apply_task_update(
+            {
                 "status": "processing",
                 "progress": 0.1,
-                "current_stage": "initializing"
-            })
-            await manager.send_progress(task_id, storage.active_tasks[task_id])
+                "current_stage": "initializing",
+            }
+        )
+        await db.append_event(
+            task_id,
+            "StageStarted",
+            normalize_payload({"stage": "initializing"}),
+        )
+        await db.set_container_state(
+            task_id,
+            build_container_state(
+                status="processing",
+                progress=0.1,
+                current_stage="initializing",
+            ),
+        )
         
         # Создаем оркестратор и контейнер
         orchestrator = AIOrchestrator()
         container = orchestrator.initialize_project(f"Task-{task_id[:8]}")
         storage.containers[task_id] = container
-        
-        # Обновляем прогресс
-        if db.is_enabled():
-            task_data = await db.update_task_row(
-                task_id,
+
+        stage_progress = {
+            "research": 0.2,
+            "design": 0.4,
+            "implementation": 0.6,
+            "review": 0.9,
+        }
+        stage_role = {
+            "research": "researcher",
+            "design": "designer",
+            "implementation": "coder",
+            "review": "reviewer",
+        }
+
+        async def handle_stage_started(payload: Dict[str, Any]) -> None:
+            stage = payload.get("stage")
+            progress = stage_progress.get(stage, 0.1)
+            await apply_task_update(
                 {
-                    "progress": 0.2,
-                    "current_stage": "research",
-                },
+                    "progress": progress,
+                    "current_stage": stage,
+                }
             )
-            if task_data:
-                await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
-        else:
-            storage.active_tasks[task_id].update({
-                "progress": 0.2,
-                "current_stage": "research"
-            })
-            await manager.send_progress(task_id, storage.active_tasks[task_id])
+            await db.append_event(
+                task_id,
+                "StageStarted",
+                normalize_payload({"stage": stage}),
+            )
+            await db.set_container_state(
+                task_id,
+                build_container_state(
+                    status="processing",
+                    progress=progress,
+                    current_stage=stage,
+                    container=container,
+                    active_role=stage_role.get(stage),
+                ),
+            )
+
+        async def handle_research_complete(payload: Dict[str, Any]) -> None:
+            result = payload.get("result")
+            await db.add_artifact(
+                task_id,
+                "research_summary",
+                normalize_payload(result),
+                produced_by="researcher",
+            )
+            await db.append_event(
+                task_id,
+                "ArtifactAdded",
+                normalize_payload({"type": "research_summary"}),
+            )
+
+        async def handle_design_complete(payload: Dict[str, Any]) -> None:
+            result = payload.get("result")
+            await db.add_artifact(
+                task_id,
+                "architecture",
+                normalize_payload(result),
+                produced_by="designer",
+            )
+            await db.append_event(
+                task_id,
+                "ArtifactAdded",
+                normalize_payload({"type": "architecture"}),
+            )
+
+        async def handle_review_result(payload: Dict[str, Any]) -> None:
+            result = payload.get("result")
+            await db.add_artifact(
+                task_id,
+                "review_report",
+                normalize_payload(result),
+                produced_by="reviewer",
+            )
+            issues = result.get("issues") if isinstance(result, dict) else None
+            issues_count = len(issues) if isinstance(issues, list) else 0
+            await db.append_event(
+                task_id,
+                "ReviewResult",
+                normalize_payload(
+                    {
+                        "status": result.get("status") if isinstance(result, dict) else None,
+                        "issues_count": issues_count,
+                        "kind": payload.get("kind"),
+                    }
+                ),
+            )
         
         # Обрабатываем задачу
-        result = await orchestrator.process_task(description)
+        result = await orchestrator.process_task(
+            description,
+            callbacks={
+                "stage_started": handle_stage_started,
+                "research_complete": handle_research_complete,
+                "design_complete": handle_design_complete,
+                "review_result": handle_review_result,
+            },
+        )
         
         # Сохраняем контейнер в файл (для persistence)
         save_container_to_file(task_id, container)
         
         # Обновляем финальный статус
-        if db.is_enabled():
-            task_data = await db.update_task_row(
-                task_id,
-                {
-                    "status": result["status"],
-                    "progress": result.get("progress", 1.0),
-                    "current_stage": "completed",
-                    "result": result,
-                    "completed_at": db.now_utc(),
-                },
-            )
-            if task_data:
-                await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
-        else:
-            storage.active_tasks[task_id].update({
+        await apply_task_update(
+            {
                 "status": result["status"],
                 "progress": result.get("progress", 1.0),
                 "current_stage": "completed",
                 "result": result,
-                "completed_at": asyncio.get_event_loop().time()
-            })
-            
-            await manager.send_progress(task_id, storage.active_tasks[task_id])
+                "completed_at": db.now_utc() if db.is_enabled() else asyncio.get_event_loop().time(),
+            }
+        )
+        await db.append_event(
+            task_id,
+            "TaskCompleted",
+            normalize_payload(
+                {"status": result["status"], "progress": result.get("progress", 1.0)}
+            ),
+        )
+        await db.set_container_state(
+            task_id,
+            build_container_state(
+                status=result["status"],
+                progress=result.get("progress", 1.0),
+                current_stage="completed",
+                container=container,
+                active_role=container.metadata.get("active_role") if container else None,
+                current_task=container.current_task if container else None,
+            ),
+        )
         logger.info(f"Task {task_id} completed with status: {result['status']}")
         
     except Exception as e:
         logger.error(f"Error processing task {task_id}: {e}")
-        
-        if db.is_enabled():
-            task_data = await db.update_task_row(
-                task_id,
-                {
-                    "status": "error",
-                    "error": str(e),
-                    "progress": 0.0,
-                    "current_stage": "failed",
-                },
-            )
-            if task_data:
-                await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
-        else:
-            storage.active_tasks[task_id].update({
+        await apply_task_update(
+            {
                 "status": "error",
                 "error": str(e),
                 "progress": 0.0,
-                "current_stage": "failed"
-            })
-            
-            await manager.send_progress(task_id, storage.active_tasks[task_id])
+                "current_stage": "failed",
+            }
+        )
+        await db.append_event(
+            task_id,
+            "TaskFailed",
+            normalize_payload({"error": str(e)}),
+        )
+        await db.set_container_state(
+            task_id,
+            build_container_state(
+                status="error",
+                progress=0.0,
+                current_stage="failed",
+                container=storage.containers.get(task_id),
+            ),
+        )
 
 def save_container_to_file(task_id: str, container: Container):
     """Сохраняет контейнер в JSON файл"""
