@@ -20,7 +20,8 @@ Use `backend/.env.example` as the template for local development and production 
 - **Purpose:** Enables Postgres persistence for tasks.
 - **Example:** `DATABASE_URL=postgresql://user:pass@host:5432/dbname`
 - **Required in production?:** Yes
-- **Notes:** When unset, the backend uses in-memory storage.
+- **Notes:** When unset, the backend uses in-memory storage. When set, container persistence tables
+  (`events`, `artifacts`, `container_state`) are created automatically on startup.
 
 ### SECRET_KEY
 - **Purpose:** Secret used for signing/auth features.

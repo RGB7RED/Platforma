@@ -7,6 +7,7 @@ Smoke check:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -74,6 +75,72 @@ def _row_to_dict(row: Optional[asyncpg.Record]) -> Optional[Dict[str, Any]]:
     return dict(row)
 
 
+def _json_payload(payload: Any) -> str:
+    if payload is None:
+        payload = {}
+    return json.dumps(payload, default=str)
+
+
+async def init_container_tables(pool: Optional[asyncpg.Pool] = None) -> None:
+    pool = pool or _pool
+    if pool is None:
+        logger.info("Database not enabled; skipping container table initialization")
+        return
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id UUID PRIMARY KEY,
+                task_id UUID NOT NULL,
+                type TEXT NOT NULL,
+                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS events_task_id_created_at_idx
+            ON events (task_id, created_at);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id UUID PRIMARY KEY,
+                task_id UUID NOT NULL,
+                type TEXT NOT NULL,
+                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                produced_by TEXT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS artifacts_task_id_created_at_idx
+            ON artifacts (task_id, created_at);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS artifacts_task_id_type_idx
+            ON artifacts (task_id, type);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS container_state (
+                task_id UUID PRIMARY KEY,
+                state JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+    logger.info("Database initialized for container persistence")
+
+
 async def create_task_row(
     *,
     task_id: str,
@@ -106,6 +173,125 @@ async def create_task_row(
         client_ip,
     )
     return _row_to_dict(row) or {}
+
+
+async def append_event(task_id: str, type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    if _pool is None:
+        logger.debug("Database not enabled; skipping append_event for task %s", task_id)
+        return
+
+    await _pool.execute(
+        """
+        INSERT INTO events (id, task_id, type, payload)
+        VALUES ($1, $2, $3, $4::jsonb);
+        """,
+        uuid.uuid4(),
+        _coerce_task_id(task_id),
+        type,
+        _json_payload(payload),
+    )
+
+
+async def add_artifact(
+    task_id: str,
+    type: str,
+    payload: Optional[Dict[str, Any]] = None,
+    produced_by: Optional[str] = None,
+) -> None:
+    if _pool is None:
+        logger.debug("Database not enabled; skipping add_artifact for task %s", task_id)
+        return
+
+    await _pool.execute(
+        """
+        INSERT INTO artifacts (id, task_id, type, payload, produced_by)
+        VALUES ($1, $2, $3, $4::jsonb, $5);
+        """,
+        uuid.uuid4(),
+        _coerce_task_id(task_id),
+        type,
+        _json_payload(payload),
+        produced_by,
+    )
+
+
+async def get_events(task_id: str, limit: int = 200, order: str = "desc") -> List[Dict[str, Any]]:
+    if _pool is None:
+        logger.debug("Database not enabled; returning empty events for task %s", task_id)
+        return []
+
+    direction = "DESC" if order.lower() == "desc" else "ASC"
+    query = f"""
+        SELECT id, type, payload, created_at
+        FROM events
+        WHERE task_id = $1
+        ORDER BY created_at {direction}
+        LIMIT $2;
+    """
+    rows = await _pool.fetch(query, _coerce_task_id(task_id), limit)
+    return [dict(row) for row in rows]
+
+
+async def get_artifacts(
+    task_id: str,
+    type: Optional[str] = None,
+    limit: int = 200,
+    order: str = "desc",
+) -> List[Dict[str, Any]]:
+    if _pool is None:
+        logger.debug("Database not enabled; returning empty artifacts for task %s", task_id)
+        return []
+
+    direction = "DESC" if order.lower() == "desc" else "ASC"
+    if type:
+        query = f"""
+            SELECT id, type, produced_by, payload, created_at
+            FROM artifacts
+            WHERE task_id = $1 AND type = $2
+            ORDER BY created_at {direction}
+            LIMIT $3;
+        """
+        rows = await _pool.fetch(query, _coerce_task_id(task_id), type, limit)
+    else:
+        query = f"""
+            SELECT id, type, produced_by, payload, created_at
+            FROM artifacts
+            WHERE task_id = $1
+            ORDER BY created_at {direction}
+            LIMIT $2;
+        """
+        rows = await _pool.fetch(query, _coerce_task_id(task_id), limit)
+
+    return [dict(row) for row in rows]
+
+
+async def set_container_state(task_id: str, state: Optional[Dict[str, Any]] = None) -> None:
+    if _pool is None:
+        logger.debug("Database not enabled; skipping set_container_state for task %s", task_id)
+        return
+
+    await _pool.execute(
+        """
+        INSERT INTO container_state (task_id, state)
+        VALUES ($1, $2::jsonb)
+        ON CONFLICT (task_id)
+        DO UPDATE SET state = EXCLUDED.state, updated_at = NOW();
+        """,
+        _coerce_task_id(task_id),
+        _json_payload(state),
+    )
+
+
+async def get_container_state(task_id: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        logger.debug("Database not enabled; returning empty container state for task %s", task_id)
+        return None
+
+    row = await _pool.fetchrow(
+        "SELECT task_id, state, updated_at FROM container_state WHERE task_id = $1;",
+        _coerce_task_id(task_id),
+    )
+    return _row_to_dict(row)
 
 
 async def update_task_row(task_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:

@@ -2,10 +2,11 @@
 Оркестратор - управляет полным циклом выполнения задачи через роли ИИ.
 """
 
+import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 from datetime import datetime
 
 from .models import Container, ProjectState
@@ -66,7 +67,22 @@ class AIOrchestrator:
         logger.info(f"Project '{project_name}' initialized with ID: {self.container.project_id}")
         return self.container
     
-    async def process_task(self, user_task: str) -> Dict[str, Any]:
+    async def _run_hook(
+        self,
+        callback: Optional[Callable[[Dict[str, Any]], Any]],
+        payload: Dict[str, Any],
+    ) -> None:
+        if not callback:
+            return
+        result = callback(payload)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def process_task(
+        self,
+        user_task: str,
+        callbacks: Optional[Dict[str, Callable[[Dict[str, Any]], Any]]] = None,
+    ) -> Dict[str, Any]:
         """Основной метод обработки задачи пользователя"""
         if not self.container:
             self.initialize_project("Auto-generated Project")
@@ -76,11 +92,19 @@ class AIOrchestrator:
         try:
             # Фаза 1: Исследование
             logger.info("Phase 1: Research")
+            await self._run_hook(
+                callbacks.get("stage_started") if callbacks else None,
+                {"stage": "research"},
+            )
             self.container.update_state(ProjectState.RESEARCH, "Analyzing requirements")
             
             researcher_result = await self.roles["researcher"].execute(
                 user_task, 
                 self.container
+            )
+            await self._run_hook(
+                callbacks.get("research_complete") if callbacks else None,
+                {"result": researcher_result},
             )
             
             self.container.add_artifact(
@@ -91,10 +115,18 @@ class AIOrchestrator:
             
             # Фаза 2: Проектирование
             logger.info("Phase 2: Design")
+            await self._run_hook(
+                callbacks.get("stage_started") if callbacks else None,
+                {"stage": "design"},
+            )
             self.container.update_state(ProjectState.DESIGN, "Creating architecture")
             
             design_result = await self.roles["designer"].execute(
                 self.container
+            )
+            await self._run_hook(
+                callbacks.get("design_complete") if callbacks else None,
+                {"result": design_result},
             )
             
             self.container.target_architecture = design_result
@@ -106,6 +138,10 @@ class AIOrchestrator:
             
             # Фаза 3: Итеративная реализация
             logger.info("Phase 3: Implementation")
+            await self._run_hook(
+                callbacks.get("stage_started") if callbacks else None,
+                {"stage": "implementation"},
+            )
             self.container.update_state(ProjectState.IMPLEMENTATION, "Implementing solution")
             
             iteration = 0
@@ -135,6 +171,10 @@ class AIOrchestrator:
                 review_result = await self.roles["reviewer"].execute(
                     self.container
                 )
+                await self._run_hook(
+                    callbacks.get("review_result") if callbacks else None,
+                    {"result": review_result, "kind": "iteration", "iteration": iteration},
+                )
                 
                 if review_result["status"] == "approved":
                     logger.info(f"Iteration {iteration} approved")
@@ -145,10 +185,18 @@ class AIOrchestrator:
             
             # Фаза 4: Финальное ревью
             logger.info("Phase 4: Final Review")
+            await self._run_hook(
+                callbacks.get("stage_started") if callbacks else None,
+                {"stage": "review"},
+            )
             self.container.update_state(ProjectState.REVIEW, "Final quality check")
             
             final_review = await self.roles["reviewer"].execute(
                 self.container
+            )
+            await self._run_hook(
+                callbacks.get("review_result") if callbacks else None,
+                {"result": final_review, "kind": "final"},
             )
             
             if final_review["status"] == "approved":
