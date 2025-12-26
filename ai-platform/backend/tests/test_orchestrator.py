@@ -98,6 +98,20 @@ class TestAIOrchestrator:
         assert result["status"] == "error"
         assert "error" in result
         assert "Test error" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_process_task_final_review_warning_success(self, orchestrator, mock_agents):
+        """Финальное ревью с предупреждениями не должно помечать задачу как failed"""
+        orchestrator.initialize_project("Test")
+
+        mock_agents["designer"].execute.return_value = {"components": []}
+        mock_agents["reviewer"].execute.return_value = {"status": "approved_with_warnings"}
+
+        result = await orchestrator.process_task("Create a test API")
+
+        assert result["status"] == "completed"
+        assert result["status"] != "failed"
+        assert orchestrator.container.state == ProjectState.COMPLETE
     
     @pytest.mark.asyncio
     async def test_get_next_task(self, orchestrator):
