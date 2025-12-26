@@ -95,6 +95,11 @@ def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
 async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
     logger.info("Starting AI Platform Backend...")
+    logger.info(
+        "CORS allowlist source=%s; allowed origins=%d",
+        cors_source,
+        len(allowed_origins),
+    )
     
     # Создаем директории если их нет
     os.makedirs("data/tasks", exist_ok=True)
@@ -123,16 +128,38 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+def parse_allowed_origins() -> tuple[list[str], str]:
+    raw_origins = os.getenv("ALLOWED_ORIGINS", "")
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    environment = os.getenv("ENVIRONMENT", "").lower()
+    is_production = environment == "production"
+    source = "env"
+
+    if is_production:
+        if not origins:
+            source = "empty"
+            logger.warning(
+                "ALLOWED_ORIGINS is empty in production; CORS will block all cross-origin requests."
+            )
+    else:
+        if not origins:
+            origins = [
+                "http://localhost:3000",
+                "http://localhost:8000",
+                "https://web.telegram.org",
+                "https://telegram.org",
+            ]
+            source = "dev-defaults"
+
+    return origins, source
+
+
+allowed_origins, cors_source = parse_allowed_origins()
+
 # CORS для Telegram Mini App и локальной разработки
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://telegram.org",
-        "https://web.telegram.org",
-        "http://localhost:3000",
-        "http://localhost:8000",
-        "*"  # Для разработки, в продакшене укажите конкретные домены
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
