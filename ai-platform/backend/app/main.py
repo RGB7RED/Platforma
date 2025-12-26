@@ -3,6 +3,7 @@
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -11,13 +12,14 @@ from contextlib import asynccontextmanager
 import uuid
 import json
 import asyncio
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 import logging
 import os
 from pathlib import Path
 
 from .models import Container
 from .orchestrator import AIOrchestrator
+from . import db
 
 # Настройка логирования
 logging.basicConfig(
@@ -50,6 +52,7 @@ class Storage:
         self.user_sessions: Dict[str, List[str]] = {}  # user_id -> [task_ids]
 
 storage = Storage()
+database_url = os.getenv("DATABASE_URL")
 
 # WebSocket менеджер
 class ConnectionManager:
@@ -69,7 +72,7 @@ class ConnectionManager:
     async def send_progress(self, task_id: str, data: dict):
         if task_id in self.active_connections:
             try:
-                await self.active_connections[task_id].send_json(data)
+                await self.active_connections[task_id].send_json(jsonable_encoder(data))
                 return True
             except Exception as e:
                 logger.error(f"Error sending WebSocket message: {e}")
@@ -77,6 +80,16 @@ class ConnectionManager:
         return False
 
 manager = ConnectionManager()
+
+
+def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(task_data.get("id"), uuid.UUID):
+        task_data["id"] = str(task_data["id"])
+    if task_id in storage.containers:
+        container = storage.containers[task_id]
+        task_data["files_count"] = len(container.files)
+        task_data["artifacts_count"] = sum(len(a) for a in container.artifacts.values())
+    return task_data
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -86,11 +99,22 @@ async def lifespan(app: FastAPI):
     # Создаем директории если их нет
     os.makedirs("data/tasks", exist_ok=True)
     os.makedirs("data/logs", exist_ok=True)
+
+    if database_url:
+        logger.info("DATABASE_URL detected, enabling Postgres persistence")
+        try:
+            await db.init_db(database_url)
+        except Exception:
+            logger.exception("Failed to initialize database connection")
+            raise
+    else:
+        logger.info("DATABASE_URL not set, using in-memory task storage")
     
     yield
     
     logger.info("Shutting down AI Platform Backend...")
     # Очистка ресурсов
+    await db.close_db()
 
 app = FastAPI(
     title="AI Collaboration Platform API",
@@ -148,22 +172,36 @@ async def create_task(request: TaskRequest, req: Request):
     
     logger.info(f"Creating new task {task_id} for user {user_id}")
     
-    # Сохраняем задачу
-    storage.active_tasks[task_id] = {
-        "id": task_id,
-        "description": request.description,
-        "user_id": user_id,
-        "status": "created",
-        "progress": 0.0,
-        "created_at": asyncio.get_event_loop().time(),
-        "codex_version": request.codex_version,
-        "client_ip": req.client.host if req.client else None
-    }
-    
-    # Сохраняем связь пользователь -> задача
-    if user_id not in storage.user_sessions:
-        storage.user_sessions[user_id] = []
-    storage.user_sessions[user_id].append(task_id)
+    client_ip = req.client.host if req.client else None
+
+    if db.is_enabled():
+        await db.create_task_row(
+            task_id=task_id,
+            user_id=user_id,
+            description=request.description,
+            status="created",
+            progress=0.0,
+            current_stage=None,
+            codex_version=request.codex_version,
+            client_ip=client_ip,
+        )
+    else:
+        # Сохраняем задачу
+        storage.active_tasks[task_id] = {
+            "id": task_id,
+            "description": request.description,
+            "user_id": user_id,
+            "status": "created",
+            "progress": 0.0,
+            "created_at": asyncio.get_event_loop().time(),
+            "codex_version": request.codex_version,
+            "client_ip": client_ip,
+        }
+        
+        # Сохраняем связь пользователь -> задача
+        if user_id not in storage.user_sessions:
+            storage.user_sessions[user_id] = []
+        storage.user_sessions[user_id].append(task_id)
     
     # Запускаем обработку в фоне
     asyncio.create_task(process_task_background(task_id, request.description))
@@ -179,18 +217,17 @@ async def create_task(request: TaskRequest, req: Request):
 @app.get("/api/tasks/{task_id}")
 async def get_task_status(task_id: str):
     """Получение статуса задачи"""
+    if db.is_enabled():
+        task_data = await db.get_task_row(task_id)
+        if task_data is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return enrich_task_data(task_id, task_data)
+
     if task_id not in storage.active_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     
     task_data = storage.active_tasks[task_id]
-    
-    # Если есть контейнер, добавляем информацию о файлах
-    if task_id in storage.containers:
-        container = storage.containers[task_id]
-        task_data["files_count"] = len(container.files)
-        task_data["artifacts_count"] = sum(len(a) for a in container.artifacts.values())
-    
-    return task_data
+    return enrich_task_data(task_id, task_data)
 
 @app.get("/api/tasks/{task_id}/files")
 async def get_task_files(task_id: str):
@@ -268,6 +305,16 @@ async def download_task_files(task_id: str):
 @app.get("/api/users/{user_id}/tasks")
 async def get_user_tasks(user_id: str, limit: int = 10):
     """Получение задач пользователя"""
+    if db.is_enabled():
+        tasks = await db.list_tasks_for_user(user_id, limit)
+        tasks = [enrich_task_data(str(task["id"]), task) for task in tasks]
+        return {
+            "user_id": user_id,
+            "tasks": tasks,
+            "total": len(tasks),
+            "limit": limit,
+        }
+
     if user_id not in storage.user_sessions:
         return {"tasks": [], "total": 0}
     
@@ -292,7 +339,11 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
     
     try:
         # Отправляем текущее состояние при подключении
-        if task_id in storage.active_tasks:
+        if db.is_enabled():
+            task_data = await db.get_task_row(task_id)
+            if task_data:
+                await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
+        elif task_id in storage.active_tasks:
             await manager.send_progress(task_id, storage.active_tasks[task_id])
         
         # Держим соединение открытым
@@ -315,12 +366,24 @@ async def process_task_background(task_id: str, description: str):
         logger.info(f"Starting AI processing for task {task_id}")
         
         # Обновляем статус
-        storage.active_tasks[task_id].update({
-            "status": "processing",
-            "progress": 0.1,
-            "current_stage": "initializing"
-        })
-        await manager.send_progress(task_id, storage.active_tasks[task_id])
+        if db.is_enabled():
+            task_data = await db.update_task_row(
+                task_id,
+                {
+                    "status": "processing",
+                    "progress": 0.1,
+                    "current_stage": "initializing",
+                },
+            )
+            if task_data:
+                await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
+        else:
+            storage.active_tasks[task_id].update({
+                "status": "processing",
+                "progress": 0.1,
+                "current_stage": "initializing"
+            })
+            await manager.send_progress(task_id, storage.active_tasks[task_id])
         
         # Создаем оркестратор и контейнер
         orchestrator = AIOrchestrator()
@@ -328,11 +391,22 @@ async def process_task_background(task_id: str, description: str):
         storage.containers[task_id] = container
         
         # Обновляем прогресс
-        storage.active_tasks[task_id].update({
-            "progress": 0.2,
-            "current_stage": "research"
-        })
-        await manager.send_progress(task_id, storage.active_tasks[task_id])
+        if db.is_enabled():
+            task_data = await db.update_task_row(
+                task_id,
+                {
+                    "progress": 0.2,
+                    "current_stage": "research",
+                },
+            )
+            if task_data:
+                await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
+        else:
+            storage.active_tasks[task_id].update({
+                "progress": 0.2,
+                "current_stage": "research"
+            })
+            await manager.send_progress(task_id, storage.active_tasks[task_id])
         
         # Обрабатываем задачу
         result = await orchestrator.process_task(description)
@@ -341,28 +415,55 @@ async def process_task_background(task_id: str, description: str):
         save_container_to_file(task_id, container)
         
         # Обновляем финальный статус
-        storage.active_tasks[task_id].update({
-            "status": result["status"],
-            "progress": result.get("progress", 1.0),
-            "current_stage": "completed",
-            "result": result,
-            "completed_at": asyncio.get_event_loop().time()
-        })
-        
-        await manager.send_progress(task_id, storage.active_tasks[task_id])
+        if db.is_enabled():
+            task_data = await db.update_task_row(
+                task_id,
+                {
+                    "status": result["status"],
+                    "progress": result.get("progress", 1.0),
+                    "current_stage": "completed",
+                    "result": result,
+                    "completed_at": db.now_utc(),
+                },
+            )
+            if task_data:
+                await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
+        else:
+            storage.active_tasks[task_id].update({
+                "status": result["status"],
+                "progress": result.get("progress", 1.0),
+                "current_stage": "completed",
+                "result": result,
+                "completed_at": asyncio.get_event_loop().time()
+            })
+            
+            await manager.send_progress(task_id, storage.active_tasks[task_id])
         logger.info(f"Task {task_id} completed with status: {result['status']}")
         
     except Exception as e:
         logger.error(f"Error processing task {task_id}: {e}")
         
-        storage.active_tasks[task_id].update({
-            "status": "error",
-            "error": str(e),
-            "progress": 0.0,
-            "current_stage": "failed"
-        })
-        
-        await manager.send_progress(task_id, storage.active_tasks[task_id])
+        if db.is_enabled():
+            task_data = await db.update_task_row(
+                task_id,
+                {
+                    "status": "error",
+                    "error": str(e),
+                    "progress": 0.0,
+                    "current_stage": "failed",
+                },
+            )
+            if task_data:
+                await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
+        else:
+            storage.active_tasks[task_id].update({
+                "status": "error",
+                "error": str(e),
+                "progress": 0.0,
+                "current_stage": "failed"
+            })
+            
+            await manager.send_progress(task_id, storage.active_tasks[task_id])
 
 def save_container_to_file(task_id: str, container: Container):
     """Сохраняет контейнер в JSON файл"""
