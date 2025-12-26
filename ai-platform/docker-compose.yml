@@ -27,9 +27,7 @@ services:
       start_period: 40s
     networks:
       - ai-platform-network
-    command: >
-      sh -c "python -c 'import sys; sys.path.insert(0, \"/app\"); from app.main import app; import uvicorn' &&
-      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   frontend:
     build:

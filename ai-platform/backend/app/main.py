@@ -603,11 +603,14 @@ if frontend_path.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    
+
+    environment = os.getenv("ENVIRONMENT", "").lower()
+    port = int(os.getenv("PORT", "8000"))
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
-        reload=True,
+        port=port,
+        reload=environment != "production",
         log_level="info"
     )
