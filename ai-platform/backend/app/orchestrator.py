@@ -199,7 +199,7 @@ class AIOrchestrator:
                 {"result": final_review, "kind": "final"},
             )
             
-            if final_review["status"] == "approved":
+            if final_review["status"] in {"approved", "approved_with_warnings"}:
                 self.container.update_state(ProjectState.COMPLETE, "Project completed")
                 self.container.update_progress(1.0)
                 logger.info("Project completed successfully")
