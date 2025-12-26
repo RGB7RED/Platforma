@@ -31,6 +31,7 @@
     progressTime: document.getElementById('progressTime'),
     currentStage: document.getElementById('currentStage'),
     taskStatus: document.getElementById('taskStatus'),
+    apiBaseUrl: document.getElementById('apiBaseUrl'),
     taskError: document.getElementById('taskError'),
     resultJson: document.getElementById('resultJson'),
     resultStatus: document.getElementById('resultStatus'),
@@ -95,6 +96,13 @@
       return;
     }
     elements.charCount.textContent = String(elements.taskDescription.value.length);
+  };
+
+  const updateApiBaseUrl = () => {
+    if (!elements.apiBaseUrl) {
+      return;
+    }
+    elements.apiBaseUrl.textContent = API_BASE_URL || '(same origin)';
   };
 
   const formatProgress = (progress) => {
@@ -352,4 +360,5 @@
   }
 
   updateCharCount();
+  updateApiBaseUrl();
 })();
