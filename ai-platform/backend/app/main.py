@@ -80,6 +80,8 @@ class ConnectionManager:
         return False
 
 manager = ConnectionManager()
+FILE_PERSISTENCE_ENABLED: Optional[bool] = None
+FILE_PERSISTENCE_REASON = ""
 
 
 def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -104,6 +106,14 @@ async def lifespan(app: FastAPI):
     # Создаем директории если их нет
     os.makedirs("data/tasks", exist_ok=True)
     os.makedirs("data/logs", exist_ok=True)
+
+    global FILE_PERSISTENCE_ENABLED, FILE_PERSISTENCE_REASON
+    FILE_PERSISTENCE_ENABLED, FILE_PERSISTENCE_REASON = resolve_file_persistence_setting()
+    logger.info(
+        "File persistence %s (%s)",
+        "enabled" if FILE_PERSISTENCE_ENABLED else "disabled",
+        FILE_PERSISTENCE_REASON,
+    )
 
     if database_url:
         logger.info("DATABASE_URL detected, enabling Postgres persistence")
@@ -158,6 +168,38 @@ def parse_allowed_origins() -> tuple[list[str], str]:
 
 
 allowed_origins, cors_source = parse_allowed_origins()
+
+def parse_bool_env(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    return None
+
+def resolve_file_persistence_setting() -> tuple[bool, str]:
+    env_value = os.getenv("ENABLE_FILE_PERSISTENCE")
+    parsed = parse_bool_env(env_value)
+    if parsed is not None:
+        return parsed, f"ENABLE_FILE_PERSISTENCE set to '{env_value}'"
+
+    environment = os.getenv("ENVIRONMENT", "").lower()
+    if environment == "production":
+        if env_value is None:
+            return False, "ENVIRONMENT=production default disabled"
+        return False, f"ENABLE_FILE_PERSISTENCE set to unrecognized value '{env_value}'; default disabled for production"
+
+    if env_value is None:
+        return True, f"ENVIRONMENT={environment or 'unset'} default enabled"
+    return True, f"ENABLE_FILE_PERSISTENCE set to unrecognized value '{env_value}'; default enabled for non-production"
+
+def get_file_persistence_setting() -> bool:
+    global FILE_PERSISTENCE_ENABLED, FILE_PERSISTENCE_REASON
+    if FILE_PERSISTENCE_ENABLED is None:
+        FILE_PERSISTENCE_ENABLED, FILE_PERSISTENCE_REASON = resolve_file_persistence_setting()
+    return FILE_PERSISTENCE_ENABLED
 
 # CORS для Telegram Mini App и локальной разработки
 app.add_middleware(
@@ -497,6 +539,12 @@ async def process_task_background(task_id: str, description: str):
 
 def save_container_to_file(task_id: str, container: Container):
     """Сохраняет контейнер в JSON файл"""
+    if not get_file_persistence_setting():
+        logger.debug(
+            "File persistence disabled; skipping container save for task %s",
+            task_id,
+        )
+        return
     try:
         data = container.to_dict()
         filepath = f"data/tasks/{task_id}.json"
