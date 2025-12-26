@@ -50,4 +50,10 @@ Use `backend/.env.example` as the template for local development and production 
 - **Purpose:** Base URL for the Telegram Web App.
 - **Example:** `WEB_APP_URL=http://localhost:3000`
 - **Required in production?:** No (Yes if the bot is enabled)
-- **Notes:** Used to build deep links from the bot.
+- **Notes:** Used to build deep links from the bot. For Vercel, point this to `https://<vercel-app>/app`.
+
+### API_BASE_URL
+- **Purpose:** Base URL for the backend API consumed by the frontend.
+- **Example:** `API_BASE_URL=https://your-railway-app.up.railway.app`
+- **Required in production?:** Yes (for deployed frontend)
+- **Notes:** Set this on the frontend deployment (e.g., Vercel) to reach the Railway-hosted API.
