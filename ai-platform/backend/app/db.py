@@ -44,6 +44,7 @@ async def init_db(database_url: str) -> None:
                 codex_version TEXT NULL,
                 client_ip TEXT NULL,
                 result JSONB NULL,
+                container_state JSONB NULL,
                 error TEXT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -51,6 +52,8 @@ async def init_db(database_url: str) -> None:
             );
             """
         )
+        await _ensure_jsonb_column(conn, table="tasks", column="result")
+        await _ensure_jsonb_column(conn, table="tasks", column="container_state")
     logger.info("Database initialized for task persistence")
 
 
@@ -81,6 +84,63 @@ def _json_payload(payload: Any) -> str:
     return json.dumps(payload, default=str)
 
 
+def _log_db_error(action: str, details: Dict[str, Any]) -> None:
+    summary = {key: type(value).__name__ for key, value in details.items()}
+    logger.exception("Database %s failed (types=%s)", action, summary)
+
+
+def _coerce_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+async def _ensure_jsonb_column(
+    conn: asyncpg.Connection,
+    *,
+    table: str,
+    column: str,
+    nullable: bool = True,
+) -> None:
+    data_type = await conn.fetchval(
+        """
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = $1
+          AND column_name = $2;
+        """,
+        table,
+        column,
+    )
+    if data_type is None:
+        null_sql = "NULL" if nullable else "NOT NULL"
+        await conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} JSONB {null_sql};"
+        )
+        return
+
+    if data_type == "jsonb":
+        return
+
+    await conn.execute(
+        f"""
+        ALTER TABLE {table}
+        ALTER COLUMN {column} TYPE JSONB
+        USING (
+            CASE
+                WHEN {column} IS NULL THEN NULL
+                WHEN {column}::text ~ '^\\s*(\\{{.*\\}}|\\[.*\\])\\s*$' THEN {column}::jsonb
+                ELSE to_jsonb({column})
+            END
+        );
+        """
+    )
+
+
 async def init_container_tables(pool: Optional[asyncpg.Pool] = None) -> None:
     pool = pool or _pool
     if pool is None:
@@ -99,6 +159,7 @@ async def init_container_tables(pool: Optional[asyncpg.Pool] = None) -> None:
             );
             """
         )
+        await _ensure_jsonb_column(conn, table="events", column="payload", nullable=False)
         await conn.execute(
             """
             CREATE INDEX IF NOT EXISTS events_task_id_created_at_idx
@@ -117,6 +178,7 @@ async def init_container_tables(pool: Optional[asyncpg.Pool] = None) -> None:
             );
             """
         )
+        await _ensure_jsonb_column(conn, table="artifacts", column="payload", nullable=False)
         await conn.execute(
             """
             CREATE INDEX IF NOT EXISTS artifacts_task_id_created_at_idx
@@ -138,6 +200,7 @@ async def init_container_tables(pool: Optional[asyncpg.Pool] = None) -> None:
             );
             """
         )
+        await _ensure_jsonb_column(conn, table="container_state", column="state", nullable=False)
     logger.info("Database initialized for container persistence")
 
 
@@ -155,23 +218,35 @@ async def create_task_row(
     if _pool is None:
         raise RuntimeError("Database pool is not initialized")
 
-    row = await _pool.fetchrow(
-        """
-        INSERT INTO tasks (
-            id, user_id, description, status, progress, current_stage, codex_version, client_ip
+    try:
+        row = await _pool.fetchrow(
+            """
+            INSERT INTO tasks (
+                id, user_id, description, status, progress, current_stage, codex_version, client_ip
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING *;
+            """,
+            _coerce_task_id(task_id),
+            user_id,
+            description,
+            status,
+            progress,
+            current_stage,
+            codex_version,
+            client_ip,
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING *;
-        """,
-        _coerce_task_id(task_id),
-        user_id,
-        description,
-        status,
-        progress,
-        current_stage,
-        codex_version,
-        client_ip,
-    )
+    except Exception:
+        _log_db_error(
+            "create_task_row",
+            {
+                "task_id": task_id,
+                "user_id": user_id,
+                "status": status,
+                "progress": progress,
+            },
+        )
+        raise
     return _row_to_dict(row) or {}
 
 
@@ -180,16 +255,23 @@ async def append_event(task_id: str, type: str, payload: Optional[Dict[str, Any]
         logger.debug("Database not enabled; skipping append_event for task %s", task_id)
         return
 
-    await _pool.execute(
-        """
-        INSERT INTO events (id, task_id, type, payload)
-        VALUES ($1, $2, $3, $4::jsonb);
-        """,
-        uuid.uuid4(),
-        _coerce_task_id(task_id),
-        type,
-        _json_payload(payload),
-    )
+    try:
+        await _pool.execute(
+            """
+            INSERT INTO events (id, task_id, type, payload)
+            VALUES ($1, $2, $3, $4::jsonb);
+            """,
+            uuid.uuid4(),
+            _coerce_task_id(task_id),
+            type,
+            _json_payload(payload),
+        )
+    except Exception:
+        _log_db_error(
+            "append_event",
+            {"task_id": task_id, "type": type, "payload": payload},
+        )
+        raise
 
 
 async def add_artifact(
@@ -202,17 +284,24 @@ async def add_artifact(
         logger.debug("Database not enabled; skipping add_artifact for task %s", task_id)
         return
 
-    await _pool.execute(
-        """
-        INSERT INTO artifacts (id, task_id, type, payload, produced_by)
-        VALUES ($1, $2, $3, $4::jsonb, $5);
-        """,
-        uuid.uuid4(),
-        _coerce_task_id(task_id),
-        type,
-        _json_payload(payload),
-        produced_by,
-    )
+    try:
+        await _pool.execute(
+            """
+            INSERT INTO artifacts (id, task_id, type, payload, produced_by)
+            VALUES ($1, $2, $3, $4::jsonb, $5);
+            """,
+            uuid.uuid4(),
+            _coerce_task_id(task_id),
+            type,
+            _json_payload(payload),
+            produced_by,
+        )
+    except Exception:
+        _log_db_error(
+            "add_artifact",
+            {"task_id": task_id, "type": type, "payload": payload},
+        )
+        raise
 
 
 async def get_events(task_id: str, limit: int = 200, order: str = "desc") -> List[Dict[str, Any]]:
@@ -229,7 +318,10 @@ async def get_events(task_id: str, limit: int = 200, order: str = "desc") -> Lis
         LIMIT $2;
     """
     rows = await _pool.fetch(query, _coerce_task_id(task_id), limit)
-    return [dict(row) for row in rows]
+    events = [dict(row) for row in rows]
+    for event in events:
+        event["payload"] = _coerce_json_value(event.get("payload"))
+    return events
 
 
 async def get_artifacts(
@@ -262,7 +354,10 @@ async def get_artifacts(
         """
         rows = await _pool.fetch(query, _coerce_task_id(task_id), limit)
 
-    return [dict(row) for row in rows]
+    artifacts = [dict(row) for row in rows]
+    for artifact in artifacts:
+        artifact["payload"] = _coerce_json_value(artifact.get("payload"))
+    return artifacts
 
 
 async def set_container_state(task_id: str, state: Optional[Dict[str, Any]] = None) -> None:
@@ -270,16 +365,20 @@ async def set_container_state(task_id: str, state: Optional[Dict[str, Any]] = No
         logger.debug("Database not enabled; skipping set_container_state for task %s", task_id)
         return
 
-    await _pool.execute(
-        """
-        INSERT INTO container_state (task_id, state)
-        VALUES ($1, $2::jsonb)
-        ON CONFLICT (task_id)
-        DO UPDATE SET state = EXCLUDED.state, updated_at = NOW();
-        """,
-        _coerce_task_id(task_id),
-        _json_payload(state),
-    )
+    try:
+        await _pool.execute(
+            """
+            INSERT INTO container_state (task_id, state)
+            VALUES ($1, $2::jsonb)
+            ON CONFLICT (task_id)
+            DO UPDATE SET state = EXCLUDED.state, updated_at = NOW();
+            """,
+            _coerce_task_id(task_id),
+            _json_payload(state),
+        )
+    except Exception:
+        _log_db_error("set_container_state", {"task_id": task_id, "state": state})
+        raise
 
 
 async def get_container_state(task_id: str) -> Optional[Dict[str, Any]]:
@@ -291,7 +390,10 @@ async def get_container_state(task_id: str) -> Optional[Dict[str, Any]]:
         "SELECT task_id, state, updated_at FROM container_state WHERE task_id = $1;",
         _coerce_task_id(task_id),
     )
-    return _row_to_dict(row)
+    data = _row_to_dict(row)
+    if data:
+        data["state"] = _coerce_json_value(data.get("state"))
+    return data
 
 
 async def update_task_row(task_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -307,6 +409,7 @@ async def update_task_row(task_id: str, fields: Dict[str, Any]) -> Optional[Dict
         "codex_version",
         "client_ip",
         "result",
+        "container_state",
         "error",
         "completed_at",
     }
@@ -317,15 +420,24 @@ async def update_task_row(task_id: str, fields: Dict[str, Any]) -> Optional[Dict
 
     set_clauses = []
     values: List[Any] = []
+    json_fields = {"result", "container_state"}
     for idx, (key, value) in enumerate(updates.items(), start=1):
-        set_clauses.append(f"{key} = ${idx}")
-        values.append(value)
+        if key in json_fields:
+            set_clauses.append(f"{key} = ${idx}::jsonb")
+            values.append(_json_payload(value))
+        else:
+            set_clauses.append(f"{key} = ${idx}")
+            values.append(value)
     set_clauses.append("updated_at = NOW()")
 
     values.append(_coerce_task_id(task_id))
     query = f"UPDATE tasks SET {', '.join(set_clauses)} WHERE id = ${len(values)} RETURNING *;"
 
-    row = await _pool.fetchrow(query, *values)
+    try:
+        row = await _pool.fetchrow(query, *values)
+    except Exception:
+        _log_db_error("update_task_row", updates)
+        raise
     return _row_to_dict(row)
 
 
@@ -337,7 +449,11 @@ async def get_task_row(task_id: str) -> Optional[Dict[str, Any]]:
         "SELECT * FROM tasks WHERE id = $1;",
         _coerce_task_id(task_id),
     )
-    return _row_to_dict(row)
+    data = _row_to_dict(row)
+    if data:
+        data["result"] = _coerce_json_value(data.get("result"))
+        data["container_state"] = _coerce_json_value(data.get("container_state"))
+    return data
 
 
 async def list_tasks_for_user(user_id: str, limit: int) -> List[Dict[str, Any]]:
@@ -354,7 +470,11 @@ async def list_tasks_for_user(user_id: str, limit: int) -> List[Dict[str, Any]]:
         user_id,
         limit,
     )
-    return [dict(row) for row in rows]
+    tasks = [dict(row) for row in rows]
+    for task in tasks:
+        task["result"] = _coerce_json_value(task.get("result"))
+        task["container_state"] = _coerce_json_value(task.get("container_state"))
+    return tasks
 
 
 def now_utc() -> datetime:
