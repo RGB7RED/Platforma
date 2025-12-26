@@ -130,7 +130,10 @@ app = FastAPI(
 
 def parse_allowed_origins() -> tuple[list[str], str]:
     raw_origins = os.getenv("ALLOWED_ORIGINS", "")
-    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    parsed_origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    origins = [origin for origin in parsed_origins if origin != "*"]
+    if len(origins) != len(parsed_origins):
+        logger.warning("Ignoring wildcard '*' entry in ALLOWED_ORIGINS.")
     environment = os.getenv("ENVIRONMENT", "").lower()
     is_production = environment == "production"
     source = "env"
