@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🤖 AI Collaboration Platform</title>
+    <meta name="api-base-url" content="https://platforma-production-7bbb.up.railway.app">
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <link rel="stylesheet" href="styles.css">
 </head>
@@ -144,6 +145,9 @@
                     </div>
                     <div class="status-row">
                         <strong>Stage:</strong> <span id="currentStage">-</span>
+                    </div>
+                    <div class="status-row">
+                        <strong>API:</strong> <span id="apiBaseUrl">-</span>
                     </div>
                     <div class="status-row error-message hidden" id="taskError"></div>
                 </div>
