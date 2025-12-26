@@ -138,6 +138,16 @@
                     </div>
                 </div>
 
+                <div class="status-panel">
+                    <div class="status-row">
+                        <strong>Status:</strong> <span id="taskStatus">-</span>
+                    </div>
+                    <div class="status-row">
+                        <strong>Stage:</strong> <span id="currentStage">-</span>
+                    </div>
+                    <div class="status-row error-message hidden" id="taskError"></div>
+                </div>
+
                 <!-- Real-time Updates -->
                 <div class="realtime-updates">
                     <h3>Real-time Updates</h3>
@@ -175,6 +185,14 @@
                     <div class="result-status" id="resultStatus">
                         <span class="status-badge success">✓ Completed</span>
                     </div>
+                </div>
+
+                <div class="result-json">
+                    <h3>Result JSON</h3>
+                    <details open>
+                        <summary>View result payload</summary>
+                        <pre id="resultJson"></pre>
+                    </details>
                 </div>
 
                 <!-- Results Summary -->
