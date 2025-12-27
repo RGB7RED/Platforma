@@ -20,8 +20,9 @@ import os
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timezone
 import hashlib
+import mimetypes
 
-from .models import Container
+from .models import Container, ProjectState
 from .orchestrator import AIOrchestrator
 from .schemas import (
     ArtifactsResponse,
@@ -68,6 +69,7 @@ class Storage:
 
 storage = Storage()
 database_url = os.getenv("DATABASE_URL")
+TASK_TTL_DAYS = os.getenv("TASK_TTL_DAYS")
 
 # WebSocket менеджер
 class ConnectionManager:
@@ -442,6 +444,16 @@ def parse_bool_env(value: Optional[str]) -> Optional[bool]:
         return False
     return None
 
+
+def parse_int_env(value: Optional[str], default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid integer env value '%s', using default=%s", value, default)
+        return default
+
 def resolve_file_persistence_setting() -> tuple[bool, str]:
     env_value = os.getenv("ENABLE_FILE_PERSISTENCE")
     parsed = parse_bool_env(env_value)
@@ -457,6 +469,10 @@ def resolve_file_persistence_setting() -> tuple[bool, str]:
     if env_value is None:
         return True, f"ENVIRONMENT={environment or 'unset'} default enabled"
     return True, f"ENABLE_FILE_PERSISTENCE set to unrecognized value '{env_value}'; default enabled for non-production"
+
+
+MAX_TASK_BYTES = parse_int_env(os.getenv("MAX_TASK_BYTES"), 50 * 1024 * 1024)
+MAX_TASK_FILES = parse_int_env(os.getenv("MAX_TASK_FILES"), 2000)
 
 def get_file_persistence_setting() -> bool:
     global FILE_PERSISTENCE_ENABLED, FILE_PERSISTENCE_REASON
@@ -514,11 +530,144 @@ def resolve_container(task_id: str) -> Optional[Container]:
     container = storage.containers.get(task_id)
     if container:
         return container
-    return load_container_from_file(task_id)
+    container = load_container_from_file(task_id)
+    if container:
+        return container
+    return None
+
+
+async def resolve_container_with_db(task_id: str) -> Optional[Container]:
+    container = resolve_container(task_id)
+    if container:
+        return container
+    if db.is_enabled():
+        return await load_container_from_db(task_id)
+    return None
+
+
+async def load_container_from_db(task_id: str) -> Optional[Container]:
+    if not db.is_enabled():
+        return None
+    snapshot_row = await db.get_container_snapshot(task_id)
+    files = await db.list_task_files_with_payload(task_id)
+    if not snapshot_row and not files:
+        return None
+
+    snapshot = snapshot_row.get("snapshot") if snapshot_row else {}
+    container_id = snapshot.get("project_id") if isinstance(snapshot, dict) else None
+    container = Container(container_id or task_id)
+
+    if isinstance(snapshot, dict):
+        state_value = snapshot.get("state")
+        if state_value:
+            try:
+                container.state = ProjectState(state_value)
+            except ValueError:
+                logger.warning("Unknown container state '%s' for task %s", state_value, task_id)
+        container.progress = snapshot.get("progress", container.progress)
+        container.metadata.update(snapshot.get("metadata", {}))
+        container.target_architecture = snapshot.get("target_architecture")
+        container.history = snapshot.get("history", [])
+        created_at = parse_datetime(snapshot.get("created_at"))
+        updated_at = parse_datetime(snapshot.get("updated_at"))
+        if created_at:
+            container.created_at = created_at
+        if updated_at:
+            container.updated_at = updated_at
+
+    for file_row in files:
+        content = file_row.get("content")
+        content_bytes = file_row.get("content_bytes")
+        if content is None and content_bytes is not None:
+            try:
+                content = content_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                content = content_bytes.decode("utf-8", errors="replace")
+        if content is not None:
+            container.files[file_row["path"]] = content
+
+    storage.containers[task_id] = container
+    return container
+
+
+def build_container_snapshot(container: Container) -> Dict[str, Any]:
+    file_entries = []
+    for filepath, content in container.files.items():
+        payload = content.encode("utf-8") if isinstance(content, str) else content
+        file_entries.append(
+            {
+                "path": filepath,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+                "mime_type": mimetypes.guess_type(filepath)[0],
+            }
+        )
+    return {
+        "project_id": container.project_id,
+        "state": container.state.value,
+        "progress": container.progress,
+        "metadata": container.metadata,
+        "target_architecture": container.target_architecture,
+        "history": container.history,
+        "created_at": container.created_at.isoformat(),
+        "updated_at": container.updated_at.isoformat(),
+        "files": file_entries,
+        "codex_hash": container.metadata.get("codex_hash"),
+        "iterations": container.metadata.get("iterations"),
+    }
+
+
+async def persist_container_snapshot(task_id: str, container: Container) -> None:
+    if not db.is_enabled():
+        return
+    await db.upsert_container_snapshot(task_id, build_container_snapshot(container))
+
+
+def build_file_payload(filepath: str, content: Any) -> Dict[str, Any]:
+    if isinstance(content, bytes):
+        payload = content
+        content_text = None
+        content_bytes = content
+    else:
+        payload = str(content).encode("utf-8")
+        content_text = str(content)
+        content_bytes = None
+    return {
+        "payload": payload,
+        "content": content_text,
+        "content_bytes": content_bytes,
+        "mime_type": mimetypes.guess_type(filepath)[0],
+    }
+
+
+async def persist_container_file(task_id: str, filepath: str, content: Any) -> None:
+    if not db.is_enabled():
+        return
+    file_data = build_file_payload(filepath, content)
+    sha256 = hashlib.sha256(file_data["payload"]).hexdigest()
+    size_bytes = len(file_data["payload"])
+    await db.upsert_task_file(
+        task_id,
+        filepath,
+        content=file_data["content"],
+        content_bytes=file_data["content_bytes"],
+        mime_type=file_data["mime_type"],
+        sha256=sha256,
+        size_bytes=size_bytes,
+        max_bytes=MAX_TASK_BYTES,
+        max_files=MAX_TASK_FILES,
+    )
+
+
+async def persist_all_container_files(task_id: str, container: Container) -> None:
+    if not db.is_enabled():
+        return
+    for filepath, content in container.files.items():
+        await persist_container_file(task_id, filepath, content)
 
 
 async def build_zip_response(task_id: str, request: Request) -> StreamingResponse:
-    container = resolve_container(task_id)
+    container = await resolve_container_with_db(task_id)
     if not container:
         raise HTTPException(status_code=404, detail="Container not found")
 
@@ -706,6 +855,7 @@ async def get_task_status(task_id: str):
         task_data = await db.get_task_row(task_id)
         if task_data is None:
             raise HTTPException(status_code=404, detail="Task not found")
+        await resolve_container_with_db(task_id)
         return enrich_task_data(task_id, task_data)
 
     if task_id not in storage.active_tasks:
@@ -772,7 +922,7 @@ async def get_task_state(task_id: str):
 @app.get("/api/tasks/{task_id}/files")
 async def get_task_files(task_id: str):
     """Получение списка файлов задачи"""
-    container = resolve_container(task_id)
+    container = await resolve_container_with_db(task_id)
     if not container:
         raise HTTPException(status_code=404, detail="Container not found")
     
@@ -800,7 +950,7 @@ async def get_task_files(task_id: str):
 @app.get("/api/tasks/{task_id}/files/{filepath:path}")
 async def get_file_content(task_id: str, filepath: str):
     """Получение содержимого файла"""
-    container = resolve_container(task_id)
+    container = await resolve_container_with_db(task_id)
     if not container:
         raise HTTPException(status_code=404, detail="Container not found")
     
@@ -815,6 +965,8 @@ async def get_file_content(task_id: str, filepath: str):
         raise HTTPException(status_code=404, detail="File not found")
     
     content = container.files[actual_path]
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", errors="replace")
     
     return {
         "path": actual_path,
@@ -932,6 +1084,7 @@ async def process_task_background(task_id: str, description: str):
         # Создаем оркестратор и контейнер
         orchestrator = AIOrchestrator()
         container = orchestrator.initialize_project(f"Task-{task_id[:8]}")
+        await persist_container_snapshot(task_id, container)
         storage.containers[task_id] = container
 
         stage_progress = {
@@ -971,6 +1124,7 @@ async def process_task_background(task_id: str, description: str):
                     active_role=stage_role.get(stage),
                 ),
             )
+            await persist_container_snapshot(task_id, container)
 
         async def handle_research_complete(payload: Dict[str, Any]) -> None:
             result = payload.get("result")
@@ -985,6 +1139,8 @@ async def process_task_background(task_id: str, description: str):
                 "ArtifactAdded",
                 normalize_payload({"type": "research_summary"}),
             )
+            await persist_all_container_files(task_id, container)
+            await persist_container_snapshot(task_id, container)
 
         async def handle_design_complete(payload: Dict[str, Any]) -> None:
             result = payload.get("result")
@@ -999,6 +1155,8 @@ async def process_task_background(task_id: str, description: str):
                 "ArtifactAdded",
                 normalize_payload({"type": "architecture"}),
             )
+            await persist_all_container_files(task_id, container)
+            await persist_container_snapshot(task_id, container)
 
         async def handle_review_result(payload: Dict[str, Any]) -> None:
             result = payload.get("result")
@@ -1021,6 +1179,8 @@ async def process_task_background(task_id: str, description: str):
                     }
                 ),
             )
+            await persist_all_container_files(task_id, container)
+            await persist_container_snapshot(task_id, container)
 
         async def handle_codex_loaded(payload: Dict[str, Any]) -> None:
             await record_event(
@@ -1043,6 +1203,8 @@ async def process_task_background(task_id: str, description: str):
         
         # Сохраняем контейнер в файл (для persistence)
         save_container_to_file(task_id, container)
+        await persist_all_container_files(task_id, container)
+        await persist_container_snapshot(task_id, container)
         
         # Обновляем финальный статус
         await apply_task_update(
