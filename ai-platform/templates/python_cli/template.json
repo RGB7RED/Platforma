@@ -1,0 +1,4 @@
+{
+  "id": "python_cli",
+  "description": "Minimal Python CLI starter with tests and Ruff configuration."
+}

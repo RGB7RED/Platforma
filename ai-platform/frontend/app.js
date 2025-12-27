@@ -69,6 +69,7 @@
     taskDescription: document.getElementById('taskDescription'),
     charCount: document.getElementById('charCount'),
     codexVersion: document.getElementById('codexVersion'),
+    templateSelect: document.getElementById('templateSelect'),
     currentTaskId: document.getElementById('currentTaskId'),
     progressBarFill: document.getElementById('progressBarFill'),
     progressPercentage: document.getElementById('progressPercentage'),
@@ -226,6 +227,47 @@
   const updateApiKeyInputs = (value) => {
     if (elements.apiKeyInput) {
       elements.apiKeyInput.value = value || '';
+    }
+  };
+
+  const setTemplateOptions = (templates) => {
+    if (!elements.templateSelect) {
+      return;
+    }
+    elements.templateSelect.innerHTML = '';
+    const noneOption = document.createElement('option');
+    noneOption.value = '';
+    noneOption.textContent = 'None';
+    elements.templateSelect.appendChild(noneOption);
+
+    templates.forEach((template) => {
+      if (!template || !template.template_id) {
+        return;
+      }
+      const option = document.createElement('option');
+      option.value = template.template_id;
+      const description = template.description ? ` — ${template.description}` : '';
+      option.textContent = `${template.template_id}${description}`;
+      elements.templateSelect.appendChild(option);
+    });
+  };
+
+  const loadTemplates = async () => {
+    if (!elements.templateSelect) {
+      return;
+    }
+    try {
+      const response = await fetch(buildApiUrl('/api/templates'), {
+        headers: buildAuthHeaders()
+      });
+      if (!response.ok) {
+        throw new Error('Templates unavailable');
+      }
+      const data = await response.json();
+      const templates = Array.isArray(data.templates) ? data.templates : [];
+      setTemplateOptions(templates);
+    } catch (error) {
+      setTemplateOptions([]);
     }
   };
 
@@ -506,6 +548,7 @@
     }
     setStoredApiKey(value);
     showToast('API key saved.', '✅');
+    loadTemplates();
   };
 
   const formatProgress = (progress) => {
@@ -1260,6 +1303,10 @@
     if (codexValue) {
       payload.codex_version = codexValue;
     }
+    const templateValue = elements.templateSelect?.value?.trim();
+    if (templateValue) {
+      payload.template_id = templateValue;
+    }
     if (window.USER_ID) {
       payload.user_id = window.USER_ID;
     }
@@ -1587,6 +1634,7 @@
   updateCharCount();
   updateApiBaseUrl();
   updateApiKeyInputs(getStoredApiKey());
+  loadTemplates();
   setActiveInspectorTab(activeInspectorTab);
   updateTimeTakenDisplay({});
 })();

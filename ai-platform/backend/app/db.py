@@ -44,6 +44,8 @@ async def init_db(database_url: str) -> None:
                 progress DOUBLE PRECISION NOT NULL DEFAULT 0,
                 current_stage TEXT NULL,
                 codex_version TEXT NULL,
+                template_id TEXT NULL,
+                template_hash TEXT NULL,
                 client_ip TEXT NULL,
                 owner_key_hash TEXT NULL,
                 result JSONB NULL,
@@ -61,6 +63,12 @@ async def init_db(database_url: str) -> None:
         )
         await conn.execute(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS failure_reason TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS template_id TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS template_hash TEXT;"
         )
         await _ensure_jsonb_column(conn, table="tasks", column="result")
         await _ensure_jsonb_column(conn, table="tasks", column="container_state")
@@ -284,6 +292,8 @@ async def create_task_row(
     progress: float,
     current_stage: Optional[str],
     codex_version: Optional[str],
+    template_id: Optional[str],
+    template_hash: Optional[str],
     client_ip: Optional[str],
     owner_key_hash: str,
 ) -> Dict[str, Any]:
@@ -301,10 +311,12 @@ async def create_task_row(
                 progress,
                 current_stage,
                 codex_version,
+                template_id,
+                template_hash,
                 client_ip,
                 owner_key_hash
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING *;
             """,
             _coerce_task_id(task_id),
@@ -314,6 +326,8 @@ async def create_task_row(
             progress,
             current_stage,
             codex_version,
+            template_id,
+            template_hash,
             client_ip,
             owner_key_hash,
         )

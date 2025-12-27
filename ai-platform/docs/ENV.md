@@ -97,6 +97,12 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Optional
 - **Notes:** Defaults to `TASK_TTL_DAYS` when unset. When set to `0`, workspaces are retained.
 
+### TEMPLATES_ROOT
+- **Purpose:** Filesystem path for project templates used to seed new task workspaces.
+- **Example:** `TEMPLATES_ROOT=ai-platform/templates`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `ai-platform/templates` relative to the repo root.
+
 ### ALLOWED_COMMANDS
 - **Purpose:** Allowlist for safe command runner executables.
 - **Example:** `ALLOWED_COMMANDS=ruff,pytest,python`

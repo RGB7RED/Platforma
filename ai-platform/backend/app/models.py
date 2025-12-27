@@ -73,6 +73,8 @@ class Container:
             "ai_models_used": [],
             "total_tokens": 0,
             "llm_usage": [],
+            "template_id": None,
+            "template_hash": None,
             "llm_usage_summary": {
                 "total_tokens_in": 0,
                 "total_tokens_out": 0,
