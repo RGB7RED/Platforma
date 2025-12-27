@@ -9,10 +9,16 @@ import shutil
 import subprocess
 import tempfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Any, Optional, List
 
 from .models import Container
+from .llm import (
+    LLMProviderError,
+    generate_with_retry,
+    get_llm_provider,
+    load_llm_settings,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -423,44 +429,190 @@ class AICoder(AIAgent):
         task_type = task.get("type", "")
         component = task.get("component", "")
         filepath = task.get("file", "")
-        
-        # Генерируем код в зависимости от задачи
-        if task_type == "implement_component":
-            content = self._generate_component_code(component, filepath)
-        elif task_type == "write_tests":
-            content = self._generate_test_code(filepath)
-        else:
-            content = f"# Placeholder for {task_type}\n# File: {filepath}\n\n# Implementation goes here\n"
-        
-        # Добавляем файл в контейнер
-        container.add_file(filepath, content)
-        
-        # Добавляем артефакт
+
+        settings = load_llm_settings()
+        provider = get_llm_provider(settings)
+        rules = self._get_role_rules()
+        allowed_paths = task.get("allowed_paths") or container.metadata.get("allowed_paths") or []
+        if not isinstance(allowed_paths, list):
+            allowed_paths = []
+        max_files = rules.get("parameters", {}).get("max_files_per_iteration", 5)
+
+        messages = self._build_messages(
+            task=task,
+            container=container,
+            rules=rules,
+            allowed_paths=allowed_paths,
+        )
+
+        request_started_at = datetime.now().isoformat()
+        try:
+            response = await generate_with_retry(provider, messages, settings)
+        except LLMProviderError as exc:
+            self._log_action("llm_failed", {"error": str(exc)})
+            raise
+        request_finished_at = datetime.now().isoformat()
+
+        response_text = response.get("text", "")
+        parsed = self._parse_llm_response(response_text)
+
+        files = parsed.get("files", [])
+        if isinstance(parsed.get("file"), dict):
+            files.append(parsed["file"])
+        if parsed.get("content") and filepath:
+            files.append({"path": filepath, "content": parsed["content"]})
+
+        if not files:
+            raise ValueError("LLM response did not include any files to write.")
+
+        if len(files) > max_files:
+            files = files[:max_files]
+
+        written_files = []
+        for file_entry in files:
+            path = str(file_entry.get("path") or file_entry.get("file") or "").strip()
+            content = str(file_entry.get("content") or "")
+            if not path:
+                continue
+            self._assert_safe_path(path, allowed_paths)
+            container.add_file(path, content)
+            written_files.append(path)
+
+            container.add_artifact(
+                "code",
+                {
+                    "file": path,
+                    "task": task,
+                    "generated_at": datetime.now().isoformat(),
+                    "size": len(content),
+                    "lines": len(content.split('\n')),
+                },
+                self.role_name,
+            )
+
+        artifacts = parsed.get("artifacts") or {}
+        if not isinstance(artifacts, dict):
+            artifacts = {}
+        if not artifacts:
+            artifacts = {
+                "code_summary": f"Updated files: {', '.join(written_files)}",
+            }
+
+        usage = response.get("usage", {}) or {}
+        tokens_in = int(usage.get("input_tokens", 0) or 0)
+        tokens_out = int(usage.get("output_tokens", 0) or 0)
+        container.record_llm_usage(
+            stage="implementation",
+            provider=provider.name,
+            model=settings.model,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            metadata={"task_type": task_type},
+        )
+
+        usage_report = {
+            "stage": "implementation",
+            "provider": provider.name,
+            "model": settings.model,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "total_tokens": tokens_in + tokens_out,
+            "started_at": request_started_at,
+            "finished_at": request_finished_at,
+            "task": task.get("description"),
+        }
+        container.add_artifact("usage_report", usage_report, self.role_name)
+        artifact_type = "implementation_plan" if "implementation_plan" in artifacts else "code_summary"
         container.add_artifact(
-            "code",
-            {
-                "file": filepath,
-                "task": task,
-                "generated_at": datetime.now().isoformat(),
-                "size": len(content),
-                "lines": len(content.split('\n'))
-            },
-            self.role_name
+            artifact_type,
+            artifacts.get(artifact_type),
+            self.role_name,
         )
         
         self.files_created += 1
         self._log_action("coding_completed", {
-            "file": filepath,
+            "files": written_files,
             "task": task_type,
             "files_created": self.files_created
         })
         
         return {
-            "file": filepath,
-            "content_preview": content[:200] + "..." if len(content) > 200 else content,
-            "size": len(content),
-            "lines": len(content.split('\n'))
+            "files": written_files,
+            "artifact_type": artifact_type,
+            "llm_usage": usage_report,
+            "usage_report": usage_report,
         }
+
+    def _build_messages(
+        self,
+        *,
+        task: Dict[str, Any],
+        container: Container,
+        rules: Dict[str, Any],
+        allowed_paths: List[str],
+    ) -> List[Dict[str, str]]:
+        context = container.get_relevant_context("coder")
+        task_description = task.get("description", "")
+        target_file = task.get("file", "")
+        constraints = rules.get("constraints", [])
+        system_prompt = (
+            "You are the Coder agent. Follow the codex rules strictly.\n"
+            "Return JSON only with fields: files (list of {path, content}), "
+            "artifacts (object with implementation_plan or code_summary).\n"
+            "Do not include secrets or API keys in outputs."
+        )
+        user_payload = {
+            "Task": task_description,
+            "Type": task.get("type"),
+            "Component": task.get("component"),
+            "Target file": target_file,
+            "Allowed paths": allowed_paths,
+            "Existing files": context.get("files", []),
+            "Architecture": context.get("architecture"),
+            "Recent changes": context.get("recent_changes"),
+            "Constraints": constraints,
+        }
+        user_prompt = f"{json.dumps(user_payload, ensure_ascii=False, indent=2)}"
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def _parse_llm_response(self, text: str) -> Dict[str, Any]:
+        """Parse JSON response, handling optional code fences."""
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(cleaned[start : end + 1])
+            raise
+
+    def _assert_safe_path(self, path: str, allowed_paths: List[str]) -> None:
+        pure_path = PurePosixPath(path)
+        if pure_path.is_absolute() or path.startswith("~"):
+            raise ValueError(f"Unsafe path rejected: {path}")
+        if ".." in pure_path.parts:
+            raise ValueError(f"Path traversal rejected: {path}")
+        if allowed_paths:
+            normalized_allowed = [PurePosixPath(p) for p in allowed_paths if p]
+            if normalized_allowed:
+                if not any(self._is_path_within(pure_path, allowed) for allowed in normalized_allowed):
+                    raise ValueError(f"Path '{path}' not within allowed paths: {allowed_paths}")
+
+    @staticmethod
+    def _is_path_within(path: PurePosixPath, base: PurePosixPath) -> bool:
+        try:
+            path.relative_to(base)
+            return True
+        except ValueError:
+            return False
     
     def _generate_component_code(self, component: str, filepath: str) -> str:
         """Генерировать код компонента"""

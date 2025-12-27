@@ -54,6 +54,7 @@ class Container:
             "review_report": [],
             "patch_diff": [],
             "repro_manifest": [],
+            "usage_report": [],
         }
         
         # Уровень 3: История изменений
@@ -70,7 +71,14 @@ class Container:
             "iterations": 0,
             "active_role": None,
             "ai_models_used": [],
-            "total_tokens": 0
+            "total_tokens": 0,
+            "llm_usage": [],
+            "llm_usage_summary": {
+                "total_tokens_in": 0,
+                "total_tokens_out": 0,
+                "by_stage": {},
+                "models": {},
+            },
         }
         self.file_update_hook: Optional[Callable[[str, Any], None]] = None
         
@@ -215,6 +223,51 @@ class Container:
         """Обновить прогресс выполнения"""
         self.progress = max(0.0, min(1.0, progress))
         self._add_history_entry("progress_updated", {"progress": self.progress})
+
+    def record_llm_usage(
+        self,
+        *,
+        stage: str,
+        provider: str,
+        model: str,
+        tokens_in: int,
+        tokens_out: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record LLM usage and update summary counters."""
+        usage_entry = {
+            "stage": stage,
+            "provider": provider,
+            "model": model,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "total_tokens": tokens_in + tokens_out,
+            "created_at": datetime.now().isoformat(),
+        }
+        if metadata:
+            usage_entry["metadata"] = metadata
+        self.metadata.setdefault("llm_usage", []).append(usage_entry)
+
+        summary = self.metadata.setdefault(
+            "llm_usage_summary",
+            {"total_tokens_in": 0, "total_tokens_out": 0, "by_stage": {}, "models": {}},
+        )
+        summary["total_tokens_in"] += tokens_in
+        summary["total_tokens_out"] += tokens_out
+
+        stage_summary = summary["by_stage"].setdefault(
+            stage,
+            {"tokens_in": 0, "tokens_out": 0, "total_tokens": 0, "models": {}},
+        )
+        stage_summary["tokens_in"] += tokens_in
+        stage_summary["tokens_out"] += tokens_out
+        stage_summary["total_tokens"] += tokens_in + tokens_out
+        stage_summary["models"][model] = stage_summary["models"].get(model, 0) + 1
+
+        summary["models"][model] = summary["models"].get(model, 0) + 1
+        self.metadata["total_tokens"] = summary["total_tokens_in"] + summary["total_tokens_out"]
+        if model not in self.metadata.get("ai_models_used", []):
+            self.metadata.setdefault("ai_models_used", []).append(model)
     
     def _add_history_entry(self, action: str, details: Dict[str, Any]) -> None:
         """Добавить запись в историю"""
@@ -256,6 +309,13 @@ class Container:
         container.state = ProjectState(data["state"])
         container.progress = data["progress"]
         container.metadata = data["metadata"]
+        container.metadata.setdefault("llm_usage", [])
+        container.metadata.setdefault(
+            "llm_usage_summary",
+            {"total_tokens_in": 0, "total_tokens_out": 0, "by_stage": {}, "models": {}},
+        )
+        container.metadata.setdefault("ai_models_used", [])
+        container.metadata.setdefault("total_tokens", 0)
         container.target_architecture = data.get("target_architecture")
         container.history = data["history"]
         container.created_at = datetime.fromisoformat(data["created_at"])
