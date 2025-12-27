@@ -27,7 +27,10 @@ USER appuser
 RUN mkdir -p /app/data/tasks /app/data/logs
 
 # Открываем порт
-EXPOSE 8000
+EXPOSE 8080
+
+# Дефолтный порт для приложения
+ENV PORT=8080
 
 # Команда для запуска приложения
 CMD ["python", "run.py"]

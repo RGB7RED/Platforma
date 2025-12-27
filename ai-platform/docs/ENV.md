@@ -14,9 +14,9 @@ Open `http://localhost` in your browser.
 
 ### PORT
 - **Purpose:** Port to bind the backend server.
-- **Example:** `PORT=8000`
+- **Example:** `PORT=8080`
 - **Required in production?:** Yes (Railway assigns this value)
-- **Notes:** Defaults to `8000` when unset. Used by `backend/run.py` to bind Uvicorn.
+- **Notes:** Defaults to `8080` when unset. Used by `backend/run.py` to bind Uvicorn.
 
 ### ALLOWED_ORIGINS
 - **Purpose:** CORS allowlist for browser clients.
