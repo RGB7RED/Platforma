@@ -11,7 +11,25 @@
     return '';
   };
 
+  const resolveAuthMode = () => {
+    const configValue = window.__APP_CONFIG__?.AUTH_MODE;
+    if (typeof configValue === 'string' && configValue.trim()) {
+      return configValue.trim().toLowerCase();
+    }
+    const metaValue = document.querySelector('meta[name="auth-mode"]')?.content;
+    if (typeof metaValue === 'string' && metaValue.trim()) {
+      return metaValue.trim().toLowerCase();
+    }
+    return 'apikey';
+  };
+
   const API_BASE_URL = resolveApiBaseUrl();
+  const AUTH_MODE = resolveAuthMode();
+  const AUTH_MODE_APIKEY = 'apikey';
+  const AUTH_MODE_AUTH = 'auth';
+  const AUTH_MODE_HYBRID = 'hybrid';
+  const isAuthEnabled = AUTH_MODE === AUTH_MODE_AUTH || AUTH_MODE === AUTH_MODE_HYBRID;
+  const isApiKeyEnabled = AUTH_MODE === AUTH_MODE_APIKEY || AUTH_MODE === AUTH_MODE_HYBRID;
   const normalizeBaseUrl = (value) => value.replace(/\/+$/, '');
   const normalizePath = (value) => (value.startsWith('/') ? value : `/${value}`);
   const buildApiUrl = (path) => {
@@ -37,12 +55,7 @@
     }
   };
 
-  const appendAuthQuery = (url) => {
-    const accessToken = getStoredAccessToken();
-    if (accessToken) {
-      const separator = url.includes('?') ? '&' : '?';
-      return `${url}${separator}access_token=${encodeURIComponent(accessToken)}`;
-    }
+  const appendApiKeyQuery = (url) => {
     const apiKey = getStoredApiKey();
     if (!apiKey) {
       return url;
@@ -51,12 +64,19 @@
     return `${url}${separator}api_key=${encodeURIComponent(apiKey)}`;
   };
 
+  const appendTokenQuery = (url, token) => {
+    if (!token) {
+      return url;
+    }
+    const separator = url.includes('?') ? '&' : '?';
+    return `${url}${separator}token=${encodeURIComponent(token)}`;
+  };
+
   const POLL_INTERVAL_MS = 2000;
   const POLL_SLOW_INTERVAL_MS = 4000;
   const POLL_TIMEOUT_MS = 3 * 60 * 1000;
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'error']);
   const API_KEY_STORAGE_KEY = 'aiPlatformApiKey';
-  const ACCESS_TOKEN_STORAGE_KEY = 'aiPlatformAccessToken';
 
   const elements = {
     welcomeScreen: document.getElementById('welcomeScreen'),
@@ -83,6 +103,25 @@
     currentStage: document.getElementById('currentStage'),
     taskStatus: document.getElementById('taskStatus'),
     apiBaseUrl: document.getElementById('apiBaseUrl'),
+    authPanel: document.getElementById('authPanel'),
+    authStatus: document.getElementById('authStatus'),
+    authShowLoginBtn: document.getElementById('authShowLoginBtn'),
+    authShowRegisterBtn: document.getElementById('authShowRegisterBtn'),
+    authShowForgotBtn: document.getElementById('authShowForgotBtn'),
+    authLoginScreen: document.getElementById('authLoginScreen'),
+    authRegisterScreen: document.getElementById('authRegisterScreen'),
+    authForgotScreen: document.getElementById('authForgotScreen'),
+    authLoginEmail: document.getElementById('authLoginEmail'),
+    authLoginPassword: document.getElementById('authLoginPassword'),
+    authRegisterEmail: document.getElementById('authRegisterEmail'),
+    authRegisterPassword: document.getElementById('authRegisterPassword'),
+    authForgotEmail: document.getElementById('authForgotEmail'),
+    authLoginBtn: document.getElementById('authLoginBtn'),
+    authRegisterBtn: document.getElementById('authRegisterBtn'),
+    authForgotBtn: document.getElementById('authForgotBtn'),
+    authLogoutBtn: document.getElementById('authLogoutBtn'),
+    accessTokenGroup: document.getElementById('accessTokenGroup'),
+    apiKeyGroup: document.getElementById('apiKeyGroup'),
     apiKeyInput: document.getElementById('apiKeyInput'),
     saveApiKeyBtn: document.getElementById('saveApiKeyBtn'),
     accessTokenInput: document.getElementById('accessTokenInput'),
@@ -135,6 +174,9 @@
 
   let currentTaskId = null;
   let pollStartTime = null;
+  let inMemoryAccessToken = '';
+  let authUser = null;
+  let refreshPromise = null;
   let pollingIntervals = {
     status: null,
     state: null,
@@ -225,12 +267,52 @@
     elements.apiBaseUrl.textContent = API_BASE_URL || '(same origin)';
   };
 
+  const updateAuthStatus = () => {
+    if (!elements.authStatus) {
+      return;
+    }
+    if (getStoredAccessToken()) {
+      const label = authUser?.email ? `Signed in as ${authUser.email}` : 'Signed in';
+      elements.authStatus.textContent = label;
+      if (elements.authLogoutBtn) {
+        elements.authLogoutBtn.disabled = false;
+      }
+      return;
+    }
+    elements.authStatus.textContent = 'Not signed in.';
+    if (elements.authLogoutBtn) {
+      elements.authLogoutBtn.disabled = true;
+    }
+  };
+
+  const updateAuthModeVisibility = () => {
+    if (elements.authPanel) {
+      elements.authPanel.classList.toggle('hidden', !isAuthEnabled);
+    }
+    if (elements.apiKeyGroup) {
+      elements.apiKeyGroup.classList.toggle('hidden', !isApiKeyEnabled);
+    }
+    if (elements.accessTokenGroup) {
+      const shouldShowAccessTokenInput = AUTH_MODE === AUTH_MODE_HYBRID;
+      elements.accessTokenGroup.classList.toggle('hidden', !shouldShowAccessTokenInput);
+    }
+    if (elements.googleSignInBtn) {
+      elements.googleSignInBtn.classList.toggle('hidden', !isAuthEnabled);
+    }
+  };
+
   const getStoredApiKey = () => {
+    if (!isApiKeyEnabled) {
+      return '';
+    }
     const value = window.localStorage.getItem(API_KEY_STORAGE_KEY);
     return typeof value === 'string' ? value.trim() : '';
   };
 
   const setStoredApiKey = (value) => {
+    if (!isApiKeyEnabled) {
+      return;
+    }
     const normalized = value.trim();
     if (!normalized) {
       window.localStorage.removeItem(API_KEY_STORAGE_KEY);
@@ -242,19 +324,21 @@
   };
 
   const getStoredAccessToken = () => {
-    const value = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY);
-    return typeof value === 'string' ? value.trim() : '';
+    return inMemoryAccessToken;
   };
 
-  const setStoredAccessToken = (value) => {
+  const setStoredAccessToken = (value, user = null) => {
     const normalized = value.trim();
+    inMemoryAccessToken = normalized;
     if (!normalized) {
-      window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
-      updateAccessTokenInputs('');
-      return;
+      authUser = null;
+    } else if (user !== null) {
+      authUser = user;
+    } else {
+      authUser = null;
     }
-    window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, normalized);
     updateAccessTokenInputs(normalized);
+    updateAuthStatus();
   };
 
   const updateApiKeyInputs = (value) => {
@@ -282,7 +366,7 @@
       return;
     }
     setStoredAccessToken(accessToken);
-    showToast('Signed in with Google. Access token saved.', '✅');
+    showToast('Signed in with Google.', '✅');
     window.history.replaceState(
       null,
       document.title,
@@ -290,7 +374,8 @@
     );
   };
 
-  const hasAuthCredentials = () => Boolean(getStoredAccessToken() || getStoredApiKey());
+  const hasAuthCredentials = () =>
+    Boolean(getStoredAccessToken() || (isApiKeyEnabled && getStoredApiKey()));
 
   const setTemplateOptions = (templates) => {
     if (!elements.templateSelect) {
@@ -319,9 +404,7 @@
       return;
     }
     try {
-      const response = await fetch(buildApiUrl('/api/templates'), {
-        headers: buildAuthHeaders()
-      });
+      const response = await apiFetch(buildApiUrl('/api/templates'));
       if (!response.ok) {
         throw new Error('Templates unavailable');
       }
@@ -345,6 +428,186 @@
       headers['X-API-Key'] = apiKey;
     }
     return headers;
+  };
+
+  const refreshAccessToken = async () => {
+    if (!isAuthEnabled) {
+      return null;
+    }
+    if (refreshPromise) {
+      return refreshPromise;
+    }
+    refreshPromise = (async () => {
+      try {
+        const response = await fetch(buildApiUrl('/auth/refresh'), {
+          method: 'POST',
+          credentials: 'include'
+        });
+        if (!response.ok) {
+          setStoredAccessToken('', null);
+          return null;
+        }
+        const data = await response.json();
+        const token = data?.access_token || data?.token;
+        const user = data?.user || null;
+        if (token) {
+          setStoredAccessToken(token, user);
+          return token;
+        }
+        setStoredAccessToken('', null);
+        return null;
+      } catch (error) {
+        return null;
+      } finally {
+        refreshPromise = null;
+      }
+    })();
+    return refreshPromise;
+  };
+
+  const apiFetch = async (url, options = {}, { retryOnUnauthorized = true, includeAuth = true } = {}) => {
+    const { headers: extraHeaders, ...rest } = options;
+    const headers = includeAuth ? buildAuthHeaders(extraHeaders) : { ...(extraHeaders || {}) };
+    const accessToken = getStoredAccessToken();
+    const apiKey = getStoredApiKey();
+    const shouldIncludeCredentials = isAuthEnabled;
+    const response = await fetch(url, {
+      ...rest,
+      headers,
+      credentials: shouldIncludeCredentials ? 'include' : rest.credentials
+    });
+    if (
+      response.status === 401 &&
+      retryOnUnauthorized &&
+      isAuthEnabled &&
+      (accessToken || !apiKey)
+    ) {
+      const refreshed = await refreshAccessToken();
+      if (refreshed) {
+        return apiFetch(url, options, { retryOnUnauthorized: false, includeAuth });
+      }
+    }
+    return response;
+  };
+
+  const setAuthView = (view) => {
+    const views = [
+      { key: 'login', element: elements.authLoginScreen },
+      { key: 'register', element: elements.authRegisterScreen },
+      { key: 'forgot', element: elements.authForgotScreen }
+    ];
+    views.forEach(({ key, element }) => {
+      if (!element) {
+        return;
+      }
+      element.classList.toggle('hidden', key !== view);
+    });
+  };
+
+  const handleAuthResponse = async (response, successMessage) => {
+    if (!response.ok) {
+      const message =
+        response.status === 401
+          ? 'Invalid credentials.'
+          : response.status === 409
+            ? 'Account already exists.'
+            : `Request failed (${response.status})`;
+      throw new Error(message);
+    }
+    const data = await response.json();
+    const token = data?.access_token || data?.token;
+    if (token) {
+      setStoredAccessToken(token, data?.user || null);
+      showToast(successMessage, '✅');
+      return true;
+    }
+    throw new Error('No access token returned.');
+  };
+
+  const loginWithEmail = async () => {
+    const email = elements.authLoginEmail?.value.trim();
+    const password = elements.authLoginPassword?.value || '';
+    if (!email || !password) {
+      showToast('Please enter your email and password.', '⚠️');
+      return;
+    }
+    try {
+      const response = await apiFetch(buildApiUrl('/auth/login'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password })
+      }, { includeAuth: false, retryOnUnauthorized: false });
+      await handleAuthResponse(response, 'Signed in successfully.');
+    } catch (error) {
+      showToast(error?.message || 'Unable to sign in.', '⚠️');
+    }
+  };
+
+  const registerWithEmail = async () => {
+    const email = elements.authRegisterEmail?.value.trim();
+    const password = elements.authRegisterPassword?.value || '';
+    if (!email || !password) {
+      showToast('Please enter your email and password.', '⚠️');
+      return;
+    }
+    try {
+      const response = await apiFetch(buildApiUrl('/auth/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password })
+      }, { includeAuth: false, retryOnUnauthorized: false });
+      await handleAuthResponse(response, 'Account created. You are signed in.');
+    } catch (error) {
+      showToast(error?.message || 'Unable to register.', '⚠️');
+    }
+  };
+
+  const requestPasswordReset = async () => {
+    const email = elements.authForgotEmail?.value.trim();
+    if (!email) {
+      showToast('Please enter your email.', '⚠️');
+      return;
+    }
+    try {
+      const response = await apiFetch(buildApiUrl('/auth/request-password-reset'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      }, { includeAuth: false, retryOnUnauthorized: false });
+      if (!response.ok) {
+        throw new Error(`Request failed (${response.status})`);
+      }
+      showToast('If the account exists, a reset email was sent.', '✅');
+    } catch (error) {
+      showToast(error?.message || 'Unable to request reset email.', '⚠️');
+    }
+  };
+
+  const logout = async () => {
+    if (!isAuthEnabled) {
+      setStoredAccessToken('', null);
+      return;
+    }
+    try {
+      await apiFetch(buildApiUrl('/auth/logout'), {
+        method: 'POST'
+      }, { retryOnUnauthorized: false });
+    } catch (error) {
+      // Ignore logout failures.
+    } finally {
+      setStoredAccessToken('', null);
+      showToast('Signed out.', 'ℹ️');
+    }
+  };
+
+  const bootstrapAuthSession = async () => {
+    if (!isAuthEnabled) {
+      return;
+    }
+    const token = await refreshAccessToken();
+    if (token) {
+      updateAuthStatus();
+    }
   };
 
   const formatShortDate = (value) => {
@@ -646,7 +909,7 @@
       return;
     }
     setStoredAccessToken(value);
-    showToast('Access token saved.', '✅');
+    showToast('Access token stored for this session.', '✅');
     loadTemplates();
   };
 
@@ -792,9 +1055,7 @@
 
   const fetchJson = async (url) => {
     try {
-      const response = await fetch(url, {
-        headers: buildAuthHeaders()
-      });
+      const response = await apiFetch(url);
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
           ? 'Invalid credentials or no access to this task.'
@@ -1457,12 +1718,38 @@
     }
   };
 
-  const startWebSocket = (taskId) => {
+  const fetchWsToken = async () => {
+    try {
+      const response = await apiFetch(buildApiUrl('/auth/ws-token'), {
+        method: 'POST'
+      });
+      if (!response.ok) {
+        return null;
+      }
+      const data = await response.json();
+      return data?.token || data?.ws_token || data?.access_token || null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const startWebSocket = async (taskId) => {
     closeWebSocket();
-    if (!getStoredAccessToken() && !getStoredApiKey()) {
+    const accessToken = getStoredAccessToken();
+    const apiKey = getStoredApiKey();
+    let wsUrl = '';
+    if (isAuthEnabled && (accessToken || !apiKey)) {
+      const wsToken = await fetchWsToken();
+      if (!wsToken) {
+        showToast('Unable to start live updates. Please refresh.', '⚠️');
+        return;
+      }
+      wsUrl = appendTokenQuery(buildWebSocketUrl(taskId), wsToken);
+    } else if (apiKey) {
+      wsUrl = appendApiKeyQuery(buildWebSocketUrl(taskId));
+    } else {
       return;
     }
-    const wsUrl = appendAuthQuery(buildWebSocketUrl(taskId));
     try {
       activeSocket = new WebSocket(wsUrl);
     } catch (error) {
@@ -1499,11 +1786,11 @@
 
   const postClarificationInput = async (taskId, answers, { autoResume = false } = {}) => {
     try {
-      const response = await fetch(buildApiUrl(`/api/tasks/${taskId}/input`), {
+      const response = await apiFetch(buildApiUrl(`/api/tasks/${taskId}/input`), {
         method: 'POST',
-        headers: buildAuthHeaders({
+        headers: {
           'Content-Type': 'application/json'
-        }),
+        },
         body: JSON.stringify({ answers, auto_resume: autoResume })
       });
       if (!response.ok) {
@@ -1522,11 +1809,11 @@
 
   const resumeClarificationTask = async (taskId) => {
     try {
-      const response = await fetch(buildApiUrl(`/api/tasks/${taskId}/resume`), {
+      const response = await apiFetch(buildApiUrl(`/api/tasks/${taskId}/resume`), {
         method: 'POST',
-        headers: buildAuthHeaders({
+        headers: {
           'Content-Type': 'application/json'
-        })
+        }
       });
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
@@ -1576,7 +1863,7 @@
     }
     showSection(elements.taskProgress);
     startPolling(taskId);
-    startWebSocket(taskId);
+    void startWebSocket(taskId);
   };
 
   const submitTask = async () => {
@@ -1608,11 +1895,11 @@
     }
 
     try {
-      const response = await fetch(buildApiUrl('/api/tasks'), {
+      const response = await apiFetch(buildApiUrl('/api/tasks'), {
         method: 'POST',
-        headers: buildAuthHeaders({
+        headers: {
           'Content-Type': 'application/json'
-        }),
+        },
         body: JSON.stringify(payload)
       });
 
@@ -1726,11 +2013,11 @@
     }
     setLoading(true, 'Running review...', 'Executing ruff and pytest checks');
     try {
-      const response = await fetch(buildApiUrl(`/api/tasks/${currentTaskId}/rerun-review`), {
+      const response = await apiFetch(buildApiUrl(`/api/tasks/${currentTaskId}/rerun-review`), {
         method: 'POST',
-        headers: buildAuthHeaders({
+        headers: {
           'Content-Type': 'application/json'
-        })
+        }
       });
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
@@ -1851,6 +2138,40 @@
     });
   }
 
+  if (elements.authShowLoginBtn) {
+    elements.authShowLoginBtn.addEventListener('click', () => {
+      setAuthView('login');
+    });
+  }
+
+  if (elements.authShowRegisterBtn) {
+    elements.authShowRegisterBtn.addEventListener('click', () => {
+      setAuthView('register');
+    });
+  }
+
+  if (elements.authShowForgotBtn) {
+    elements.authShowForgotBtn.addEventListener('click', () => {
+      setAuthView('forgot');
+    });
+  }
+
+  if (elements.authLoginBtn) {
+    elements.authLoginBtn.addEventListener('click', loginWithEmail);
+  }
+
+  if (elements.authRegisterBtn) {
+    elements.authRegisterBtn.addEventListener('click', registerWithEmail);
+  }
+
+  if (elements.authForgotBtn) {
+    elements.authForgotBtn.addEventListener('click', requestPasswordReset);
+  }
+
+  if (elements.authLogoutBtn) {
+    elements.authLogoutBtn.addEventListener('click', logout);
+  }
+
   if (elements.apiKeyInput) {
     elements.apiKeyInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
@@ -1865,6 +2186,43 @@
         event.preventDefault();
         saveAccessToken();
       }
+    });
+  }
+
+  const handleAuthInputSubmit = (event, action) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      action();
+    }
+  };
+
+  if (elements.authLoginEmail) {
+    elements.authLoginEmail.addEventListener('keydown', (event) => {
+      handleAuthInputSubmit(event, loginWithEmail);
+    });
+  }
+
+  if (elements.authLoginPassword) {
+    elements.authLoginPassword.addEventListener('keydown', (event) => {
+      handleAuthInputSubmit(event, loginWithEmail);
+    });
+  }
+
+  if (elements.authRegisterEmail) {
+    elements.authRegisterEmail.addEventListener('keydown', (event) => {
+      handleAuthInputSubmit(event, registerWithEmail);
+    });
+  }
+
+  if (elements.authRegisterPassword) {
+    elements.authRegisterPassword.addEventListener('keydown', (event) => {
+      handleAuthInputSubmit(event, registerWithEmail);
+    });
+  }
+
+  if (elements.authForgotEmail) {
+    elements.authForgotEmail.addEventListener('keydown', (event) => {
+      handleAuthInputSubmit(event, requestPasswordReset);
     });
   }
 
@@ -1963,9 +2321,7 @@
     }
     const downloadUrl = buildApiUrl(`/api/tasks/${taskId}/download.zip`);
     try {
-      const response = await fetch(downloadUrl, {
-        headers: buildAuthHeaders()
-      });
+      const response = await apiFetch(downloadUrl);
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
           ? 'Invalid credentials or no access to this task.'
@@ -1994,9 +2350,7 @@
     }
     const downloadUrl = buildApiUrl(`/api/tasks/${taskId}/git-export.zip`);
     try {
-      const response = await fetch(downloadUrl, {
-        headers: buildAuthHeaders()
-      });
+      const response = await apiFetch(downloadUrl);
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
           ? 'Invalid credentials or no access to this task.'
@@ -2054,10 +2408,13 @@
 
   updateCharCount();
   updateApiBaseUrl();
+  updateAuthModeVisibility();
+  updateAuthStatus();
+  setAuthView('login');
   syncAccessTokenFromHash();
   updateApiKeyInputs(getStoredApiKey());
   updateAccessTokenInputs(getStoredAccessToken());
-  loadTemplates();
+  void bootstrapAuthSession().then(loadTemplates);
   setActiveInspectorTab(activeInspectorTab);
   updateTimeTakenDisplay({});
 })();
