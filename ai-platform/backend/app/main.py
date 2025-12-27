@@ -58,6 +58,7 @@ class TaskRequest(BaseModel):
     description: str
     user_id: Optional[str] = None
     codex_version: Optional[str] = "1.0.0-mvp"
+    template_id: Optional[str] = None
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -84,6 +85,8 @@ database_url = os.getenv("DATABASE_URL")
 TASK_TTL_DAYS_ENV = os.getenv("TASK_TTL_DAYS")
 APP_API_KEY = os.getenv("APP_API_KEY")
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "data/workspaces"))
+DEFAULT_TEMPLATES_ROOT = Path(__file__).resolve().parents[2] / "templates"
+TEMPLATES_ROOT = Path(os.getenv("TEMPLATES_ROOT", str(DEFAULT_TEMPLATES_ROOT)))
 WORKSPACE_TTL_DAYS_ENV = os.getenv("WORKSPACE_TTL_DAYS")
 COMMAND_TIMEOUT_SECONDS = os.getenv("COMMAND_TIMEOUT_SECONDS")
 COMMAND_MAX_OUTPUT_BYTES = os.getenv("COMMAND_MAX_OUTPUT_BYTES")
@@ -817,6 +820,7 @@ def aggregate_llm_usage(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
 class QueueItem:
     task_id: str
     description: str
+    template_id: Optional[str] = None
     request_id: Optional[str] = None
 
 
@@ -1116,6 +1120,95 @@ def capture_baseline_files(container: Container) -> Dict[str, Dict[str, Any]]:
     return {path: build_file_record(content) for path, content in container.files.items()}
 
 
+@dataclass
+class TemplateInfo:
+    template_id: str
+    description: str
+    hash: str
+    files: Dict[str, Any]
+
+
+def load_template_manifest(template_path: Path) -> Dict[str, Any]:
+    manifest_path = template_path / "template.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        logger.warning("Invalid template manifest at %s", manifest_path)
+    return {}
+
+
+def collect_template_files(template_path: Path) -> Dict[str, Any]:
+    files: Dict[str, Any] = {}
+    for path in sorted(template_path.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name == "template.json":
+            continue
+        relative_path = path.relative_to(template_path).as_posix()
+        data = path.read_bytes()
+        try:
+            content: Any = data.decode("utf-8")
+        except UnicodeDecodeError:
+            content = data
+        files[relative_path] = content
+    return files
+
+
+def compute_template_hash(files: Dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(files.keys()):
+        digest.update(path.encode("utf-8"))
+        content = files[path]
+        if isinstance(content, (bytes, bytearray)):
+            payload = bytes(content)
+        else:
+            payload = str(content).encode("utf-8")
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def resolve_template(template_id: str) -> Optional[TemplateInfo]:
+    root = TEMPLATES_ROOT.resolve()
+    template_path = (root / template_id).resolve()
+    if not template_path.is_relative_to(root):
+        return None
+    if not template_path.exists() or not template_path.is_dir():
+        return None
+    manifest = load_template_manifest(template_path)
+    description = manifest.get("description")
+    if not isinstance(description, str):
+        description = ""
+    files = collect_template_files(template_path)
+    template_hash = compute_template_hash(files)
+    return TemplateInfo(
+        template_id=template_id,
+        description=description,
+        hash=template_hash,
+        files=files,
+    )
+
+
+def list_available_templates() -> List[Dict[str, Any]]:
+    templates: List[Dict[str, Any]] = []
+    if not TEMPLATES_ROOT.exists():
+        return templates
+    for entry in sorted(TEMPLATES_ROOT.iterdir(), key=lambda path: path.name):
+        if not entry.is_dir():
+            continue
+        info = resolve_template(entry.name)
+        if not info:
+            continue
+        templates.append(
+            {
+                "template_id": info.template_id,
+                "description": info.description,
+                "hash": info.hash,
+            }
+        )
+    return templates
+
 class TaskWorkspace:
     """Workspace for materializing and syncing task files."""
 
@@ -1364,6 +1457,8 @@ def build_repro_manifest_payload(
     requirements = get_requirements_hash()
     codex_version = container.metadata.get("codex_version") if container else None
     codex_hash = container.metadata.get("codex_hash") if container else None
+    template_id = container.metadata.get("template_id") if container else None
+    template_hash = container.metadata.get("template_hash") if container else None
     created_at = to_iso_string(task_data.get("created_at")) if task_data else None
     completed_at = to_iso_string(task_data.get("completed_at")) if task_data else None
     return {
@@ -1380,6 +1475,8 @@ def build_repro_manifest_payload(
         "pytest_version": get_tool_version(["pytest", "--version"]),
         "codex_version": codex_version,
         "codex_hash": codex_hash,
+        "template_id": template_id,
+        "template_hash": template_hash,
         "review_summary": review_summary or {},
     }
 
@@ -1658,6 +1755,12 @@ async def ops_status():
         "llm_usage_totals": aggregate_llm_usage(llm_summaries),
     }
 
+
+@app.get("/api/templates")
+async def list_templates_endpoint(request: Request):
+    require_api_key(request)
+    return {"templates": list_available_templates()}
+
 @app.post("/api/tasks", response_model=TaskResponse)
 async def create_task(request: TaskRequest, req: Request):
     """Создание новой задачи для обработки ИИ"""
@@ -1667,6 +1770,13 @@ async def create_task(request: TaskRequest, req: Request):
     task_id = str(uuid.uuid4())
     user_id = request.user_id or f"user_{uuid.uuid4().hex[:8]}"
     request_id = get_request_id()
+    template_id = request.template_id.strip() if request.template_id else None
+    template_hash = None
+    if template_id:
+        template_info = resolve_template(template_id)
+        if not template_info:
+            raise HTTPException(status_code=400, detail="Template not found")
+        template_hash = template_info.hash
     task_token = set_task_id(task_id)
     try:
         logger.info("Creating new task task_id=%s user_id=%s", task_id, user_id)
@@ -1682,6 +1792,8 @@ async def create_task(request: TaskRequest, req: Request):
                 progress=0.0,
                 current_stage=None,
                 codex_version=request.codex_version,
+                template_id=template_id,
+                template_hash=template_hash,
                 client_ip=client_ip,
                 owner_key_hash=owner_key_hash,
             )
@@ -1697,6 +1809,8 @@ async def create_task(request: TaskRequest, req: Request):
                 "created_at": now,
                 "updated_at": now,
                 "codex_version": request.codex_version,
+                "template_id": template_id,
+                "template_hash": template_hash,
                 "client_ip": client_ip,
                 "owner_key_hash": owner_key_hash,
                 "request_id": request_id,
@@ -1711,7 +1825,14 @@ async def create_task(request: TaskRequest, req: Request):
         await record_event(
             task_id,
             "TaskCreated",
-            normalize_payload({"user_id": user_id, "codex_version": request.codex_version}),
+            normalize_payload(
+                {
+                    "user_id": user_id,
+                    "codex_version": request.codex_version,
+                    "template_id": template_id,
+                    "template_hash": template_hash,
+                }
+            ),
         )
         await record_state(
             task_id,
@@ -1725,7 +1846,12 @@ async def create_task(request: TaskRequest, req: Request):
         
         # Запускаем обработку в очереди
         await task_governor.enqueue(
-            QueueItem(task_id=task_id, description=request.description, request_id=request_id)
+            QueueItem(
+                task_id=task_id,
+                description=request.description,
+                template_id=template_id,
+                request_id=request_id,
+            )
         )
         
         return TaskResponse(
@@ -2008,7 +2134,12 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
     finally:
         reset_task_id(task_token)
 
-async def process_task_background(task_id: str, description: str, request_id: Optional[str] = None):
+async def process_task_background(
+    task_id: str,
+    description: str,
+    template_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+):
     """Фоновая обработка задачи ИИ-агентами"""
     request_token = set_request_id(request_id)
     task_token = set_task_id(task_id)
@@ -2027,6 +2158,11 @@ async def process_task_background(task_id: str, description: str, request_id: Op
                 await manager.send_progress(task_id, storage.active_tasks[task_id])
 
         owner_key_hash = await get_task_owner_hash(task_id)
+        template_info: Optional[TemplateInfo] = None
+        if template_id:
+            template_info = resolve_template(template_id)
+            if not template_info:
+                raise RuntimeError(f"Template '{template_id}' not found")
 
         async def fail_quota_exceeded() -> None:
             completed_at = db.now_utc()
@@ -2094,6 +2230,11 @@ async def process_task_background(task_id: str, description: str, request_id: Op
         # Создаем оркестратор и контейнер
         orchestrator = AIOrchestrator()
         container = orchestrator.initialize_project(f"Task-{task_id[:8]}")
+        if template_info:
+            for path, content in template_info.files.items():
+                container.add_file(path, content)
+            container.metadata["template_id"] = template_info.template_id
+            container.metadata["template_hash"] = template_info.hash
         baseline_files = capture_baseline_files(container)
         container.metadata["baseline_files"] = baseline_files
         workspace = TaskWorkspace(task_id, WORKSPACE_ROOT)
@@ -2475,7 +2616,12 @@ async def process_task_background(task_id: str, description: str, request_id: Op
 
 
 async def process_task_background_item(item: QueueItem) -> None:
-    await process_task_background(item.task_id, item.description, item.request_id)
+    await process_task_background(
+        item.task_id,
+        item.description,
+        item.template_id,
+        item.request_id,
+    )
 
 def save_container_to_file(task_id: str, container: Container):
     """Сохраняет контейнер в JSON файл"""

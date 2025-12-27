@@ -1,0 +1,4 @@
+{
+  "id": "python_fastapi",
+  "description": "Minimal FastAPI starter with tests and Ruff configuration."
+}
