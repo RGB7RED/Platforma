@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Any, Optional, List, Callable, Sequence
 
 from .models import Container
+from . import db
 from .llm import (
     LLMProviderError,
     generate_with_retry,
@@ -29,6 +30,19 @@ from .llm import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_ALLOWED_COMMANDS = {"ruff", "pytest", "python", "python3"}
+
+
+class BudgetExceededError(RuntimeError):
+    """Raised when an API key exceeds daily usage caps."""
+
+
+def _parse_int_env(value: Optional[str]) -> int:
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        return 0
 
 
 class SafeCommandRunner:
@@ -622,6 +636,20 @@ class AICoder(AIAgent):
             rules=rules,
             allowed_paths=allowed_paths,
         )
+
+        owner_key_hash = container.metadata.get("owner_key_hash")
+        max_tokens_per_day = _parse_int_env(os.getenv("MAX_TOKENS_PER_DAY"))
+        max_command_runs_per_day = _parse_int_env(os.getenv("MAX_COMMAND_RUNS_PER_DAY"))
+        if owner_key_hash and (max_tokens_per_day > 0 or max_command_runs_per_day > 0):
+            usage = await db.get_usage_for_key(owner_key_hash)
+            total_tokens = usage.get("tokens_in", 0) + usage.get("tokens_out", 0)
+            if max_tokens_per_day > 0 and total_tokens >= max_tokens_per_day:
+                raise BudgetExceededError("max_tokens_per_day exceeded")
+            if (
+                max_command_runs_per_day > 0
+                and usage.get("command_runs", 0) >= max_command_runs_per_day
+            ):
+                raise BudgetExceededError("max_command_runs_per_day exceeded")
 
         request_started_at = datetime.now().isoformat()
         try:

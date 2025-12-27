@@ -13,7 +13,7 @@ from datetime import datetime
 
 from .models import Container, ProjectState
 from .logging_utils import configure_logging
-from .agents import AIResearcher, AIDesigner, AICoder, AIReviewer
+from .agents import AIResearcher, AIDesigner, AICoder, AIReviewer, BudgetExceededError
 from .llm import LLMProviderError
 
 
@@ -244,6 +244,28 @@ class AIOrchestrator:
                         next_task,
                         self.container
                     )
+                except BudgetExceededError:
+                    await self._run_hook(
+                        callbacks.get("stage_failed") if callbacks else None,
+                        {
+                            "stage": "implementation",
+                            "reason": "quota_exceeded",
+                            "error": "quota_exceeded",
+                        },
+                    )
+                    self.container.update_state(ProjectState.ERROR, "quota_exceeded")
+                    return {
+                        "status": "failed",
+                        "container_id": self.container.project_id,
+                        "state": self.container.state.value,
+                        "progress": self.container.progress,
+                        "files_count": len(self.container.files),
+                        "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
+                        "iterations": iteration,
+                        "max_iterations": max_iterations,
+                        "history": self.task_history[-5:],
+                        "failure_reason": "quota_exceeded",
+                    }
                 except LLMProviderError as exc:
                     await self._run_hook(
                         callbacks.get("stage_failed") if callbacks else None,

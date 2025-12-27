@@ -9,16 +9,17 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import uuid
 import json
 import asyncio
 import io
 import zipfile
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Callable
 import logging
 import os
 from pathlib import Path, PurePosixPath
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import mimetypes
 import difflib
@@ -80,13 +81,19 @@ class Storage:
 
 storage = Storage()
 database_url = os.getenv("DATABASE_URL")
-TASK_TTL_DAYS = os.getenv("TASK_TTL_DAYS")
+TASK_TTL_DAYS_ENV = os.getenv("TASK_TTL_DAYS")
 APP_API_KEY = os.getenv("APP_API_KEY")
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "data/workspaces"))
-WORKSPACE_TTL_DAYS = os.getenv("WORKSPACE_TTL_DAYS")
+WORKSPACE_TTL_DAYS_ENV = os.getenv("WORKSPACE_TTL_DAYS")
 COMMAND_TIMEOUT_SECONDS = os.getenv("COMMAND_TIMEOUT_SECONDS")
 COMMAND_MAX_OUTPUT_BYTES = os.getenv("COMMAND_MAX_OUTPUT_BYTES")
 ALLOWED_COMMANDS = os.getenv("ALLOWED_COMMANDS")
+MAX_CONCURRENT_TASKS_ENV = os.getenv("MAX_CONCURRENT_TASKS")
+RATE_LIMIT_CREATE_TASKS_PER_MIN_ENV = os.getenv("RATE_LIMIT_CREATE_TASKS_PER_MIN")
+RATE_LIMIT_RERUN_REVIEW_PER_MIN_ENV = os.getenv("RATE_LIMIT_RERUN_REVIEW_PER_MIN")
+RATE_LIMIT_DOWNLOADS_PER_MIN_ENV = os.getenv("RATE_LIMIT_DOWNLOADS_PER_MIN")
+MAX_TOKENS_PER_DAY_ENV = os.getenv("MAX_TOKENS_PER_DAY")
+MAX_COMMAND_RUNS_PER_DAY_ENV = os.getenv("MAX_COMMAND_RUNS_PER_DAY")
 
 # WebSocket менеджер
 class ConnectionManager:
@@ -439,13 +446,19 @@ def parse_allowed_commands(value: Optional[str]) -> Optional[List[str]]:
     return commands or None
 
 
-def build_command_runner(task_id: str, workspace_path: Path) -> SafeCommandRunner:
+def build_command_runner(
+    task_id: str,
+    workspace_path: Path,
+    owner_key_hash: Optional[str] = None,
+) -> SafeCommandRunner:
     timeout_seconds = parse_int_env(COMMAND_TIMEOUT_SECONDS, 60)
     max_output_bytes = parse_int_env(COMMAND_MAX_OUTPUT_BYTES, 20000)
     allowed_commands = parse_allowed_commands(ALLOWED_COMMANDS)
 
     async def handle_event(event_type: str, payload: Dict[str, Any]) -> None:
         await record_event(task_id, event_type, normalize_payload(payload))
+        if event_type == "command_started":
+            await record_command_run(owner_key_hash)
 
     async def handle_artifact(
         artifact_type: str,
@@ -480,7 +493,8 @@ async def run_review_for_task(task_id: str, container: Container) -> Dict[str, A
     reviewer = AIReviewer(AIOrchestrator().codex)
     workspace = TaskWorkspace(task_id, WORKSPACE_ROOT)
     workspace.materialize(container)
-    runner = build_command_runner(task_id, workspace.path)
+    owner_key_hash = await get_task_owner_hash(task_id)
+    runner = build_command_runner(task_id, workspace.path, owner_key_hash)
     review_result = await reviewer.execute(
         container,
         workspace_path=workspace.path,
@@ -598,16 +612,26 @@ async def lifespan(app: FastAPI):
             await db.init_db(database_url)
             await db.init_container_tables()
             logger.info("Container persistence enabled")
+            if TASK_TTL_DAYS > 0:
+                cleanup_counts = await db.cleanup_expired_data(TASK_TTL_DAYS)
+                if cleanup_counts:
+                    logger.info("Purged expired task data: %s", cleanup_counts)
         except Exception:
             logger.exception("Failed to initialize database connection")
             raise
     else:
         logger.info("DATABASE_URL not set, using in-memory task storage")
+
+    queued = await task_governor.bootstrap()
+    if queued:
+        logger.info("Loaded %s queued tasks on startup", queued)
+    await task_governor.start(process_task_background_item)
     
     yield
     
     logger.info("Shutting down AI Platform Backend...")
     # Очистка ресурсов
+    await task_governor.stop()
     await db.close_db()
 
 app = FastAPI(
@@ -682,8 +706,22 @@ def parse_int_env(value: Optional[str], default: int) -> int:
         return default
 
 
-def cleanup_workspaces(root: Path, ttl_days: Optional[str]) -> None:
-    ttl_value = parse_int_env(ttl_days, 0) if ttl_days else 0
+MAX_CONCURRENT_TASKS = parse_int_env(MAX_CONCURRENT_TASKS_ENV, 4)
+RATE_LIMIT_CREATE_TASKS_PER_MIN = parse_int_env(RATE_LIMIT_CREATE_TASKS_PER_MIN_ENV, 0)
+RATE_LIMIT_RERUN_REVIEW_PER_MIN = parse_int_env(RATE_LIMIT_RERUN_REVIEW_PER_MIN_ENV, 0)
+RATE_LIMIT_DOWNLOADS_PER_MIN = parse_int_env(RATE_LIMIT_DOWNLOADS_PER_MIN_ENV, 0)
+MAX_TOKENS_PER_DAY = parse_int_env(MAX_TOKENS_PER_DAY_ENV, 0)
+MAX_COMMAND_RUNS_PER_DAY = parse_int_env(MAX_COMMAND_RUNS_PER_DAY_ENV, 0)
+TASK_TTL_DAYS = parse_int_env(TASK_TTL_DAYS_ENV, 30)
+WORKSPACE_TTL_DAYS = (
+    parse_int_env(WORKSPACE_TTL_DAYS_ENV, TASK_TTL_DAYS)
+    if WORKSPACE_TTL_DAYS_ENV is not None
+    else TASK_TTL_DAYS
+)
+
+
+def cleanup_workspaces(root: Path, ttl_days: Optional[int]) -> None:
+    ttl_value = ttl_days or 0
     if ttl_value <= 0:
         return
     cutoff = time.time() - ttl_value * 86400
@@ -773,6 +811,172 @@ def aggregate_llm_usage(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     totals["total_tokens"] = totals["total_tokens_in"] + totals["total_tokens_out"]
     return totals
+
+
+@dataclass
+class QueueItem:
+    task_id: str
+    description: str
+    request_id: Optional[str] = None
+
+
+class RateLimiter:
+    def __init__(self, window_seconds: int = 60) -> None:
+        self.window_seconds = window_seconds
+        self._entries: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def check(self, key_hash: str, scope: str, limit: int) -> tuple[bool, int]:
+        if limit <= 0:
+            return True, 0
+        now = time.time()
+        window_start = int(now // self.window_seconds) * self.window_seconds
+        retry_after = max(1, int(window_start + self.window_seconds - now))
+        entry_key = (key_hash, scope)
+        async with self._lock:
+            entry = self._entries.get(entry_key)
+            if entry and entry["window_start"] == window_start:
+                if entry["count"] >= limit:
+                    return False, retry_after
+                entry["count"] += 1
+                return True, retry_after
+            self._entries[entry_key] = {
+                "window_start": window_start,
+                "count": 1,
+            }
+        return True, retry_after
+
+
+class TaskGovernor:
+    def __init__(self, max_concurrent: int) -> None:
+        self.max_concurrent = max(1, max_concurrent)
+        self._queue: asyncio.Queue[QueueItem] = asyncio.Queue()
+        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        self._worker_task: Optional[asyncio.Task] = None
+        self._shutdown = asyncio.Event()
+        self.running: set[str] = set()
+        self._runner: Optional[Callable[[QueueItem], Any]] = None
+
+    async def start(self, runner: Callable[[QueueItem], Any]) -> None:
+        self._runner = runner
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        self._shutdown.set()
+        if self._worker_task:
+            self._worker_task.cancel()
+            self._worker_task = None
+
+    async def enqueue(self, item: QueueItem) -> None:
+        await self._queue.put(item)
+
+    async def bootstrap(self) -> int:
+        queued = 0
+        if db.is_enabled():
+            reset_count = await db.reset_processing_tasks_to_queued()
+            if reset_count:
+                logger.info("Reset %s processing tasks back to queued", reset_count)
+            tasks = await db.list_queued_tasks()
+            for task in tasks:
+                await self.enqueue(
+                    QueueItem(
+                        task_id=str(task["id"]),
+                        description=task["description"],
+                        request_id=None,
+                    )
+                )
+            queued = len(tasks)
+        return queued
+
+    async def _run(self) -> None:
+        while not self._shutdown.is_set():
+            item = await self._queue.get()
+            await self._semaphore.acquire()
+            task_id = item.task_id
+            self.running.add(task_id)
+            asyncio.create_task(self._execute(item))
+
+    async def _execute(self, item: QueueItem) -> None:
+        try:
+            if self._runner is not None:
+                result = self._runner(item)
+                if asyncio.iscoroutine(result):
+                    await result
+        finally:
+            self.running.discard(item.task_id)
+            self._semaphore.release()
+            self._queue.task_done()
+
+
+rate_limiter = RateLimiter()
+task_governor = TaskGovernor(MAX_CONCURRENT_TASKS)
+
+
+async def enforce_rate_limit(
+    key_hash: str,
+    scope: str,
+    limit: int,
+) -> None:
+    if limit <= 0:
+        return
+    allowed, retry_after = await rate_limiter.check(key_hash, scope, limit)
+    if db.is_enabled():
+        db_allowed, db_retry_after = await db.check_rate_limit(
+            key_hash,
+            scope,
+            limit=limit,
+            window_seconds=60,
+        )
+        if not db_allowed:
+            retry_after = db_retry_after
+            allowed = False
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={"error": "rate_limited", "retry_after": retry_after},
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+async def get_task_owner_hash(task_id: str) -> Optional[str]:
+    if db.is_enabled():
+        task_data = await db.get_task_row(task_id)
+        if task_data:
+            return task_data.get("owner_key_hash")
+        return None
+    return storage.active_tasks.get(task_id, {}).get("owner_key_hash")
+
+
+async def record_usage_tokens(owner_key_hash: Optional[str], tokens_in: int, tokens_out: int) -> None:
+    if not owner_key_hash:
+        return
+    await db.record_usage(
+        owner_key_hash,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        command_runs=0,
+    )
+
+
+async def record_command_run(owner_key_hash: Optional[str]) -> None:
+    if not owner_key_hash:
+        return
+    await db.record_usage(owner_key_hash, tokens_in=0, tokens_out=0, command_runs=1)
+
+
+async def check_quota_exceeded(owner_key_hash: Optional[str]) -> bool:
+    if not owner_key_hash:
+        return False
+    if MAX_TOKENS_PER_DAY <= 0 and MAX_COMMAND_RUNS_PER_DAY <= 0:
+        return False
+    usage = await db.get_usage_for_key(owner_key_hash)
+    total_tokens = usage.get("tokens_in", 0) + usage.get("tokens_out", 0)
+    if MAX_TOKENS_PER_DAY > 0 and total_tokens >= MAX_TOKENS_PER_DAY:
+        return True
+    if MAX_COMMAND_RUNS_PER_DAY > 0 and usage.get("command_runs", 0) >= MAX_COMMAND_RUNS_PER_DAY:
+        return True
+    return False
 
 
 def sanitize_zip_path(path: str) -> str:
@@ -1350,6 +1554,7 @@ async def ops_status():
     """Operational status endpoint for observability."""
     generated_at = db.now_utc().isoformat()
     if db.is_enabled():
+        status_breakdown = await db.get_task_status_breakdown()
         metrics = await db.get_task_status_metrics()
         states = await db.list_task_states()
         llm_summaries = []
@@ -1359,8 +1564,13 @@ async def ops_status():
                 summary = state.get("llm_usage_summary")
                 if summary:
                     llm_summaries.append(summary)
-        success = metrics.get("completed", 0) or 0
-        failed = metrics.get("failed", 0) or 0
+        active_task_ids = await db.list_active_task_ids(limit=5)
+        usage_since = db.now_utc() - timedelta(hours=24)
+        usage_totals = await db.get_usage_totals_since(usage_since)
+        top_keys = await db.get_top_usage_keys_since(usage_since, limit=5)
+        failure_reasons = await db.get_failure_reason_counts(limit=5)
+        success = status_breakdown.get("completed", 0)
+        failed = status_breakdown.get("failed", 0)
         total_terminal = success + failed
         return {
             "generated_at": generated_at,
@@ -1370,14 +1580,28 @@ async def ops_status():
             "fail_rate": (failed / total_terminal) if total_terminal else None,
             "success_count": success,
             "fail_count": failed,
+            "queued_count": status_breakdown.get("queued", 0),
+            "running_count": status_breakdown.get("running", 0),
+            "completed_count": status_breakdown.get("completed", 0),
+            "failed_count": status_breakdown.get("failed", 0),
+            "queue_length": status_breakdown.get("queued", 0),
+            "active_task_ids": active_task_ids,
+            "usage_totals_last_24h": {
+                **usage_totals,
+                "total_tokens": usage_totals.get("tokens_in", 0) + usage_totals.get("tokens_out", 0),
+            },
+            "top_keys_last_24h": top_keys,
+            "top_failure_reasons": failure_reasons,
             "llm_usage_totals": aggregate_llm_usage(llm_summaries),
         }
 
     tasks = list(storage.active_tasks.values())
     terminal_statuses = {"completed", "failed", "error"}
-    active_tasks = len([task for task in tasks if task.get("status") not in terminal_statuses])
+    queued = len([task for task in tasks if task.get("status") == "queued"])
+    running = len([task for task in tasks if task.get("status") == "processing"])
     completed = len([task for task in tasks if task.get("status") == "completed"])
     failed = len([task for task in tasks if task.get("status") in {"failed", "error"}])
+    active_tasks = len([task for task in tasks if task.get("status") not in terminal_statuses])
     durations = [
         compute_time_taken_seconds(task)
         for task in tasks
@@ -1393,6 +1617,24 @@ async def ops_status():
             if summary:
                 llm_summaries.append(summary)
     total_terminal = completed + failed
+    active_task_ids = [task.get("id") for task in tasks if task.get("status") == "processing"][:5]
+    usage_since = db.now_utc() - timedelta(hours=24)
+    usage_totals = await db.get_usage_totals_since(usage_since)
+    top_keys = await db.get_top_usage_keys_since(usage_since, limit=5)
+    failure_counts: Dict[str, int] = {}
+    for task in tasks:
+        if task.get("status") in {"failed", "error"}:
+            reason = task.get("failure_reason") or task.get("error")
+            if reason:
+                failure_counts[reason] = failure_counts.get(reason, 0) + 1
+    top_failure_reasons = [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(
+            failure_counts.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:5]
+    ]
     return {
         "generated_at": generated_at,
         "active_tasks": active_tasks,
@@ -1401,6 +1643,18 @@ async def ops_status():
         "fail_rate": (failed / total_terminal) if total_terminal else None,
         "success_count": completed,
         "fail_count": failed,
+        "queued_count": queued,
+        "running_count": running,
+        "completed_count": completed,
+        "failed_count": failed,
+        "queue_length": queued,
+        "active_task_ids": active_task_ids,
+        "usage_totals_last_24h": {
+            **usage_totals,
+            "total_tokens": usage_totals.get("tokens_in", 0) + usage_totals.get("tokens_out", 0),
+        },
+        "top_keys_last_24h": top_keys,
+        "top_failure_reasons": top_failure_reasons,
         "llm_usage_totals": aggregate_llm_usage(llm_summaries),
     }
 
@@ -1409,6 +1663,7 @@ async def create_task(request: TaskRequest, req: Request):
     """Создание новой задачи для обработки ИИ"""
     api_key = require_api_key(req)
     owner_key_hash = hash_api_key(api_key)
+    await enforce_rate_limit(owner_key_hash, "create_task", RATE_LIMIT_CREATE_TASKS_PER_MIN)
     task_id = str(uuid.uuid4())
     user_id = request.user_id or f"user_{uuid.uuid4().hex[:8]}"
     request_id = get_request_id()
@@ -1423,7 +1678,7 @@ async def create_task(request: TaskRequest, req: Request):
                 task_id=task_id,
                 user_id=user_id,
                 description=request.description,
-                status="created",
+                status="queued",
                 progress=0.0,
                 current_stage=None,
                 codex_version=request.codex_version,
@@ -1437,7 +1692,7 @@ async def create_task(request: TaskRequest, req: Request):
                 "id": task_id,
                 "description": request.description,
                 "user_id": user_id,
-                "status": "created",
+                "status": "queued",
                 "progress": 0.0,
                 "created_at": now,
                 "updated_at": now,
@@ -1461,20 +1716,22 @@ async def create_task(request: TaskRequest, req: Request):
         await record_state(
             task_id,
             build_container_state(
-                status="created",
+                status="queued",
                 progress=0.0,
                 current_stage=None,
                 include_created_at=True,
             ),
         )
         
-        # Запускаем обработку в фоне
-        asyncio.create_task(process_task_background(task_id, request.description, request_id))
+        # Запускаем обработку в очереди
+        await task_governor.enqueue(
+            QueueItem(task_id=task_id, description=request.description, request_id=request_id)
+        )
         
         return TaskResponse(
             task_id=task_id,
-            status="created",
-            message="Task started processing",
+            status="queued",
+            message="Task queued for processing",
             progress=0.0,
             estimated_time=60  # Примерное время в секундах
         )
@@ -1499,6 +1756,12 @@ async def rerun_review(task_id: str, request: Request):
     """Перезапуск ревью для существующей задачи"""
     task_token = set_task_id(task_id)
     try:
+        api_key = require_api_key(request)
+        await enforce_rate_limit(
+            hash_api_key(api_key),
+            "rerun_review",
+            RATE_LIMIT_RERUN_REVIEW_PER_MIN,
+        )
         await ensure_task_owner(task_id, request)
         container = await resolve_container_with_db(task_id)
         if not container:
@@ -1652,6 +1915,12 @@ async def download_task_files(task_id: str, request: Request):
     """Скачать файлы задачи ZIP архивом"""
     task_token = set_task_id(task_id)
     try:
+        api_key = require_api_key(request)
+        await enforce_rate_limit(
+            hash_api_key(api_key),
+            "download",
+            RATE_LIMIT_DOWNLOADS_PER_MIN,
+        )
         await ensure_task_owner(task_id, request)
         return await build_zip_response(task_id, request)
     finally:
@@ -1663,6 +1932,12 @@ async def download_task_files_get(task_id: str, request: Request):
     """Скачать файлы задачи ZIP архивом (GET alias)"""
     task_token = set_task_id(task_id)
     try:
+        api_key = require_api_key(request)
+        await enforce_rate_limit(
+            hash_api_key(api_key),
+            "download",
+            RATE_LIMIT_DOWNLOADS_PER_MIN,
+        )
         await ensure_task_owner(task_id, request)
         return await build_zip_response(task_id, request)
     finally:
@@ -1751,6 +2026,49 @@ async def process_task_background(task_id: str, description: str, request_id: Op
                 storage.active_tasks[task_id].update(fields)
                 await manager.send_progress(task_id, storage.active_tasks[task_id])
 
+        owner_key_hash = await get_task_owner_hash(task_id)
+
+        async def fail_quota_exceeded() -> None:
+            completed_at = db.now_utc()
+            await record_event(
+                task_id,
+                "stage_failed",
+                normalize_payload(
+                    {
+                        "stage": "initializing",
+                        "reason": "quota_exceeded",
+                        "status": "failed",
+                    }
+                ),
+            )
+            await apply_task_update(
+                {
+                    "status": "failed",
+                    "progress": 1.0,
+                    "current_stage": "failed",
+                    "error": "quota_exceeded",
+                    "failure_reason": "quota_exceeded",
+                    "completed_at": completed_at,
+                }
+            )
+            await record_event(
+                task_id,
+                "TaskFailed",
+                normalize_payload({"error": "quota_exceeded"}),
+            )
+            await record_state(
+                task_id,
+                build_container_state(
+                    status="failed",
+                    progress=1.0,
+                    current_stage="failed",
+                ),
+            )
+
+        if await check_quota_exceeded(owner_key_hash):
+            await fail_quota_exceeded()
+            return
+
         # Обновляем статус
         await apply_task_update(
             {
@@ -1781,8 +2099,9 @@ async def process_task_background(task_id: str, description: str, request_id: Op
         workspace = TaskWorkspace(task_id, WORKSPACE_ROOT)
         workspace.materialize(container)
         container.metadata["workspace_path"] = str(workspace.path)
+        container.metadata["owner_key_hash"] = owner_key_hash
         container.file_update_hook = workspace.write_file
-        command_runner = build_command_runner(task_id, workspace.path)
+        command_runner = build_command_runner(task_id, workspace.path, owner_key_hash)
         await persist_container_snapshot(task_id, container)
         storage.containers[task_id] = container
 
@@ -1930,6 +2249,10 @@ async def process_task_background(task_id: str, description: str, request_id: Op
                 "llm_usage",
                 normalize_payload(usage or {}),
             )
+            if isinstance(usage, dict):
+                tokens_in = int(usage.get("tokens_in") or usage.get("input_tokens") or 0)
+                tokens_out = int(usage.get("tokens_out") or usage.get("output_tokens") or 0)
+                await record_usage_tokens(owner_key_hash, tokens_in, tokens_out)
             usage_report = payload.get("usage_report") if isinstance(payload, dict) else None
             if usage_report:
                 await record_artifact(
@@ -2149,6 +2472,10 @@ async def process_task_background(task_id: str, description: str, request_id: Op
     finally:
         reset_task_id(task_token)
         reset_request_id(request_token)
+
+
+async def process_task_background_item(item: QueueItem) -> None:
+    await process_task_background(item.task_id, item.description, item.request_id)
 
 def save_container_to_file(task_id: str, container: Container):
     """Сохраняет контейнер в JSON файл"""

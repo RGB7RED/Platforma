@@ -10,14 +10,16 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 
 logger = logging.getLogger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
+_rate_limits: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+_usage_daily: Dict[Tuple[str, date], Dict[str, Any]] = {}
 
 
 def is_enabled() -> bool:
@@ -47,6 +49,7 @@ async def init_db(database_url: str) -> None:
                 result JSONB NULL,
                 container_state JSONB NULL,
                 error TEXT NULL,
+                failure_reason TEXT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 completed_at TIMESTAMPTZ NULL
@@ -56,8 +59,36 @@ async def init_db(database_url: str) -> None:
         await conn.execute(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS owner_key_hash TEXT;"
         )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS failure_reason TEXT;"
+        )
         await _ensure_jsonb_column(conn, table="tasks", column="result")
         await _ensure_jsonb_column(conn, table="tasks", column="container_state")
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_rate_limits (
+                key_hash TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                window_start TIMESTAMPTZ NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (key_hash, scope, window_start)
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_usage_daily (
+                key_hash TEXT NOT NULL,
+                usage_date DATE NOT NULL,
+                tokens_in BIGINT NOT NULL DEFAULT 0,
+                tokens_out BIGINT NOT NULL DEFAULT 0,
+                command_runs INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (key_hash, usage_date)
+            );
+            """
+        )
     logger.info("Database initialized for task persistence")
 
 
@@ -668,6 +699,7 @@ async def update_task_row(task_id: str, fields: Dict[str, Any]) -> Optional[Dict
         "result",
         "container_state",
         "error",
+        "failure_reason",
         "completed_at",
     }
     updates = {key: value for key, value in fields.items() if key in allowed_fields}
@@ -772,3 +804,440 @@ async def list_task_states() -> List[Dict[str, Any]]:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _usage_key(key_hash: str, usage_date: date) -> Tuple[str, date]:
+    return key_hash, usage_date
+
+
+def _rate_limit_key(key_hash: str, scope: str, window_start: int) -> Tuple[str, str, int]:
+    return key_hash, scope, window_start
+
+
+async def reset_processing_tasks_to_queued() -> int:
+    if _pool is None:
+        return 0
+    result = await _pool.execute(
+        """
+        UPDATE tasks
+        SET status = 'queued', updated_at = NOW()
+        WHERE status = 'processing';
+        """
+    )
+    return int(result.split()[-1])
+
+
+async def list_queued_tasks(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    if _pool is None:
+        return []
+    query = """
+        SELECT id, description, user_id, created_at
+        FROM tasks
+        WHERE status = 'queued'
+        ORDER BY created_at ASC
+    """
+    if limit is not None:
+        query += " LIMIT $1"
+        rows = await _pool.fetch(query, limit)
+    else:
+        rows = await _pool.fetch(query)
+    return [dict(row) for row in rows]
+
+
+def _window_start_ts(now: datetime, window_seconds: int) -> datetime:
+    epoch = int(now.timestamp())
+    window_start = epoch - (epoch % window_seconds)
+    return datetime.fromtimestamp(window_start, tz=timezone.utc)
+
+
+async def check_rate_limit(
+    key_hash: str,
+    scope: str,
+    *,
+    limit: int,
+    window_seconds: int = 60,
+) -> Tuple[bool, int]:
+    if limit <= 0:
+        return True, 0
+    now = now_utc()
+    window_start = _window_start_ts(now, window_seconds)
+    retry_after = max(1, int((window_start + timedelta(seconds=window_seconds) - now).total_seconds()))
+    if _pool is None:
+        key = _rate_limit_key(key_hash, scope, int(window_start.timestamp()))
+        entry = _rate_limits.get(key)
+        if entry and entry["window_start"] == window_start:
+            if entry["count"] >= limit:
+                return False, retry_after
+            entry["count"] += 1
+        else:
+            _rate_limits[key] = {
+                "count": 1,
+                "window_start": window_start,
+                "updated_at": now,
+            }
+        return True, retry_after
+
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT count
+                FROM api_rate_limits
+                WHERE key_hash = $1 AND scope = $2 AND window_start = $3
+                FOR UPDATE;
+                """,
+                key_hash,
+                scope,
+                window_start,
+            )
+            if row and row["count"] >= limit:
+                return False, retry_after
+            if row:
+                await conn.execute(
+                    """
+                    UPDATE api_rate_limits
+                    SET count = count + 1, updated_at = NOW()
+                    WHERE key_hash = $1 AND scope = $2 AND window_start = $3;
+                    """,
+                    key_hash,
+                    scope,
+                    window_start,
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO api_rate_limits (key_hash, scope, window_start, count)
+                    VALUES ($1, $2, $3, 1);
+                    """,
+                    key_hash,
+                    scope,
+                    window_start,
+                )
+    return True, retry_after
+
+
+async def record_usage(
+    key_hash: str,
+    *,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    command_runs: int = 0,
+) -> None:
+    usage_date = now_utc().date()
+    if _pool is None:
+        key = _usage_key(key_hash, usage_date)
+        entry = _usage_daily.setdefault(
+            key,
+            {
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "command_runs": 0,
+                "updated_at": now_utc(),
+            },
+        )
+        entry["tokens_in"] += tokens_in
+        entry["tokens_out"] += tokens_out
+        entry["command_runs"] += command_runs
+        entry["updated_at"] = now_utc()
+        return
+
+    await _pool.execute(
+        """
+        INSERT INTO api_usage_daily (key_hash, usage_date, tokens_in, tokens_out, command_runs)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (key_hash, usage_date)
+        DO UPDATE SET
+            tokens_in = api_usage_daily.tokens_in + EXCLUDED.tokens_in,
+            tokens_out = api_usage_daily.tokens_out + EXCLUDED.tokens_out,
+            command_runs = api_usage_daily.command_runs + EXCLUDED.command_runs,
+            updated_at = NOW();
+        """,
+        key_hash,
+        usage_date,
+        tokens_in,
+        tokens_out,
+        command_runs,
+    )
+
+
+async def get_usage_for_key(key_hash: str) -> Dict[str, int]:
+    usage_date = now_utc().date()
+    if _pool is None:
+        entry = _usage_daily.get(_usage_key(key_hash, usage_date))
+        if not entry:
+            return {"tokens_in": 0, "tokens_out": 0, "command_runs": 0}
+        return {
+            "tokens_in": entry.get("tokens_in", 0),
+            "tokens_out": entry.get("tokens_out", 0),
+            "command_runs": entry.get("command_runs", 0),
+        }
+
+    row = await _pool.fetchrow(
+        """
+        SELECT tokens_in, tokens_out, command_runs
+        FROM api_usage_daily
+        WHERE key_hash = $1 AND usage_date = $2;
+        """,
+        key_hash,
+        usage_date,
+    )
+    if not row:
+        return {"tokens_in": 0, "tokens_out": 0, "command_runs": 0}
+    return {
+        "tokens_in": int(row["tokens_in"]),
+        "tokens_out": int(row["tokens_out"]),
+        "command_runs": int(row["command_runs"]),
+    }
+
+
+async def get_usage_totals_since(since: datetime) -> Dict[str, int]:
+    if _pool is None:
+        totals = {"tokens_in": 0, "tokens_out": 0, "command_runs": 0}
+        for entry in _usage_daily.values():
+            updated_at = entry.get("updated_at")
+            if isinstance(updated_at, datetime) and updated_at >= since:
+                totals["tokens_in"] += entry.get("tokens_in", 0)
+                totals["tokens_out"] += entry.get("tokens_out", 0)
+                totals["command_runs"] += entry.get("command_runs", 0)
+        return totals
+
+    row = await _pool.fetchrow(
+        """
+        SELECT
+            COALESCE(SUM(tokens_in), 0) AS tokens_in,
+            COALESCE(SUM(tokens_out), 0) AS tokens_out,
+            COALESCE(SUM(command_runs), 0) AS command_runs
+        FROM api_usage_daily
+        WHERE updated_at >= $1;
+        """,
+        since,
+    )
+    return {
+        "tokens_in": int(row["tokens_in"]) if row else 0,
+        "tokens_out": int(row["tokens_out"]) if row else 0,
+        "command_runs": int(row["command_runs"]) if row else 0,
+    }
+
+
+async def get_top_usage_keys_since(
+    since: datetime,
+    *,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    if _pool is None:
+        totals: Dict[str, Dict[str, Any]] = {}
+        for (key_hash, _), entry in _usage_daily.items():
+            updated_at = entry.get("updated_at")
+            if isinstance(updated_at, datetime) and updated_at >= since:
+                bucket = totals.setdefault(
+                    key_hash,
+                    {"tokens_in": 0, "tokens_out": 0, "command_runs": 0},
+                )
+                bucket["tokens_in"] += entry.get("tokens_in", 0)
+                bucket["tokens_out"] += entry.get("tokens_out", 0)
+                bucket["command_runs"] += entry.get("command_runs", 0)
+        ranked = sorted(
+            totals.items(),
+            key=lambda item: item[1]["tokens_in"] + item[1]["tokens_out"],
+            reverse=True,
+        )
+        return [
+            {
+                "key_hash": key_hash,
+                "tokens_in": metrics["tokens_in"],
+                "tokens_out": metrics["tokens_out"],
+                "total_tokens": metrics["tokens_in"] + metrics["tokens_out"],
+                "command_runs": metrics["command_runs"],
+            }
+            for key_hash, metrics in ranked[:limit]
+        ]
+
+    rows = await _pool.fetch(
+        """
+        SELECT
+            key_hash,
+            COALESCE(SUM(tokens_in), 0) AS tokens_in,
+            COALESCE(SUM(tokens_out), 0) AS tokens_out,
+            COALESCE(SUM(command_runs), 0) AS command_runs
+        FROM api_usage_daily
+        WHERE updated_at >= $1
+        GROUP BY key_hash
+        ORDER BY (COALESCE(SUM(tokens_in), 0) + COALESCE(SUM(tokens_out), 0)) DESC
+        LIMIT $2;
+        """,
+        since,
+        limit,
+    )
+    return [
+        {
+            "key_hash": row["key_hash"],
+            "tokens_in": int(row["tokens_in"]),
+            "tokens_out": int(row["tokens_out"]),
+            "total_tokens": int(row["tokens_in"]) + int(row["tokens_out"]),
+            "command_runs": int(row["command_runs"]),
+        }
+        for row in rows
+    ]
+
+
+async def get_failure_reason_counts(limit: int = 5) -> List[Dict[str, Any]]:
+    if _pool is None:
+        return []
+    rows = await _pool.fetch(
+        """
+        SELECT COALESCE(failure_reason, error) AS reason, COUNT(*) AS count
+        FROM tasks
+        WHERE status IN ('failed', 'error')
+          AND COALESCE(failure_reason, error) IS NOT NULL
+        GROUP BY reason
+        ORDER BY count DESC
+        LIMIT $1;
+        """,
+        limit,
+    )
+    return [
+        {"reason": row["reason"], "count": int(row["count"])}
+        for row in rows
+    ]
+
+
+async def get_task_status_breakdown() -> Dict[str, int]:
+    if _pool is None:
+        return {}
+    row = await _pool.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'queued') AS queued,
+            COUNT(*) FILTER (WHERE status = 'processing') AS running,
+            COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+            COUNT(*) FILTER (WHERE status IN ('failed', 'error')) AS failed
+        FROM tasks;
+        """
+    )
+    return {
+        "queued": int(row["queued"] or 0),
+        "running": int(row["running"] or 0),
+        "completed": int(row["completed"] or 0),
+        "failed": int(row["failed"] or 0),
+    }
+
+
+async def list_active_task_ids(limit: int = 5) -> List[str]:
+    if _pool is None:
+        return []
+    rows = await _pool.fetch(
+        """
+        SELECT id
+        FROM tasks
+        WHERE status = 'processing'
+        ORDER BY updated_at DESC
+        LIMIT $1;
+        """,
+        limit,
+    )
+    return [str(row["id"]) for row in rows]
+
+
+async def cleanup_expired_data(ttl_days: int) -> Dict[str, int]:
+    if _pool is None or ttl_days <= 0:
+        return {}
+    cutoff = now_utc() - timedelta(days=ttl_days)
+    counts: Dict[str, int] = {}
+    async with _pool.acquire() as conn:
+        task_rows = await conn.fetch(
+            "SELECT id FROM tasks WHERE created_at < $1;",
+            cutoff,
+        )
+        task_ids = [row["id"] for row in task_rows]
+
+        if task_ids:
+            counts["task_events"] = await conn.fetchval(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ANY($1::uuid[]);",
+                task_ids,
+            )
+            await conn.execute(
+                "DELETE FROM task_events WHERE task_id = ANY($1::uuid[]);",
+                task_ids,
+            )
+            counts["task_artifacts"] = await conn.fetchval(
+                "SELECT COUNT(*) FROM task_artifacts WHERE task_id = ANY($1::uuid[]);",
+                task_ids,
+            )
+            await conn.execute(
+                "DELETE FROM task_artifacts WHERE task_id = ANY($1::uuid[]);",
+                task_ids,
+            )
+            counts["task_files"] = await conn.fetchval(
+                "SELECT COUNT(*) FROM task_files WHERE task_id = ANY($1::uuid[]);",
+                task_ids,
+            )
+            await conn.execute(
+                "DELETE FROM task_files WHERE task_id = ANY($1::uuid[]);",
+                task_ids,
+            )
+            counts["task_state"] = await conn.fetchval(
+                "SELECT COUNT(*) FROM task_state WHERE task_id = ANY($1::uuid[]);",
+                task_ids,
+            )
+            await conn.execute(
+                "DELETE FROM task_state WHERE task_id = ANY($1::uuid[]);",
+                task_ids,
+            )
+            counts["task_snapshots"] = await conn.fetchval(
+                "SELECT COUNT(*) FROM task_container_snapshots WHERE task_id = ANY($1::uuid[]);",
+                task_ids,
+            )
+            await conn.execute(
+                "DELETE FROM task_container_snapshots WHERE task_id = ANY($1::uuid[]);",
+                task_ids,
+            )
+
+        counts["old_events"] = await conn.fetchval(
+            "SELECT COUNT(*) FROM task_events WHERE created_at < $1;",
+            cutoff,
+        )
+        await conn.execute(
+            "DELETE FROM task_events WHERE created_at < $1;",
+            cutoff,
+        )
+        counts["old_artifacts"] = await conn.fetchval(
+            "SELECT COUNT(*) FROM task_artifacts WHERE created_at < $1;",
+            cutoff,
+        )
+        await conn.execute(
+            "DELETE FROM task_artifacts WHERE created_at < $1;",
+            cutoff,
+        )
+        counts["old_files"] = await conn.fetchval(
+            "SELECT COUNT(*) FROM task_files WHERE updated_at < $1;",
+            cutoff,
+        )
+        await conn.execute(
+            "DELETE FROM task_files WHERE updated_at < $1;",
+            cutoff,
+        )
+        counts["old_state"] = await conn.fetchval(
+            "SELECT COUNT(*) FROM task_state WHERE updated_at < $1;",
+            cutoff,
+        )
+        await conn.execute(
+            "DELETE FROM task_state WHERE updated_at < $1;",
+            cutoff,
+        )
+        counts["old_snapshots"] = await conn.fetchval(
+            "SELECT COUNT(*) FROM task_container_snapshots WHERE updated_at < $1;",
+            cutoff,
+        )
+        await conn.execute(
+            "DELETE FROM task_container_snapshots WHERE updated_at < $1;",
+            cutoff,
+        )
+        counts["tasks"] = await conn.fetchval(
+            "SELECT COUNT(*) FROM tasks WHERE created_at < $1;",
+            cutoff,
+        )
+        await conn.execute(
+            "DELETE FROM tasks WHERE created_at < $1;",
+            cutoff,
+        )
+    return {key: int(value or 0) for key, value in counts.items()}
