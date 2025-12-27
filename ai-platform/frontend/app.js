@@ -86,6 +86,14 @@
     resultStatus: document.getElementById('resultStatus'),
     filesCount: document.getElementById('filesCount'),
     artifactsCount: document.getElementById('artifactsCount'),
+    iterationsCount: document.getElementById('iterationsCount'),
+    timeTaken: document.getElementById('timeTaken'),
+    fileCategories: document.getElementById('fileCategories'),
+    fileList: document.getElementById('fileList'),
+    filePreview: document.getElementById('filePreview'),
+    previewFileName: document.getElementById('previewFileName'),
+    fileContentPreview: document.getElementById('fileContentPreview'),
+    copyFileBtn: document.getElementById('copyFileBtn'),
     loadingOverlay: document.getElementById('loadingOverlay'),
     loadingMessage: document.getElementById('loadingMessage'),
     loadingSubtext: document.getElementById('loadingSubtext'),
@@ -109,6 +117,9 @@
   let activeInspectorTab = 'state';
   let latestFilesTotal = null;
   let latestArtifactsTotal = null;
+  let activeFileCategory = 'all';
+  let activeFilePath = '';
+  let activeFileContent = '';
   let activeSocket = null;
 
   const sections = [
@@ -241,6 +252,7 @@
   const updateSummaryCounts = ({
     filesTotal = latestFilesTotal,
     artifactsTotal = latestArtifactsTotal,
+    iterationsTotal = null,
     fallbackFiles,
     fallbackArtifacts
   } = {}) => {
@@ -250,6 +262,9 @@
       typeof artifactsTotal === 'number' ? artifactsTotal : fallbackArtifacts ?? 0;
     renderCount(elements.filesCount, resolvedFiles);
     renderCount(elements.artifactsCount, resolvedArtifacts);
+    if (typeof iterationsTotal === 'number') {
+      renderCount(elements.iterationsCount, iterationsTotal);
+    }
   };
 
   const formatProgress = (progress) => {
@@ -285,10 +300,28 @@
     if (elements.resultJson && data.result !== undefined && data.result !== null) {
       elements.resultJson.textContent = JSON.stringify(data.result, null, 2);
     }
+    const iterations =
+      typeof data.iterations === 'number'
+        ? data.iterations
+        : typeof data.result?.iterations === 'number'
+          ? data.result.iterations
+          : 0;
+    const fallbackFilesCount =
+      typeof data.files_count === 'number'
+        ? data.files_count
+        : typeof data.result?.files_count === 'number'
+          ? data.result.files_count
+          : null;
+    const fallbackArtifactsCount =
+      typeof data.artifacts_count === 'number'
+        ? data.artifacts_count
+        : typeof data.result?.artifacts_count === 'number'
+          ? data.result.artifacts_count
+          : null;
     updateSummaryCounts({
-      fallbackFiles: typeof data.files_count === 'number' ? data.files_count : null,
-      fallbackArtifacts:
-        typeof data.artifacts_count === 'number' ? data.artifacts_count : null
+      fallbackFiles: fallbackFilesCount,
+      fallbackArtifacts: fallbackArtifactsCount,
+      iterationsTotal: iterations
     });
   };
   const isTerminalState = (data) => {
@@ -308,7 +341,7 @@
     }
     latestFilesTotal = null;
     latestArtifactsTotal = null;
-    updateSummaryCounts({ filesTotal: 0, artifactsTotal: 0 });
+    updateSummaryCounts({ filesTotal: 0, artifactsTotal: 0, iterationsTotal: 0 });
     if (elements.taskStatus) {
       elements.taskStatus.textContent = '-';
     }
@@ -324,6 +357,7 @@
     if (elements.resultStatus) {
       elements.resultStatus.innerHTML = '<span class="status-badge">In progress</span>';
     }
+    resetFilePanel();
   };
 
   const stopPolling = () => {
@@ -416,10 +450,26 @@
   const getItemKey = (item) =>
     item?.id || item?._id || item?.event_id || item?.artifact_id || item?.created_at || '';
 
-  const renderStatePanel = (state) => {
+  const normalizeStatePayload = (payload) => {
+    if (!payload) {
+      return { state: null, updatedAt: null };
+    }
+    if (payload.state) {
+      return { state: payload.state, updatedAt: payload.updated_at };
+    }
+    return { state: payload, updatedAt: payload.updated_at };
+  };
+
+  const resolveStateValue = (value) =>
+    value === null || value === undefined || value === '' ? '-' : value;
+
+  const renderStatePanel = (payload) => {
     if (!elements.stateTable) {
       return;
     }
+    const { state, updatedAt } = normalizeStatePayload(payload);
+    const resolvedUpdatedAt =
+      updatedAt || state?.timestamps?.updated_at || state?.timestamps?.updatedAt;
     const entries = [
       { label: 'status', value: state?.status },
       { label: 'progress', value: state?.progress },
@@ -428,19 +478,166 @@
       { label: 'current_task', value: state?.current_task },
       { label: 'container_state', value: state?.container_state },
       { label: 'container_progress', value: state?.container_progress },
-      { label: 'updated_at', value: formatShortDate(state?.updated_at) }
+      { label: 'updated_at', value: formatShortDate(resolvedUpdatedAt) }
     ];
     elements.stateTable.innerHTML = entries
       .map(
         (entry) => `
           <div class="state-item">
             <span>${entry.label}</span>
-            <strong>${entry.value ?? '-'}</strong>
+            <strong>${resolveStateValue(entry.value)}</strong>
           </div>
         `
       )
       .join('');
   };
+
+  const resetFilePanel = () => {
+    activeFileCategory = 'all';
+    activeFilePath = '';
+    activeFileContent = '';
+    latestFilesSnapshot = null;
+    if (elements.fileCategories) {
+      elements.fileCategories.innerHTML =
+        '<div class="category-item active" data-category="all">All Files</div>';
+    }
+    if (elements.fileList) {
+      elements.fileList.innerHTML = '<div class="file-item">No files yet.</div>';
+    }
+    if (elements.previewFileName) {
+      elements.previewFileName.textContent = 'Select a file to preview';
+    }
+    if (elements.fileContentPreview) {
+      elements.fileContentPreview.textContent = '// Select a file to view its content';
+    }
+    if (elements.copyFileBtn) {
+      elements.copyFileBtn.disabled = true;
+    }
+  };
+
+  const formatFileLabel = (path) => {
+    if (!path) {
+      return 'Untitled';
+    }
+    const segments = path.split('/');
+    return segments[segments.length - 1] || path;
+  };
+
+  const renderFileCategories = (filesData) => {
+    if (!elements.fileCategories) {
+      return;
+    }
+    const byType = filesData?.by_type || {};
+    const categories = [
+      { key: 'all', label: `All Files (${filesData?.total ?? 0})` },
+      { key: 'code', label: `Code (${byType.code?.length ?? 0})` },
+      { key: 'config', label: `Config (${byType.config?.length ?? 0})` },
+      { key: 'docs', label: `Docs (${byType.docs?.length ?? 0})` },
+      { key: 'tests', label: `Tests (${byType.tests?.length ?? 0})` },
+      { key: 'other', label: `Other (${byType.other?.length ?? 0})` }
+    ];
+    elements.fileCategories.innerHTML = categories
+      .map(
+        (category) => `
+          <div class="category-item ${category.key === activeFileCategory ? 'active' : ''}" data-category="${category.key}">
+            ${category.label}
+          </div>
+        `
+      )
+      .join('');
+  };
+
+  const resolveFilesForCategory = (filesData, category) => {
+    if (!filesData) {
+      return [];
+    }
+    if (category === 'all') {
+      return filesData.all_files || [];
+    }
+    return filesData.by_type?.[category] || [];
+  };
+
+  const renderFileList = (filesData) => {
+    if (!elements.fileList) {
+      return;
+    }
+    const files = resolveFilesForCategory(filesData, activeFileCategory);
+    if (!files.length) {
+      elements.fileList.innerHTML = '<div class="file-item">No files in this category.</div>';
+      return;
+    }
+    elements.fileList.innerHTML = files
+      .map((path) => {
+        const isActive = path === activeFilePath;
+        return `
+          <div class="file-item ${isActive ? 'active' : ''}" data-path="${path}">
+            <span class="file-icon">📄</span>
+            <span class="file-name">${formatFileLabel(path)}</span>
+          </div>
+        `;
+      })
+      .join('');
+  };
+
+  const encodeFilePath = (path) =>
+    encodeURIComponent(path).replace(/%2F/g, '/');
+
+  const fetchFileContent = async (taskId, filepath) =>
+    fetchJson(buildApiUrl(`/api/tasks/${taskId}/files/${encodeFilePath(filepath)}`));
+
+  const renderFilePreview = (filename, content) => {
+    if (elements.previewFileName) {
+      elements.previewFileName.textContent = filename || 'Select a file to preview';
+    }
+    if (elements.fileContentPreview) {
+      elements.fileContentPreview.textContent = content || '// No content available';
+    }
+    if (elements.copyFileBtn) {
+      elements.copyFileBtn.disabled = !content;
+    }
+  };
+
+  const handleFileSelection = async (taskId, path) => {
+    if (!taskId || !path) {
+      return;
+    }
+    activeFilePath = path;
+    renderFileList(latestFilesSnapshot);
+    renderFilePreview(formatFileLabel(path), 'Loading file content...');
+    const { data, error } = await fetchFileContent(taskId, path);
+    if (error) {
+      renderFilePreview(formatFileLabel(path), `Unable to load file: ${error}`);
+      return;
+    }
+    const content = data?.content ?? '';
+    activeFileContent = content;
+    renderFilePreview(formatFileLabel(path), content);
+  };
+
+  const copyFileContent = async () => {
+    if (!activeFileContent) {
+      showToast('No file selected to copy.', '⚠️');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(activeFileContent);
+      showToast('File content copied.', '✅');
+      return;
+    } catch (error) {
+      const textarea = document.createElement('textarea');
+      textarea.value = activeFileContent;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'absolute';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const success = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      showToast(success ? 'File content copied.' : 'Unable to copy file content.', success ? '✅' : '⚠️');
+    }
+  };
+
+  let latestFilesSnapshot = null;
 
   const renderEvents = (events) => {
     if (!elements.eventsList) {
@@ -598,11 +795,20 @@
     if (error) {
       return;
     }
+    latestFilesSnapshot = data;
+    const availableFiles = data?.all_files || [];
+    if (activeFilePath && !availableFiles.includes(activeFilePath)) {
+      activeFilePath = '';
+      activeFileContent = '';
+      renderFilePreview('Select a file to preview', '// Select a file to view its content');
+    }
     const total = parseTotalCount(data);
     if (typeof total === 'number') {
       latestFilesTotal = total;
       updateSummaryCounts();
     }
+    renderFileCategories(data);
+    renderFileList(data);
   };
 
   const startPolling = (taskId) => {
@@ -879,6 +1085,42 @@
           pollArtifacts(currentTaskId);
         }
       }
+    });
+  }
+
+  if (elements.fileCategories) {
+    elements.fileCategories.addEventListener('click', (event) => {
+      const category = event.target.closest('.category-item');
+      if (!category) {
+        return;
+      }
+      const nextCategory = category.dataset.category || 'all';
+      if (nextCategory === activeFileCategory) {
+        return;
+      }
+      activeFileCategory = nextCategory;
+      renderFileCategories(latestFilesSnapshot);
+      renderFileList(latestFilesSnapshot);
+    });
+  }
+
+  if (elements.fileList) {
+    elements.fileList.addEventListener('click', (event) => {
+      const fileItem = event.target.closest('.file-item');
+      if (!fileItem || !currentTaskId) {
+        return;
+      }
+      const path = fileItem.dataset.path;
+      if (!path) {
+        return;
+      }
+      handleFileSelection(currentTaskId, path);
+    });
+  }
+
+  if (elements.copyFileBtn) {
+    elements.copyFileBtn.addEventListener('click', () => {
+      copyFileContent();
     });
   }
 
