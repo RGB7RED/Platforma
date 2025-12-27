@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def get_port() -> int:
     """Return the port the server should bind to."""
-    return int(os.getenv("PORT", "8000"))
+    return int(os.getenv("PORT", "8080"))
 
 def get_workers() -> int:
     """Return the number of workers to use for production server."""
