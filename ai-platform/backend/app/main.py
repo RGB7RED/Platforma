@@ -2408,31 +2408,50 @@ async def get_task_state(task_id: str, request: Request):
 async def get_task_files(task_id: str, request: Request):
     """Получение списка файлов задачи"""
     task_token = set_task_id(task_id)
+    container = None
     try:
         await ensure_task_owner(task_id, request)
         container = await resolve_container_with_db(task_id)
         if not container:
             raise HTTPException(status_code=404, detail="Container not found")
-    
-    # Группируем файлы по типам
-    files_by_type = {
-        "code": [f for f in container.files.keys() if f.endswith('.py')],
-        "config": [f for f in container.files.keys() if any(
-            ext in f for ext in ['.json', '.yaml', '.yml', '.toml', '.env']
-        )],
-        "docs": [f for f in container.files.keys() if any(
-            ext in f for ext in ['.md', '.txt', '.rst']
-        )],
-        "tests": [f for f in container.files.keys() if 'test' in f.lower()],
-        "other": [f for f in container.files.keys() if not any(
-            pattern in f for pattern in ['.py', '.json', '.yaml', '.md', 'test']
-        )]
-    }
-    
+
+        # Группируем файлы по типам
+        files_by_type = {
+            "code": [f for f in container.files.keys() if f.endswith(".py")],
+            "config": [
+                f
+                for f in container.files.keys()
+                if any(ext in f for ext in [".json", ".yaml", ".yml", ".toml", ".env"])
+            ],
+            "docs": [
+                f
+                for f in container.files.keys()
+                if any(ext in f for ext in [".md", ".txt", ".rst"])
+            ],
+            "tests": [f for f in container.files.keys() if "test" in f.lower()],
+            "other": [
+                f
+                for f in container.files.keys()
+                if not any(pattern in f for pattern in [".py", ".json", ".yaml", ".md", "test"])
+            ],
+        }
+
         return {
             "total": len(container.files),
             "by_type": files_by_type,
-            "all_files": list(container.files.keys())
+            "all_files": list(container.files.keys()),
+        }
+    except Exception as exc:
+        logger.exception("Failed to build files_by_type for task_id=%s", task_id)
+        await record_event(
+            task_id,
+            "TaskFilesError",
+            normalize_payload({"error": str(exc)}),
+        )
+        return {
+            "total": len(container.files) if container else 0,
+            "by_type": {},
+            "all_files": list(container.files.keys()) if container else [],
         }
     finally:
         reset_task_id(task_token)
@@ -2446,26 +2465,26 @@ async def get_file_content(task_id: str, filepath: str, request: Request):
         container = await resolve_container_with_db(task_id)
         if not container:
             raise HTTPException(status_code=404, detail="Container not found")
-    
-    # Ищем файл (с учетом возможных путей)
-    actual_path = None
-    for stored_path in container.files.keys():
-        if stored_path.endswith(filepath) or filepath in stored_path:
-            actual_path = stored_path
-            break
-    
-    if not actual_path or actual_path not in container.files:
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    content = container.files[actual_path]
-    if isinstance(content, bytes):
-        content = content.decode("utf-8", errors="replace")
-    
+
+        # Ищем файл (с учетом возможных путей)
+        actual_path = None
+        for stored_path in container.files.keys():
+            if stored_path.endswith(filepath) or filepath in stored_path:
+                actual_path = stored_path
+                break
+
+        if not actual_path or actual_path not in container.files:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        content = container.files[actual_path]
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+
         return {
             "path": actual_path,
             "content": content,
             "size": len(content),
-            "language": get_language_from_extension(actual_path)
+            "language": get_language_from_extension(actual_path),
         }
     finally:
         reset_task_id(task_token)
