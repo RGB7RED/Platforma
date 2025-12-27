@@ -174,7 +174,8 @@ Open `http://localhost` in your browser.
 - **Example:** `AUTH_MODE=apikey` or `AUTH_MODE=hybrid` or `AUTH_MODE=auth`
 - **Required in production?:** Recommended
 - **Notes:** `apikey` enforces the existing API key flow, `auth` requires JWT access tokens, and
-  `hybrid` allows either.
+  `hybrid` allows either. In `auth`/`hybrid` mode, tasks created with access tokens are bound to the
+  authenticated user ID (`owner_user_id`) and cannot be accessed via API keys.
 
 ### AUTH_JWT_SECRET
 - **Purpose:** Secret key used to sign access tokens.

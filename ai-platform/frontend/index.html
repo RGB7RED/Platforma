@@ -61,6 +61,25 @@
                     <h2>Create New Task</h2>
 
                     <div class="form-group">
+                        <label for="accessTokenInput">Access Token</label>
+                        <div class="task-lookup-actions">
+                            <input
+                                type="password"
+                                id="accessTokenInput"
+                                class="task-id-input"
+                                placeholder="Enter your access token"
+                                autocomplete="off"
+                                autocapitalize="off"
+                                autocorrect="off"
+                                spellcheck="false">
+                            <button class="secondary-btn" id="saveAccessTokenBtn">Save</button>
+                        </div>
+                        <div class="task-lookup-hint">
+                            Optional for auth mode. Stored locally on this device (localStorage).
+                        </div>
+                    </div>
+
+                    <div class="form-group">
                         <label for="apiKeyInput">API Key</label>
                         <div class="task-lookup-actions">
                             <input
