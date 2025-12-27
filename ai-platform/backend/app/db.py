@@ -111,6 +111,40 @@ async def init_db(database_url: str) -> None:
             );
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_users (
+                id UUID PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_refresh_sessions (
+                id UUID PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                revoked_at TIMESTAMPTZ NULL,
+                rotated_at TIMESTAMPTZ NULL,
+                last_used_at TIMESTAMPTZ NULL,
+                user_agent TEXT NULL,
+                ip_address TEXT NULL
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS auth_refresh_sessions_user_id_idx
+            ON auth_refresh_sessions (user_id);
+            """
+        )
     logger.info("Database initialized for task persistence")
 
 
@@ -127,6 +161,10 @@ async def close_db() -> None:
 
 def _coerce_task_id(task_id: str) -> uuid.UUID:
     return task_id if isinstance(task_id, uuid.UUID) else uuid.UUID(task_id)
+
+
+def _coerce_user_id(user_id: str) -> uuid.UUID:
+    return user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(user_id)
 
 
 def _row_to_dict(row: Optional[asyncpg.Record]) -> Optional[Dict[str, Any]]:
@@ -1169,6 +1207,156 @@ async def list_active_task_ids(limit: int = 5) -> List[str]:
         limit,
     )
     return [str(row["id"]) for row in rows]
+
+
+async def create_auth_user(*, email: str, password_hash: str) -> Dict[str, Any]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    try:
+        row = await _pool.fetchrow(
+            """
+            INSERT INTO auth_users (id, email, password_hash)
+            VALUES ($1, $2, $3)
+            RETURNING id, email, password_hash, created_at, updated_at;
+            """,
+            uuid.uuid4(),
+            email,
+            password_hash,
+        )
+    except Exception:
+        _log_db_error("create_auth_user", {"email": email})
+        raise
+    return _row_to_dict(row) or {}
+
+
+async def get_auth_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    row = await _pool.fetchrow(
+        """
+        SELECT id, email, password_hash, created_at, updated_at
+        FROM auth_users
+        WHERE email = $1;
+        """,
+        email,
+    )
+    return _row_to_dict(row)
+
+
+async def get_auth_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    row = await _pool.fetchrow(
+        """
+        SELECT id, email, password_hash, created_at, updated_at
+        FROM auth_users
+        WHERE id = $1;
+        """,
+        _coerce_user_id(user_id),
+    )
+    return _row_to_dict(row)
+
+
+async def create_refresh_session(
+    *,
+    user_id: str,
+    token_hash: str,
+    expires_at: datetime,
+    user_agent: Optional[str] = None,
+    ip_address: Optional[str] = None,
+) -> Dict[str, Any]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    try:
+        row = await _pool.fetchrow(
+            """
+            INSERT INTO auth_refresh_sessions (
+                id,
+                user_id,
+                token_hash,
+                expires_at,
+                last_used_at,
+                user_agent,
+                ip_address
+            )
+            VALUES ($1, $2, $3, $4, NOW(), $5, $6)
+            RETURNING *;
+            """,
+            uuid.uuid4(),
+            _coerce_user_id(user_id),
+            token_hash,
+            expires_at,
+            user_agent,
+            ip_address,
+        )
+    except Exception:
+        _log_db_error(
+            "create_refresh_session",
+            {"user_id": user_id, "expires_at": expires_at},
+        )
+        raise
+    return _row_to_dict(row) or {}
+
+
+async def get_refresh_session_by_hash(token_hash: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    row = await _pool.fetchrow(
+        """
+        SELECT *
+        FROM auth_refresh_sessions
+        WHERE token_hash = $1;
+        """,
+        token_hash,
+    )
+    return _row_to_dict(row)
+
+
+async def rotate_refresh_session(
+    *,
+    session_id: str,
+    token_hash: str,
+    expires_at: datetime,
+) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    try:
+        row = await _pool.fetchrow(
+            """
+            UPDATE auth_refresh_sessions
+            SET token_hash = $2,
+                expires_at = $3,
+                rotated_at = NOW(),
+                last_used_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1 AND revoked_at IS NULL
+            RETURNING *;
+            """,
+            _coerce_user_id(session_id),
+            token_hash,
+            expires_at,
+        )
+    except Exception:
+        _log_db_error("rotate_refresh_session", {"session_id": session_id})
+        raise
+    return _row_to_dict(row)
+
+
+async def revoke_refresh_session(*, session_id: str) -> None:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    try:
+        await _pool.execute(
+            """
+            UPDATE auth_refresh_sessions
+            SET revoked_at = NOW(), updated_at = NOW()
+            WHERE id = $1;
+            """,
+            _coerce_user_id(session_id),
+        )
+    except Exception:
+        _log_db_error("revoke_refresh_session", {"session_id": session_id})
+        raise
 
 
 async def cleanup_expired_data(ttl_days: int) -> Dict[str, int]:

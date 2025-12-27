@@ -169,6 +169,73 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Recommended
 - **Notes:** Clients must send `X-API-Key` with the configured value.
 
+### AUTH_MODE
+- **Purpose:** Selects the authentication strategy for API access.
+- **Example:** `AUTH_MODE=apikey` or `AUTH_MODE=hybrid` or `AUTH_MODE=auth`
+- **Required in production?:** Recommended
+- **Notes:** `apikey` enforces the existing API key flow, `auth` requires JWT access tokens, and
+  `hybrid` allows either.
+
+### AUTH_JWT_SECRET
+- **Purpose:** Secret key used to sign access tokens.
+- **Example:** `AUTH_JWT_SECRET=super-long-random-string`
+- **Required in production?:** Yes (when using `AUTH_MODE=auth` or `AUTH_MODE=hybrid`)
+- **Notes:** Must be kept private. Rotating this secret invalidates existing access tokens.
+
+### AUTH_REFRESH_TOKEN_SECRET
+- **Purpose:** HMAC secret for hashing refresh tokens before storing them in the database.
+- **Example:** `AUTH_REFRESH_TOKEN_SECRET=another-long-random-string`
+- **Required in production?:** Yes (when using refresh tokens)
+- **Notes:** Defaults to `AUTH_JWT_SECRET` if unset.
+
+### AUTH_ACCESS_TOKEN_TTL_MINUTES
+- **Purpose:** Access token lifetime in minutes.
+- **Example:** `AUTH_ACCESS_TOKEN_TTL_MINUTES=15`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 15 minutes.
+
+### AUTH_REFRESH_TOKEN_TTL_DAYS
+- **Purpose:** Refresh token lifetime in days.
+- **Example:** `AUTH_REFRESH_TOKEN_TTL_DAYS=30`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 30 days and is reset on each refresh rotation.
+
+### AUTH_REFRESH_COOKIE_NAME
+- **Purpose:** Cookie name for the refresh token.
+- **Example:** `AUTH_REFRESH_COOKIE_NAME=refresh_token`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `refresh_token`.
+
+### AUTH_REFRESH_COOKIE_PATH
+- **Purpose:** Cookie path for refresh token storage.
+- **Example:** `AUTH_REFRESH_COOKIE_PATH=/auth`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `/auth`.
+
+### AUTH_REFRESH_COOKIE_DOMAIN
+- **Purpose:** Cookie domain for refresh token storage.
+- **Example:** `AUTH_REFRESH_COOKIE_DOMAIN=your-domain.com`
+- **Required in production?:** Optional
+- **Notes:** Leave unset to default to the current host.
+
+### AUTH_REFRESH_COOKIE_SAMESITE
+- **Purpose:** SameSite attribute for the refresh token cookie.
+- **Example:** `AUTH_REFRESH_COOKIE_SAMESITE=lax`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `lax`. Use `none` only when required and with HTTPS.
+
+### AUTH_JWT_ISSUER
+- **Purpose:** Optional issuer claim for access tokens.
+- **Example:** `AUTH_JWT_ISSUER=ai-platform`
+- **Required in production?:** Optional
+- **Notes:** When set, tokens must include this issuer.
+
+### AUTH_JWT_AUDIENCE
+- **Purpose:** Optional audience claim for access tokens.
+- **Example:** `AUTH_JWT_AUDIENCE=ai-platform-clients`
+- **Required in production?:** Optional
+- **Notes:** When set, tokens must include this audience.
+
 ### Clarification loop endpoints
 - **Purpose:** `/api/tasks/{task_id}/questions`, `/input`, and `/resume` use the same API key enforcement.
 - **Example:** No additional environment variables.
