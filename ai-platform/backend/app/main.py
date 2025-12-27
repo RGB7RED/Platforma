@@ -6,16 +6,19 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Requ
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uuid
 import json
 import asyncio
+import io
+import zipfile
 from typing import Dict, Optional, List, Any
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from datetime import datetime
 
 from .models import Container
 from .orchestrator import AIOrchestrator
@@ -99,10 +102,19 @@ FILE_PERSISTENCE_REASON = ""
 def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(task_data.get("id"), uuid.UUID):
         task_data["id"] = str(task_data["id"])
-    if task_id in storage.containers:
-        container = storage.containers[task_id]
+    container = resolve_container(task_id)
+    if container:
         task_data["files_count"] = len(container.files)
         task_data["artifacts_count"] = sum(len(a) for a in container.artifacts.values())
+        task_data["iterations"] = container.metadata.get("iterations")
+        result = task_data.get("result")
+        if isinstance(result, dict):
+            result["files_count"] = task_data["files_count"]
+            result["artifacts_count"] = task_data["artifacts_count"]
+            result["iterations"] = task_data.get("iterations", result.get("iterations"))
+    time_taken_seconds = compute_time_taken_seconds(task_data)
+    if time_taken_seconds is not None:
+        task_data["time_taken_seconds"] = time_taken_seconds
     return task_data
 
 
@@ -451,6 +463,79 @@ def get_file_persistence_setting() -> bool:
         FILE_PERSISTENCE_ENABLED, FILE_PERSISTENCE_REASON = resolve_file_persistence_setting()
     return FILE_PERSISTENCE_ENABLED
 
+
+def parse_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def compute_time_taken_seconds(task_data: Dict[str, Any]) -> Optional[float]:
+    start = parse_datetime(task_data.get("created_at"))
+    end = parse_datetime(task_data.get("completed_at")) or parse_datetime(task_data.get("updated_at"))
+    if not start or not end:
+        return None
+    delta = (end - start).total_seconds()
+    return max(0.0, delta)
+
+
+def sanitize_zip_path(path: str) -> str:
+    normalized = path.replace("\\", "/").lstrip("/")
+    posix_path = PurePosixPath(normalized)
+    if posix_path.is_absolute() or ".." in posix_path.parts or not posix_path.parts:
+        raise HTTPException(status_code=400, detail=f"Invalid file path: {path}")
+    return posix_path.as_posix()
+
+
+def load_container_from_file(task_id: str) -> Optional[Container]:
+    if not get_file_persistence_setting():
+        return None
+    filepath = Path("data/tasks") / f"{task_id}.json"
+    if not filepath.exists():
+        return None
+    try:
+        with filepath.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+        container = Container.from_dict(data)
+        storage.containers[task_id] = container
+        return container
+    except Exception:
+        logger.exception("Failed to load container from %s", filepath)
+        return None
+
+
+def resolve_container(task_id: str) -> Optional[Container]:
+    container = storage.containers.get(task_id)
+    if container:
+        return container
+    return load_container_from_file(task_id)
+
+
+def build_zip_response(task_id: str) -> StreamingResponse:
+    container = resolve_container(task_id)
+    if not container:
+        raise HTTPException(status_code=404, detail="Container not found")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for filepath, content in container.files.items():
+            safe_path = sanitize_zip_path(filepath)
+            payload = content.encode("utf-8") if isinstance(content, str) else content
+            zip_info = zipfile.ZipInfo(safe_path)
+            zip_info.flag_bits |= 0x800  # UTF-8 filenames
+            zip_file.writestr(zip_info, payload)
+
+    buffer.seek(0)
+    headers = {
+        "Content-Disposition": f'attachment; filename="task_{task_id}.zip"'
+    }
+    return StreamingResponse(buffer, media_type="application/zip", headers=headers)
+
 # CORS для Telegram Mini App и локальной разработки
 app.add_middleware(
     CORSMiddleware,
@@ -509,13 +594,15 @@ async def create_task(request: TaskRequest, req: Request):
         )
     else:
         # Сохраняем задачу
+        now = db.now_utc()
         storage.active_tasks[task_id] = {
             "id": task_id,
             "description": request.description,
             "user_id": user_id,
             "status": "created",
             "progress": 0.0,
-            "created_at": asyncio.get_event_loop().time(),
+            "created_at": now,
+            "updated_at": now,
             "codex_version": request.codex_version,
             "client_ip": client_ip,
         }
@@ -624,10 +711,9 @@ async def get_task_state(task_id: str):
 @app.get("/api/tasks/{task_id}/files")
 async def get_task_files(task_id: str):
     """Получение списка файлов задачи"""
-    if task_id not in storage.containers:
+    container = resolve_container(task_id)
+    if not container:
         raise HTTPException(status_code=404, detail="Container not found")
-    
-    container = storage.containers[task_id]
     
     # Группируем файлы по типам
     files_by_type = {
@@ -653,10 +739,9 @@ async def get_task_files(task_id: str):
 @app.get("/api/tasks/{task_id}/files/{filepath:path}")
 async def get_file_content(task_id: str, filepath: str):
     """Получение содержимого файла"""
-    if task_id not in storage.containers:
+    container = resolve_container(task_id)
+    if not container:
         raise HTTPException(status_code=404, detail="Container not found")
-    
-    container = storage.containers[task_id]
     
     # Ищем файл (с учетом возможных путей)
     actual_path = None
@@ -679,20 +764,14 @@ async def get_file_content(task_id: str, filepath: str):
 
 @app.post("/api/tasks/{task_id}/download")
 async def download_task_files(task_id: str):
-    """Подготовка файлов задачи для скачивания"""
-    if task_id not in storage.containers:
-        raise HTTPException(status_code=404, detail="Container not found")
-    
-    # В реальной реализации здесь создавался бы ZIP архив
-    # Для MVP возвращаем информацию о файлах
-    container = storage.containers[task_id]
-    
-    return {
-        "task_id": task_id,
-        "files_count": len(container.files),
-        "download_url": f"/api/tasks/{task_id}/zip",  # Будет реализовано позже
-        "instructions": "Use the download_url to get ZIP archive"
-    }
+    """Скачать файлы задачи ZIP архивом"""
+    return build_zip_response(task_id)
+
+
+@app.get("/api/tasks/{task_id}/download.zip")
+async def download_task_files_get(task_id: str):
+    """Скачать файлы задачи ZIP архивом (GET alias)"""
+    return build_zip_response(task_id)
 
 @app.get("/api/users/{user_id}/tasks")
 async def get_user_tasks(user_id: str, limit: int = 10):
@@ -763,6 +842,7 @@ async def process_task_background(task_id: str, description: str):
                 if task_data:
                     await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
             else:
+                fields.setdefault("updated_at", db.now_utc())
                 storage.active_tasks[task_id].update(fields)
                 await manager.send_progress(task_id, storage.active_tasks[task_id])
 
@@ -902,7 +982,7 @@ async def process_task_background(task_id: str, description: str):
                 "progress": result.get("progress", 1.0),
                 "current_stage": "completed",
                 "result": result,
-                "completed_at": db.now_utc() if db.is_enabled() else asyncio.get_event_loop().time(),
+                "completed_at": db.now_utc(),
             }
         )
         await record_event(

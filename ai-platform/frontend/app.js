@@ -88,6 +88,7 @@
     artifactsCount: document.getElementById('artifactsCount'),
     iterationsCount: document.getElementById('iterationsCount'),
     timeTaken: document.getElementById('timeTaken'),
+    downloadZipBtn: document.getElementById('downloadZipBtn'),
     fileCategories: document.getElementById('fileCategories'),
     fileList: document.getElementById('fileList'),
     filePreview: document.getElementById('filePreview'),
@@ -121,6 +122,7 @@
   let activeFilePath = '';
   let activeFileContent = '';
   let activeSocket = null;
+  let latestTaskSnapshot = null;
 
   const sections = [
     elements.welcomeScreen,
@@ -267,6 +269,128 @@
     }
   };
 
+  const formatDuration = (seconds) => {
+    if (typeof seconds !== 'number' || Number.isNaN(seconds) || seconds < 0) {
+      return '—';
+    }
+    if (seconds < 1) {
+      return '0s';
+    }
+    return `${Math.round(seconds)}s`;
+  };
+
+  const resolveIterations = (data) => {
+    if (typeof data?.iterations === 'number') {
+      return data.iterations;
+    }
+    if (typeof data?.result?.iterations === 'number') {
+      return data.result.iterations;
+    }
+    return null;
+  };
+
+  const resolveFilesTotal = (data) => {
+    if (typeof latestFilesTotal === 'number') {
+      return latestFilesTotal;
+    }
+    if (typeof data?.files_count === 'number') {
+      return data.files_count;
+    }
+    if (typeof data?.result?.files_count === 'number') {
+      return data.result.files_count;
+    }
+    return null;
+  };
+
+  const resolveArtifactsTotal = (data) => {
+    if (typeof latestArtifactsTotal === 'number') {
+      return latestArtifactsTotal;
+    }
+    if (typeof data?.artifacts_count === 'number') {
+      return data.artifacts_count;
+    }
+    if (typeof data?.result?.artifacts_count === 'number') {
+      return data.result.artifacts_count;
+    }
+    return null;
+  };
+
+  const computeTimeTakenSeconds = (data) => {
+    if (typeof data?.time_taken_seconds === 'number') {
+      return data.time_taken_seconds;
+    }
+    const start = data?.created_at || data?.started_at;
+    const end = data?.completed_at || data?.updated_at;
+    if (!start || !end) {
+      return null;
+    }
+    const startDate = new Date(start);
+    const endDate = new Date(end);
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+      return null;
+    }
+    const diffSeconds = (endDate - startDate) / 1000;
+    if (diffSeconds < 0) {
+      return null;
+    }
+    return diffSeconds;
+  };
+
+  const renderResultJson = () => {
+    if (!elements.resultJson) {
+      return;
+    }
+    const result = latestTaskSnapshot?.result;
+    if (result === undefined || result === null) {
+      elements.resultJson.textContent = '';
+      return;
+    }
+    const resolved = { ...result };
+    const iterations = resolveIterations(latestTaskSnapshot);
+    const filesTotal = resolveFilesTotal(latestTaskSnapshot);
+    const artifactsTotal = resolveArtifactsTotal(latestTaskSnapshot);
+    if (typeof iterations === 'number') {
+      resolved.iterations = iterations;
+    }
+    if (typeof filesTotal === 'number') {
+      resolved.files_count = filesTotal;
+    }
+    if (typeof artifactsTotal === 'number') {
+      resolved.artifacts_count = artifactsTotal;
+    }
+    elements.resultJson.textContent = JSON.stringify(resolved, null, 2);
+  };
+
+  const refreshMetricsDisplay = () => {
+    if (!latestTaskSnapshot) {
+      return;
+    }
+    updateSummaryCounts({
+      filesTotal: resolveFilesTotal(latestTaskSnapshot),
+      artifactsTotal: resolveArtifactsTotal(latestTaskSnapshot),
+      iterationsTotal: resolveIterations(latestTaskSnapshot)
+    });
+    renderResultJson();
+  };
+
+  const updateTimeTakenDisplay = (data) => {
+    if (!elements.timeTaken) {
+      return;
+    }
+    const seconds = computeTimeTakenSeconds(data);
+    if (seconds === null) {
+      elements.timeTaken.textContent = '—';
+      return;
+    }
+    elements.timeTaken.textContent = formatDuration(seconds);
+  };
+
+  const setDownloadEnabled = (isEnabled) => {
+    if (elements.downloadZipBtn) {
+      elements.downloadZipBtn.disabled = !isEnabled;
+    }
+  };
+
   const formatProgress = (progress) => {
     if (typeof progress !== 'number' || Number.isNaN(progress)) {
       return { value: 0, percent: 0 };
@@ -280,6 +404,9 @@
     if (!data) {
       return;
     }
+    latestTaskSnapshot = data;
+    const isCompleted = String(data.status).toLowerCase() === 'completed';
+    setDownloadEnabled(isCompleted);
     if (elements.taskStatus) {
       elements.taskStatus.textContent = data.status || '-';
     }
@@ -297,32 +424,8 @@
       elements.taskError.textContent = data.error || '';
       elements.taskError.classList.toggle('hidden', !data.error);
     }
-    if (elements.resultJson && data.result !== undefined && data.result !== null) {
-      elements.resultJson.textContent = JSON.stringify(data.result, null, 2);
-    }
-    const iterations =
-      typeof data.iterations === 'number'
-        ? data.iterations
-        : typeof data.result?.iterations === 'number'
-          ? data.result.iterations
-          : 0;
-    const fallbackFilesCount =
-      typeof data.files_count === 'number'
-        ? data.files_count
-        : typeof data.result?.files_count === 'number'
-          ? data.result.files_count
-          : null;
-    const fallbackArtifactsCount =
-      typeof data.artifacts_count === 'number'
-        ? data.artifacts_count
-        : typeof data.result?.artifacts_count === 'number'
-          ? data.result.artifacts_count
-          : null;
-    updateSummaryCounts({
-      fallbackFiles: fallbackFilesCount,
-      fallbackArtifacts: fallbackArtifactsCount,
-      iterationsTotal: iterations
-    });
+    updateTimeTakenDisplay(data);
+    refreshMetricsDisplay();
   };
   const isTerminalState = (data) => {
     const progressInfo = formatProgress(data?.progress);
@@ -341,7 +444,10 @@
     }
     latestFilesTotal = null;
     latestArtifactsTotal = null;
+    latestTaskSnapshot = null;
     updateSummaryCounts({ filesTotal: 0, artifactsTotal: 0, iterationsTotal: 0 });
+    setDownloadEnabled(false);
+    updateTimeTakenDisplay({});
     if (elements.taskStatus) {
       elements.taskStatus.textContent = '-';
     }
@@ -780,7 +886,7 @@
     const total = parseTotalCount(data);
     if (typeof total === 'number') {
       latestArtifactsTotal = total;
-      updateSummaryCounts();
+      refreshMetricsDisplay();
     }
     const signature = JSON.stringify(artifacts.slice(0, 20).map(getItemKey));
     if (signature === lastArtifactSignature) {
@@ -805,7 +911,7 @@
     const total = parseTotalCount(data);
     if (typeof total === 'number') {
       latestFilesTotal = total;
-      updateSummaryCounts();
+      refreshMetricsDisplay();
     }
     renderFileCategories(data);
     renderFileList(data);
@@ -1124,6 +1230,35 @@
     });
   }
 
+  const submitDownloadForm = (url) => {
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = url;
+    form.style.display = 'none';
+    document.body.appendChild(form);
+    form.submit();
+    document.body.removeChild(form);
+  };
+
+  if (elements.downloadZipBtn) {
+    elements.downloadZipBtn.addEventListener('click', () => {
+      if (!currentTaskId) {
+        showToast('No task available to download.', '⚠️');
+        return;
+      }
+      if (elements.downloadZipBtn.disabled) {
+        showToast('ZIP download is available after completion.', 'ℹ️');
+        return;
+      }
+      const downloadUrl = buildApiUrl(`/api/tasks/${currentTaskId}/download.zip`);
+      if (downloadUrl) {
+        window.location.assign(downloadUrl);
+        return;
+      }
+      submitDownloadForm(buildApiUrl(`/api/tasks/${currentTaskId}/download`));
+    });
+  }
+
   if (elements.taskDescription) {
     elements.taskDescription.addEventListener('input', updateCharCount);
   }
@@ -1131,4 +1266,5 @@
   updateCharCount();
   updateApiBaseUrl();
   setActiveInspectorTab(activeInspectorTab);
+  updateTimeTakenDisplay({});
 })();
