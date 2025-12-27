@@ -26,11 +26,27 @@ def get_port() -> int:
     """Return the port the server should bind to."""
     return int(os.getenv("PORT", "8000"))
 
+def get_workers() -> int:
+    """Return the number of workers to use for production server."""
+    raw_value = os.getenv("WEB_CONCURRENCY", "1")
+    try:
+        workers = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid WEB_CONCURRENCY value '%s'; defaulting to 1", raw_value)
+        workers = 1
+    return max(1, workers)
+
 
 def log_startup(port: int) -> None:
     """Log a single startup line for process managers."""
     auth_mode = os.getenv("AUTH_MODE", "unset")
-    logger.info("Starting on 0.0.0.0:%s (AUTH_MODE=%s)", port, auth_mode)
+    workers = get_workers()
+    logger.info(
+        "Starting on 0.0.0.0:%s (AUTH_MODE=%s, WORKERS=%s)",
+        port,
+        auth_mode,
+        workers,
+    )
 
 
 async def run_backend():
@@ -82,12 +98,13 @@ def run_production():
     import uvicorn
 
     port = get_port()
+    workers = get_workers()
     log_startup(port)
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=port,
-        workers=4,
+        workers=workers,
         log_level="info"
     )
 
