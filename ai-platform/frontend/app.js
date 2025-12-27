@@ -405,6 +405,14 @@
     }
     try {
       const response = await apiFetch(buildApiUrl('/api/templates'));
+      if (response.status === 401) {
+        setTemplateOptions([]);
+        if (isAuthEnabled) {
+          updateAuthStatus();
+          showToast('Sign in to load templates.', '⚠️');
+        }
+        return;
+      }
       if (!response.ok) {
         throw new Error('Templates unavailable');
       }

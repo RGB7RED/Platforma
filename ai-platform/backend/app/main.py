@@ -6,7 +6,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Requ
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -785,6 +785,13 @@ app = FastAPI(
 
 
 @app.middleware("http")
+async def preflight_bypass_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return Response(status_code=200)
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request_token = set_request_id(request_id)
@@ -795,25 +802,24 @@ async def request_id_middleware(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     return response
 
-def parse_allowed_origins() -> tuple[list[str], str]:
+def parse_allowed_origins() -> tuple[list[str], str, bool]:
     raw_origins = os.getenv("ALLOWED_ORIGINS")
     raw_value = raw_origins or ""
     parsed_origins = [origin.strip() for origin in raw_value.split(",") if origin.strip()]
+    allow_all_origins = "*" in parsed_origins
     origins = [origin for origin in parsed_origins if origin != "*"]
-    if len(origins) != len(parsed_origins):
-        logger.warning("Ignoring wildcard '*' entry in ALLOWED_ORIGINS.")
     environment = os.getenv("ENVIRONMENT", "").lower()
     is_production = environment == "production"
     source = "env" if raw_origins is not None else "unset"
 
     if is_production:
-        if not origins:
+        if not origins and not allow_all_origins:
             source = "empty"
             logger.warning(
                 "ALLOWED_ORIGINS is empty in production; CORS will block all cross-origin requests."
             )
     else:
-        if not origins:
+        if not origins and not allow_all_origins:
             origins = [
                 "http://localhost",
                 "http://127.0.0.1",
@@ -822,10 +828,10 @@ def parse_allowed_origins() -> tuple[list[str], str]:
             ]
             source = "dev-defaults"
 
-    return origins, source
+    return origins, source, allow_all_origins
 
 
-allowed_origins, cors_source = parse_allowed_origins()
+allowed_origins, cors_source, allow_all_origins = parse_allowed_origins()
 
 def parse_bool_env(value: Optional[str]) -> Optional[bool]:
     if value is None:
@@ -1909,9 +1915,9 @@ async def build_git_export_zip_response(task_id: str, request: Request) -> Strea
 # CORS для Telegram Mini App и локальной разработки
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"] if allow_all_origins else allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
