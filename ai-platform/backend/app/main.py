@@ -1391,6 +1391,105 @@ def build_patch_diff_payload(
     }
 
 
+def build_git_export_apply_script() -> str:
+    return "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "",
+            'ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+            'PATCH_FILE="${ROOT_DIR}/patch.diff"',
+            "",
+            "if ! command -v git >/dev/null 2>&1; then",
+            '  echo "git is required to apply this patch."',
+            "  exit 1",
+            "fi",
+            "",
+            "if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then",
+            '  echo "Run this script from the root of a git repository."',
+            "  exit 1",
+            "fi",
+            "",
+            "if ! git diff --quiet || ! git diff --cached --quiet; then",
+            '  echo "Your working tree has uncommitted changes. Commit or stash them first."',
+            "  exit 1",
+            "fi",
+            "",
+            'git apply --index "${PATCH_FILE}"',
+            'echo "Patch applied. Review the result with git status."',
+        ]
+    )
+
+
+def build_git_export_readme(task_id: str) -> str:
+    return "\n".join(
+        [
+            f"# Git Export Bundle for task {task_id}",
+            "",
+            "This bundle contains a Git-friendly patch with supporting files.",
+            "",
+            "## Contents",
+            "- `patch.diff`: Unified diff for the task changes.",
+            "- `apply.sh`: Helper script to apply the patch safely.",
+            "- `changed_files.json`: Machine-readable list of changed files.",
+            "- `README_APPLY.md`: This guide.",
+            "",
+            "## Apply with the helper script",
+            "1. Ensure `git` is installed.",
+            "2. `cd` to the root of the target repository.",
+            "3. Ensure the working tree is clean (`git status`).",
+            "4. Run: `./apply.sh`",
+            "",
+            "## Apply manually",
+            "```bash",
+            "git apply --index patch.diff",
+            "```",
+            "",
+            "## Notes",
+            "- Binary files are listed in `changed_files.json` and must be handled manually.",
+            "- If the patch fails to apply cleanly, use `git apply --3way patch.diff`.",
+        ]
+    )
+
+
+def build_git_export_files(task_id: str, patch_payload: Dict[str, Any]) -> Dict[str, str]:
+    diff_text = patch_payload.get("diff") or ""
+    changed_files = patch_payload.get("changed_files") or []
+    changed_files_json = json.dumps(changed_files, ensure_ascii=False, indent=2)
+    return {
+        "patch.diff": diff_text,
+        "apply.sh": build_git_export_apply_script(),
+        "README_APPLY.md": build_git_export_readme(task_id),
+        "changed_files.json": changed_files_json,
+    }
+
+
+def build_git_export_payload(task_id: str, patch_payload: Dict[str, Any]) -> Dict[str, Any]:
+    files = build_git_export_files(task_id, patch_payload)
+    return {
+        "files": files,
+        "patch_stats": patch_payload.get("stats") or {},
+    }
+
+
+async def resolve_patch_payload(task_id: str, container: Optional[Container]) -> Dict[str, Any]:
+    patch_payload = None
+    if container:
+        patch_artifacts = container.artifacts.get("patch_diff", [])
+        if patch_artifacts:
+            latest = patch_artifacts[-1]
+            patch_payload = latest.content if hasattr(latest, "content") else latest
+    if patch_payload is None and db.is_enabled():
+        artifacts = await db.get_artifacts(task_id, type="patch_diff", limit=1, order="desc")
+        if artifacts:
+            patch_payload = artifacts[0].get("payload")
+    if patch_payload is None and container:
+        patch_payload = build_patch_diff_payload(
+            container.metadata.get("baseline_files") or {},
+            container.files,
+        )
+    return patch_payload or {"diff": "", "changed_files": [], "stats": {}}
+
 def resolve_latest_review_summary(container: Optional[Container]) -> Dict[str, Any]:
     if not container:
         return {}
@@ -1607,6 +1706,61 @@ async def build_zip_response(task_id: str, request: Request) -> StreamingRespons
     buffer.seek(0)
     headers = {
         "Content-Disposition": f'attachment; filename="task_{task_id}.zip"'
+    }
+    return StreamingResponse(buffer, media_type="application/zip", headers=headers)
+
+
+async def build_git_export_zip_response(task_id: str, request: Request) -> StreamingResponse:
+    container = await resolve_container_with_db(task_id)
+    if not container:
+        raise HTTPException(status_code=404, detail="Container not found")
+
+    if db.is_enabled():
+        task_data = await db.get_task_row(task_id)
+        if task_data is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+    else:
+        task_data = storage.active_tasks.get(task_id) or {}
+
+    updated_at = parse_datetime(task_data.get("updated_at")) if task_data else None
+    timestamp_source = updated_at or db.now_utc()
+    if timestamp_source.tzinfo is None:
+        timestamp_source = timestamp_source.replace(tzinfo=timezone.utc)
+    timestamp_source = timestamp_source.astimezone(timezone.utc)
+    zip_timestamp = (
+        timestamp_source.year,
+        timestamp_source.month,
+        timestamp_source.day,
+        timestamp_source.hour,
+        timestamp_source.minute,
+        timestamp_source.second,
+    )
+
+    patch_payload = await resolve_patch_payload(task_id, container)
+    git_export_files = build_git_export_files(task_id, patch_payload)
+
+    root_folder = f"task_{task_id}/git_export/"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        root_info = zipfile.ZipInfo(root_folder)
+        root_info.flag_bits |= 0x800  # UTF-8 filenames
+        root_info.date_time = zip_timestamp
+        root_info.external_attr = 0o40775 << 16
+        zip_file.writestr(root_info, b"")
+
+        for filename, content in git_export_files.items():
+            archive_path = f"{root_folder}{sanitize_zip_path(filename)}"
+            zip_info = zipfile.ZipInfo(archive_path)
+            zip_info.flag_bits |= 0x800  # UTF-8 filenames
+            zip_info.date_time = zip_timestamp
+            if filename == "apply.sh":
+                zip_info.external_attr = 0o100755 << 16
+            payload = content.encode("utf-8") if isinstance(content, str) else content
+            zip_file.writestr(zip_info, payload)
+
+    buffer.seek(0)
+    headers = {
+        "Content-Disposition": f'attachment; filename="task_{task_id}_git_export.zip"'
     }
     return StreamingResponse(buffer, media_type="application/zip", headers=headers)
 
@@ -2069,6 +2223,23 @@ async def download_task_files_get(task_id: str, request: Request):
     finally:
         reset_task_id(task_token)
 
+
+@app.get("/api/tasks/{task_id}/git-export.zip")
+async def download_git_export(task_id: str, request: Request):
+    """Download git export bundle ZIP."""
+    task_token = set_task_id(task_id)
+    try:
+        api_key = require_api_key(request)
+        await enforce_rate_limit(
+            hash_api_key(api_key),
+            "download",
+            RATE_LIMIT_DOWNLOADS_PER_MIN,
+        )
+        await ensure_task_owner(task_id, request)
+        return await build_git_export_zip_response(task_id, request)
+    finally:
+        reset_task_id(task_token)
+
 @app.get("/api/users/{user_id}/tasks")
 async def get_user_tasks(user_id: str, limit: int = 10):
     """Получение задач пользователя"""
@@ -2482,6 +2653,20 @@ async def process_task_background(
             task_id,
             "ArtifactAdded",
             normalize_payload({"type": "patch_diff"}),
+        )
+
+        git_export_payload = build_git_export_payload(task_id, patch_payload)
+        container.add_artifact("git_export", git_export_payload, "system")
+        await record_artifact(
+            task_id,
+            "git_export",
+            normalize_payload(git_export_payload),
+            produced_by="system",
+        )
+        await record_event(
+            task_id,
+            "ArtifactAdded",
+            normalize_payload({"type": "git_export"}),
         )
 
         completed_at = db.now_utc()

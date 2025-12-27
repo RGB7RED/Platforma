@@ -104,6 +104,7 @@
     latestReviewResult: document.getElementById('latestReviewResult'),
     rerunReviewBtn: document.getElementById('rerunReviewBtn'),
     downloadZipBtn: document.getElementById('downloadZipBtn'),
+    downloadGitExportBtn: document.getElementById('downloadGitExportBtn'),
     fileCategories: document.getElementById('fileCategories'),
     fileList: document.getElementById('fileList'),
     filePreview: document.getElementById('filePreview'),
@@ -530,9 +531,26 @@
     elements.timeTaken.textContent = formatDuration(seconds);
   };
 
+  const ensureGitExportButton = () => {
+    if (!elements.downloadZipBtn || elements.downloadGitExportBtn) {
+      return;
+    }
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'primary-btn download-zip-btn';
+    button.id = 'downloadGitExportBtn';
+    button.textContent = 'Download Git Export';
+    button.disabled = elements.downloadZipBtn.disabled;
+    elements.downloadZipBtn.insertAdjacentElement('afterend', button);
+    elements.downloadGitExportBtn = button;
+  };
+
   const setDownloadEnabled = (isEnabled) => {
     if (elements.downloadZipBtn) {
       elements.downloadZipBtn.disabled = !isEnabled;
+    }
+    if (elements.downloadGitExportBtn) {
+      elements.downloadGitExportBtn.disabled = !isEnabled;
     }
   };
 
@@ -1613,6 +1631,38 @@
     }
   };
 
+  const downloadGitExport = async (taskId) => {
+    const apiKey = getStoredApiKey();
+    if (!apiKey) {
+      showToast('Please save your API key before downloading.', '⚠️');
+      return;
+    }
+    const downloadUrl = buildApiUrl(`/api/tasks/${taskId}/git-export.zip`);
+    try {
+      const response = await fetch(downloadUrl, {
+        headers: buildAuthHeaders()
+      });
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'Invalid API Key or no access to this task.'
+          : `Download failed (${response.status})`;
+        showToast(message, '⚠️');
+        return;
+      }
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = `task_${taskId}_git_export.zip`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      showToast('Unable to download git export. Please try again.', '⚠️');
+    }
+  };
+
   if (elements.downloadZipBtn) {
     elements.downloadZipBtn.addEventListener('click', () => {
       if (!currentTaskId) {
@@ -1624,6 +1674,22 @@
         return;
       }
       downloadZip(currentTaskId);
+    });
+  }
+
+  ensureGitExportButton();
+
+  if (elements.downloadGitExportBtn) {
+    elements.downloadGitExportBtn.addEventListener('click', () => {
+      if (!currentTaskId) {
+        showToast('No task available to download.', '⚠️');
+        return;
+      }
+      if (elements.downloadGitExportBtn.disabled) {
+        showToast('Git export download is available after completion.', 'ℹ️');
+        return;
+      }
+      downloadGitExport(currentTaskId);
     });
   }
 
