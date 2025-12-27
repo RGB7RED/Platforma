@@ -12,15 +12,12 @@ from typing import Dict, Any, Optional, List, Callable
 from datetime import datetime
 
 from .models import Container, ProjectState
+from .logging_utils import configure_logging
 from .agents import AIResearcher, AIDesigner, AICoder, AIReviewer
 from .llm import LLMProviderError
 
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -242,6 +239,14 @@ class AIOrchestrator:
                     )
                 except LLMProviderError as exc:
                     await self._run_hook(
+                        callbacks.get("stage_failed") if callbacks else None,
+                        {
+                            "stage": "implementation",
+                            "reason": "llm_provider_error",
+                            "error": str(exc),
+                        },
+                    )
+                    await self._run_hook(
                         callbacks.get("llm_error") if callbacks else None,
                         {
                             "stage": "implementation",
@@ -319,7 +324,17 @@ class AIOrchestrator:
                     self.container.update_progress(1.0)
                     logger.info("Project completed successfully")
                 else:
-                    logger.error(f"Project failed final review: {final_review.get('issues')}")
+                    failure_reason = "Final review failed"
+                    issues = final_review.get("issues")
+                    await self._run_hook(
+                        callbacks.get("stage_failed") if callbacks else None,
+                        {
+                            "stage": "review",
+                            "reason": failure_reason,
+                            "issues": issues,
+                        },
+                    )
+                    logger.error(f"Project failed final review: {issues}")
                     self.container.update_state(ProjectState.ERROR, "Failed final review")
             else:
                 logger.info("Codex allows skipping final review stage")
@@ -334,8 +349,9 @@ class AIOrchestrator:
                 "timestamp": datetime.now().isoformat()
             })
             
+            status = "completed" if self.container.state == ProjectState.COMPLETE else "failed"
             return {
-                "status": "completed" if self.container.state == ProjectState.COMPLETE else "failed",
+                "status": status,
                 "container_id": self.container.project_id,
                 "state": self.container.state.value,
                 "progress": self.container.progress,
@@ -343,7 +359,8 @@ class AIOrchestrator:
                 "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
                 "iterations": iteration,
                 "max_iterations": max_iterations,
-                "history": self.task_history[-5:]  # Последние 5 задач
+                "history": self.task_history[-5:],  # Последние 5 задач
+                "failure_reason": "Final review failed" if status == "failed" else None,
             }
             
         except Exception as e:
@@ -351,11 +368,20 @@ class AIOrchestrator:
             if self.container:
                 self.container.update_state(ProjectState.ERROR, f"Processing error: {str(e)}")
                 self.container.errors.append(str(e))
+                await self._run_hook(
+                    callbacks.get("stage_failed") if callbacks else None,
+                    {
+                        "stage": self.container.state.value,
+                        "reason": "processing_error",
+                        "error": str(e),
+                    },
+                )
             
             return {
                 "status": "error",
                 "error": str(e),
-                "container_id": self.container.project_id if self.container else None
+                "container_id": self.container.project_id if self.container else None,
+                "failure_reason": str(e),
             }
     
     def _get_next_task(self) -> Optional[Dict[str, Any]]:

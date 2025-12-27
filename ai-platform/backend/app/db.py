@@ -712,5 +712,41 @@ async def list_tasks_for_user(user_id: str, limit: int) -> List[Dict[str, Any]]:
     return tasks
 
 
+async def get_task_status_metrics() -> Dict[str, Any]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+
+    row = await _pool.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE status NOT IN ('completed', 'failed', 'error')) AS active_tasks,
+            COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+            COUNT(*) FILTER (WHERE status IN ('failed', 'error')) AS failed,
+            AVG(EXTRACT(EPOCH FROM (completed_at - created_at)))
+                FILTER (WHERE completed_at IS NOT NULL) AS avg_duration_seconds
+        FROM tasks;
+        """
+    )
+    return _row_to_dict(row) or {}
+
+
+async def list_task_states() -> List[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+
+    rows = await _pool.fetch(
+        """
+        SELECT task_id, state_json, updated_at
+        FROM task_state;
+        """
+    )
+    states: List[Dict[str, Any]] = []
+    for row in rows:
+        data = dict(row)
+        data["state"] = _coerce_json_value(data.pop("state_json", None))
+        states.append(data)
+    return states
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
