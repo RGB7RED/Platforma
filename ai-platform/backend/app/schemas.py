@@ -48,3 +48,31 @@ class ContainerStateResponse(BaseModel):
     task_id: str
     state: ContainerStateSnapshot
     updated_at: Optional[str] = None
+
+
+class ClarificationQuestion(BaseModel):
+    id: str
+    text: str
+    type: str = "text"
+    choices: Optional[List[str]] = None
+    required: bool = True
+    rationale: Optional[str] = None
+
+
+class TaskQuestionsResponse(BaseModel):
+    task_id: str
+    pending_questions: List[ClarificationQuestion] = Field(default_factory=list)
+    provided_answers: Dict[str, Any] = Field(default_factory=dict)
+    resume_from_stage: Optional[str] = None
+    requested_at: Optional[str] = None
+
+
+class TaskInputRequest(BaseModel):
+    answers: Dict[str, Any] = Field(default_factory=dict)
+    auto_resume: bool = False
+
+
+class TaskResumeResponse(BaseModel):
+    task_id: str
+    status: str
+    resume_from_stage: Optional[str] = None

@@ -17,6 +17,7 @@ class ProjectState(Enum):
     DESIGN = "design"
     IMPLEMENTATION = "implementation"
     REVIEW = "review"
+    NEEDS_INPUT = "needs_input"
     COMPLETE = "complete"
     ERROR = "error"
 
@@ -56,6 +57,7 @@ class Container:
             "git_export": [],
             "repro_manifest": [],
             "usage_report": [],
+            "clarification_questions": [],
         }
         
         # Уровень 3: История изменений
@@ -319,7 +321,10 @@ class Container:
         
         container = cls(data["project_id"])
         container.files = data["files"]
-        container.state = ProjectState(data["state"])
+        try:
+            container.state = ProjectState(data["state"])
+        except ValueError:
+            container.state = ProjectState.ERROR
         container.progress = data["progress"]
         container.metadata = data["metadata"]
         container.metadata.setdefault("llm_usage", [])

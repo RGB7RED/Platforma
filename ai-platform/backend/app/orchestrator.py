@@ -7,6 +7,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import uuid
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Callable
 from datetime import datetime
@@ -119,15 +121,112 @@ class AIOrchestrator:
             self.container.metadata["max_iterations"] = max_iterations
         
         # Инициализация ролей
+        self._ensure_roles()
+        
+        logger.info(f"Project '{project_name}' initialized with ID: {self.container.project_id}")
+        return self.container
+
+    def attach_container(self, container: Container) -> None:
+        """Attach an existing container for resuming work."""
+        self.container = container
+        self._ensure_roles()
+
+    def _ensure_roles(self) -> None:
+        if self.roles:
+            return
         self.roles = {
             "researcher": AIResearcher(self.codex),
             "designer": AIDesigner(self.codex),
             "coder": AICoder(self.codex),
-            "reviewer": AIReviewer(self.codex)
+            "reviewer": AIReviewer(self.codex),
         }
-        
-        logger.info(f"Project '{project_name}' initialized with ID: {self.container.project_id}")
-        return self.container
+
+    def _sanitize_question_id(self, text: str) -> str:
+        normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", text.strip().lower()).strip("_")
+        return normalized or str(uuid.uuid4())
+
+    def _plan_clarification_questions(
+        self,
+        user_task: str,
+        *,
+        template_manifest: Optional[Dict[str, Any]] = None,
+        provided_answers: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        rules = self.codex.get("rules", {})
+        max_questions = (
+            rules.get("researcher", {}).get("parameters", {}).get("max_questions")
+            or 3
+        )
+        questions: List[Dict[str, Any]] = []
+        answers = provided_answers or {}
+
+        manifest_questions = []
+        if isinstance(template_manifest, dict):
+            manifest_questions = template_manifest.get("clarification_questions") or []
+        if isinstance(manifest_questions, list):
+            for entry in manifest_questions:
+                if not isinstance(entry, dict):
+                    continue
+                question_id = entry.get("id") or self._sanitize_question_id(entry.get("text", ""))
+                if answers.get(question_id):
+                    continue
+                questions.append(
+                    {
+                        "id": question_id,
+                        "text": entry.get("text") or "Provide the missing input.",
+                        "type": entry.get("type") or "text",
+                        "choices": entry.get("choices"),
+                        "required": bool(entry.get("required", True)),
+                        "rationale": entry.get("rationale") or "Required to proceed.",
+                    }
+                )
+
+        placeholder_matches = re.findall(r"\{\{([^}]+)\}\}|\[\[([^\]]+)\]\]", user_task)
+        placeholders = [match[0] or match[1] for match in placeholder_matches if match[0] or match[1]]
+        for placeholder in placeholders:
+            question_id = self._sanitize_question_id(placeholder)
+            if answers.get(question_id):
+                continue
+            questions.append(
+                {
+                    "id": question_id,
+                    "text": f"Please clarify: {placeholder.strip()}",
+                    "type": "text",
+                    "required": True,
+                    "rationale": "This placeholder must be resolved before implementation.",
+                }
+            )
+
+        if len(user_task.split()) < 5:
+            question_id = "task_details"
+            if not answers.get(question_id):
+                questions.append(
+                    {
+                        "id": question_id,
+                        "text": "Please provide more detail about the desired outcome.",
+                        "type": "text",
+                        "required": True,
+                        "rationale": "The task description is too short to infer requirements.",
+                    }
+                )
+
+        missing_markers = re.findall(r"\b(TBD|TBC|TODO)\b|\?{2,}", user_task, flags=re.IGNORECASE)
+        if missing_markers:
+            question_id = "open_questions"
+            if not answers.get(question_id):
+                questions.append(
+                    {
+                        "id": question_id,
+                        "text": "Please resolve the open questions/unknowns in the task description.",
+                        "type": "text",
+                        "required": True,
+                        "rationale": "Open questions must be answered before coding.",
+                    }
+                )
+
+        if max_questions and len(questions) > max_questions:
+            questions = questions[:max_questions]
+        return questions
     
     async def _run_hook(
         self,
@@ -147,10 +246,29 @@ class AIOrchestrator:
         *,
         workspace_path: Optional[Path] = None,
         command_runner: Optional[Any] = None,
+        provided_answers: Optional[Dict[str, Any]] = None,
+        resume_from_stage: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Основной метод обработки задачи пользователя"""
         if not self.container:
             self.initialize_project("Auto-generated Project")
+        else:
+            self._ensure_roles()
+
+        if provided_answers:
+            existing_answers = self.container.metadata.get("provided_answers", {})
+            if not isinstance(existing_answers, dict):
+                existing_answers = {}
+            existing_answers.update(provided_answers)
+            self.container.metadata["provided_answers"] = existing_answers
+
+        if resume_from_stage:
+            self.container.metadata["resume_from_stage"] = resume_from_stage
+
+        stages = ["research", "design", "implementation", "review"]
+        start_index = 0
+        if resume_from_stage in stages:
+            start_index = stages.index(resume_from_stage)
         
         logger.info(f"Starting processing of task: {user_task[:50]}...")
         await self._run_hook(
@@ -164,58 +282,91 @@ class AIOrchestrator:
         
         try:
             # Фаза 1: Исследование
-            logger.info("Phase 1: Research")
-            await self._run_hook(
-                callbacks.get("stage_started") if callbacks else None,
-                {"stage": "research"},
-            )
-            self.container.update_state(ProjectState.RESEARCH, "Analyzing requirements")
-            
-            researcher_result = await self.roles["researcher"].execute(
-                user_task, 
-                self.container
-            )
-            await self._run_hook(
-                callbacks.get("research_complete") if callbacks else None,
-                {"result": researcher_result},
-            )
-            
-            self.container.add_artifact(
-                "research_summary",
-                researcher_result,
-                "researcher"
-            )
+            if start_index <= stages.index("research"):
+                logger.info("Phase 1: Research")
+                await self._run_hook(
+                    callbacks.get("stage_started") if callbacks else None,
+                    {"stage": "research"},
+                )
+                self.container.update_state(ProjectState.RESEARCH, "Analyzing requirements")
+
+                researcher_result = await self.roles["researcher"].execute(
+                    user_task,
+                    self.container
+                )
+                await self._run_hook(
+                    callbacks.get("research_complete") if callbacks else None,
+                    {"result": researcher_result},
+                )
+
+                self.container.add_artifact(
+                    "research_summary",
+                    researcher_result,
+                    "researcher"
+                )
             
             # Фаза 2: Проектирование
-            logger.info("Phase 2: Design")
-            await self._run_hook(
-                callbacks.get("stage_started") if callbacks else None,
-                {"stage": "design"},
-            )
-            self.container.update_state(ProjectState.DESIGN, "Creating architecture")
-            
-            design_result = await self.roles["designer"].execute(
-                self.container
-            )
-            await self._run_hook(
-                callbacks.get("design_complete") if callbacks else None,
-                {"result": design_result},
-            )
-            
-            self.container.target_architecture = design_result
-            self.container.add_artifact(
-                "architecture",
-                design_result,
-                "designer"
-            )
+            if start_index <= stages.index("design"):
+                logger.info("Phase 2: Design")
+                await self._run_hook(
+                    callbacks.get("stage_started") if callbacks else None,
+                    {"stage": "design"},
+                )
+                self.container.update_state(ProjectState.DESIGN, "Creating architecture")
+
+                design_result = await self.roles["designer"].execute(
+                    self.container
+                )
+                await self._run_hook(
+                    callbacks.get("design_complete") if callbacks else None,
+                    {"result": design_result},
+                )
+
+                self.container.target_architecture = design_result
+                self.container.add_artifact(
+                    "architecture",
+                    design_result,
+                    "designer"
+                )
+
+            if start_index <= stages.index("implementation"):
+                template_manifest = self.container.metadata.get("template_manifest")
+                clarification_questions = self._plan_clarification_questions(
+                    user_task,
+                    template_manifest=template_manifest if isinstance(template_manifest, dict) else None,
+                    provided_answers=self.container.metadata.get("provided_answers"),
+                )
+                if clarification_questions:
+                    requested_at = datetime.now().isoformat()
+                    resume_stage = "implementation"
+                    self.container.metadata["pending_questions"] = clarification_questions
+                    self.container.metadata["resume_from_stage"] = resume_stage
+                    self.container.update_state(ProjectState.NEEDS_INPUT, "Awaiting clarification")
+                    await self._run_hook(
+                        callbacks.get("clarification_requested") if callbacks else None,
+                        {
+                            "questions": clarification_questions,
+                            "requested_at": requested_at,
+                            "resume_from_stage": resume_stage,
+                        },
+                    )
+                    return {
+                        "status": "needs_input",
+                        "container_id": self.container.project_id,
+                        "state": self.container.state.value,
+                        "progress": self.container.progress,
+                        "questions": clarification_questions,
+                        "resume_from_stage": resume_stage,
+                    }
             
             # Фаза 3: Итеративная реализация
-            logger.info("Phase 3: Implementation")
-            await self._run_hook(
-                callbacks.get("stage_started") if callbacks else None,
-                {"stage": "implementation"},
-            )
-            self.container.update_state(ProjectState.IMPLEMENTATION, "Implementing solution")
+            if start_index <= stages.index("implementation"):
+                logger.info("Phase 3: Implementation")
+                await self._run_hook(
+                    callbacks.get("stage_started") if callbacks else None,
+                    {"stage": "implementation"},
+                )
+                self.container.update_state(ProjectState.IMPLEMENTATION, "Implementing solution")
             
             iteration = 0
             max_iterations = self.codex.get("workflow", {}).get("max_iterations", 15)
@@ -223,112 +374,115 @@ class AIOrchestrator:
             failure_reason: Optional[str] = None
             failure_stage: Optional[str] = None
             next_task_override: Optional[Dict[str, Any]] = None
-            
-            while not self.container.is_complete() and iteration < max_iterations:
-                iteration += 1
-                logger.info(f"Implementation iteration {iteration}")
-                
-                # 3.1 Получаем следующую задачу от планировщика
-                next_task = next_task_override or self._get_next_task()
-                next_task_override = None
-                if not next_task:
-                    logger.warning("No tasks to execute")
-                    break
-                
-                self.container.current_task = next_task["description"]
-                self.container.metadata["active_role"] = "coder"
-                
-                # 3.2 Кодер выполняет задачу
-                try:
-                    coder_result = await self.roles["coder"].execute(
-                        next_task,
-                        self.container
-                    )
-                except BudgetExceededError:
-                    await self._run_hook(
-                        callbacks.get("stage_failed") if callbacks else None,
-                        {
-                            "stage": "implementation",
-                            "reason": "quota_exceeded",
-                            "error": "quota_exceeded",
-                        },
-                    )
-                    self.container.update_state(ProjectState.ERROR, "quota_exceeded")
-                    return {
-                        "status": "failed",
-                        "container_id": self.container.project_id,
-                        "state": self.container.state.value,
-                        "progress": self.container.progress,
-                        "files_count": len(self.container.files),
-                        "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
-                        "iterations": iteration,
-                        "max_iterations": max_iterations,
-                        "history": self.task_history[-5:],
-                        "failure_reason": "quota_exceeded",
-                    }
-                except LLMProviderError as exc:
-                    await self._run_hook(
-                        callbacks.get("stage_failed") if callbacks else None,
-                        {
-                            "stage": "implementation",
-                            "reason": "llm_provider_error",
-                            "error": str(exc),
-                        },
-                    )
-                    await self._run_hook(
-                        callbacks.get("llm_error") if callbacks else None,
-                        {
-                            "stage": "implementation",
-                            "error": str(exc),
-                        },
-                    )
-                    raise
 
-                if isinstance(coder_result, dict) and coder_result.get("llm_usage"):
+            if start_index <= stages.index("implementation"):
+                while not self.container.is_complete() and iteration < max_iterations:
+                    iteration += 1
+                    logger.info(f"Implementation iteration {iteration}")
+
+                    # 3.1 Получаем следующую задачу от планировщика
+                    next_task = next_task_override or self._get_next_task()
+                    next_task_override = None
+                    if not next_task:
+                        logger.warning("No tasks to execute")
+                        break
+
+                    self.container.current_task = next_task["description"]
+                    self.container.metadata["active_role"] = "coder"
+
+                    # 3.2 Кодер выполняет задачу
+                    try:
+                        coder_result = await self.roles["coder"].execute(
+                            next_task,
+                            self.container
+                        )
+                    except BudgetExceededError:
+                        await self._run_hook(
+                            callbacks.get("stage_failed") if callbacks else None,
+                            {
+                                "stage": "implementation",
+                                "reason": "quota_exceeded",
+                                "error": "quota_exceeded",
+                            },
+                        )
+                        self.container.update_state(ProjectState.ERROR, "quota_exceeded")
+                        return {
+                            "status": "failed",
+                            "container_id": self.container.project_id,
+                            "state": self.container.state.value,
+                            "progress": self.container.progress,
+                            "files_count": len(self.container.files),
+                            "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
+                            "iterations": iteration,
+                            "max_iterations": max_iterations,
+                            "history": self.task_history[-5:],
+                            "failure_reason": "quota_exceeded",
+                        }
+                    except LLMProviderError as exc:
+                        await self._run_hook(
+                            callbacks.get("stage_failed") if callbacks else None,
+                            {
+                                "stage": "implementation",
+                                "reason": "llm_provider_error",
+                                "error": str(exc),
+                            },
+                        )
+                        await self._run_hook(
+                            callbacks.get("llm_error") if callbacks else None,
+                            {
+                                "stage": "implementation",
+                                "error": str(exc),
+                            },
+                        )
+                        raise
+
+                    if isinstance(coder_result, dict) and coder_result.get("llm_usage"):
+                        await self._run_hook(
+                            callbacks.get("llm_usage") if callbacks else None,
+                            {
+                                "stage": "implementation",
+                                "usage": coder_result.get("llm_usage"),
+                                "usage_report": coder_result.get("usage_report"),
+                            },
+                        )
                     await self._run_hook(
-                        callbacks.get("llm_usage") if callbacks else None,
-                        {
-                            "stage": "implementation",
-                            "usage": coder_result.get("llm_usage"),
-                            "usage_report": coder_result.get("usage_report"),
-                        },
+                        callbacks.get("coder_finished") if callbacks else None,
+                        {"task": next_task, "result": coder_result, "iteration": iteration},
                     )
-                await self._run_hook(
-                    callbacks.get("coder_finished") if callbacks else None,
-                    {"task": next_task, "result": coder_result, "iteration": iteration},
-                )
-                
-                # 3.3 Ревьюер проверяет результат
-                self.container.metadata["active_role"] = "reviewer"
-                await self._run_hook(
-                    callbacks.get("review_started") if callbacks else None,
-                    {"kind": "iteration", "iteration": iteration},
-                )
-                review_result = await self.roles["reviewer"].execute(
-                    self.container,
-                    workspace_path=workspace_path,
-                    command_runner=command_runner,
-                )
-                await self._run_hook(
-                    callbacks.get("review_finished") if callbacks else None,
-                    {"result": review_result, "kind": "iteration", "iteration": iteration},
-                )
-                await self._run_hook(
-                    callbacks.get("review_result") if callbacks else None,
-                    {"result": review_result, "kind": "iteration", "iteration": iteration},
-                )
-                
-                if review_result.get("command_timeout"):
-                    failure_reason = "command_timeout"
-                    failure_stage = "implementation"
-                    logger.warning("Iteration %s halted due to command timeout", iteration)
-                    break
-                if review_result.get("passed"):
-                    logger.info(f"Iteration {iteration} approved")
-                    self.container.update_progress(iteration / max_iterations)
-                else:
-                    logger.warning(f"Iteration {iteration} rejected: {review_result.get('issues', [])}")
-                    next_task_override = self._build_fix_task(next_task, review_result)
+
+                    # 3.3 Ревьюер проверяет результат
+                    self.container.metadata["active_role"] = "reviewer"
+                    await self._run_hook(
+                        callbacks.get("review_started") if callbacks else None,
+                        {"kind": "iteration", "iteration": iteration},
+                    )
+                    review_result = await self.roles["reviewer"].execute(
+                        self.container,
+                        workspace_path=workspace_path,
+                        command_runner=command_runner,
+                    )
+                    await self._run_hook(
+                        callbacks.get("review_finished") if callbacks else None,
+                        {"result": review_result, "kind": "iteration", "iteration": iteration},
+                    )
+                    await self._run_hook(
+                        callbacks.get("review_result") if callbacks else None,
+                        {"result": review_result, "kind": "iteration", "iteration": iteration},
+                    )
+
+                    if review_result.get("command_timeout"):
+                        failure_reason = "command_timeout"
+                        failure_stage = "implementation"
+                        logger.warning("Iteration %s halted due to command timeout", iteration)
+                        break
+                    if review_result.get("passed"):
+                        logger.info(f"Iteration {iteration} approved")
+                        self.container.update_progress(iteration / max_iterations)
+                    else:
+                        logger.warning(f"Iteration {iteration} rejected: {review_result.get('issues', [])}")
+                        next_task_override = self._build_fix_task(next_task, review_result)
+            else:
+                iteration = self.container.metadata.get("iterations", 0) or 0
 
             if failure_reason:
                 await self._run_hook(
@@ -400,7 +554,7 @@ class AIOrchestrator:
                 "review_required",
                 self.codex.get("workflow", {}).get("require_review", True),
             )
-            if review_required:
+            if review_required and start_index <= stages.index("review"):
                 logger.info("Phase 4: Final Review")
                 await self._run_hook(
                     callbacks.get("stage_started") if callbacks else None,
