@@ -37,7 +37,7 @@ class TestAIOrchestrator:
                 "components": [{"name": "Test", "files": ["test.py"]}]
             }
             mock_coder.execute.return_value = {"file": "test.py", "size": 100}
-            mock_reviewer.execute.return_value = {"status": "approved"}
+            mock_reviewer.execute.return_value = {"status": "approved", "passed": True}
             
             # Настраиваем классы моков
             MockResearcher.return_value = mock_researcher
@@ -105,13 +105,34 @@ class TestAIOrchestrator:
         orchestrator.initialize_project("Test")
 
         mock_agents["designer"].execute.return_value = {"components": []}
-        mock_agents["reviewer"].execute.return_value = {"status": "approved_with_warnings"}
+        mock_agents["reviewer"].execute.return_value = {
+            "status": "approved_with_warnings",
+            "passed": True,
+            "warnings": ["warning"],
+        }
 
         result = await orchestrator.process_task("Create a test API")
 
         assert result["status"] == "completed"
         assert result["status"] != "failed"
         assert orchestrator.container.state == ProjectState.COMPLETE
+
+    @pytest.mark.asyncio
+    async def test_process_task_final_review_failure(self, orchestrator, mock_agents):
+        """Финальное ревью с ошибками должно помечать задачу как failed"""
+        orchestrator.initialize_project("Test")
+
+        mock_agents["designer"].execute.return_value = {"components": []}
+        mock_agents["reviewer"].execute.return_value = {
+            "status": "rejected",
+            "passed": False,
+            "errors": ["ruff failed"],
+        }
+
+        result = await orchestrator.process_task("Create a test API")
+
+        assert result["status"] == "failed"
+        assert orchestrator.container.state == ProjectState.ERROR
     
     @pytest.mark.asyncio
     async def test_get_next_task(self, orchestrator):

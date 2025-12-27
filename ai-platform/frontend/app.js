@@ -614,6 +614,24 @@
     return text.length > 120 ? `${text.slice(0, 120)}…` : text;
   };
 
+  const formatArtifactSummary = (artifact) => {
+    const payload = artifact?.payload ?? artifact?.data ?? artifact;
+    if (artifact?.type === 'review_report' && payload && typeof payload === 'object') {
+      const passed =
+        payload?.passed === true ? 'passed' : payload?.passed === false ? 'failed' : 'unknown';
+      const ruffExit =
+        payload?.ruff?.exit_code === null || payload?.ruff?.exit_code === undefined
+          ? 'n/a'
+          : payload.ruff.exit_code;
+      const pytestExit =
+        payload?.pytest?.exit_code === null || payload?.pytest?.exit_code === undefined
+          ? 'n/a'
+          : payload.pytest.exit_code;
+      return `Review ${passed} (ruff: ${ruffExit}, pytest: ${pytestExit})`;
+    }
+    return formatPayloadSummary(payload);
+  };
+
   const getItemKey = (item) =>
     item?.id || item?._id || item?.event_id || item?.artifact_id || item?.created_at || '';
 
@@ -852,7 +870,7 @@
             </div>
             <div class="artifact-meta">Produced by: ${artifact?.produced_by || '-'}</div>
             <details class="payload-details">
-              <summary>${formatPayloadSummary(payload)}</summary>
+              <summary>${formatArtifactSummary(artifact)}</summary>
               <pre>${JSON.stringify(payload, null, 2)}</pre>
             </details>
           </div>

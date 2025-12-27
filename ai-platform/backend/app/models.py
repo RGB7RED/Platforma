@@ -51,7 +51,7 @@ class Container:
             "tests": [],
             "documentation": [],
             "decisions": [],
-            "reviews": []
+            "review_report": []
         }
         
         # Уровень 3: История изменений
