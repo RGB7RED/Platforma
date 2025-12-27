@@ -55,6 +55,42 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Optional
 - **Notes:** Defaults to `backend/app/codex.json` relative to the backend source.
 
+### LLM_PROVIDER
+- **Purpose:** Selects the LLM backend implementation.
+- **Example:** `LLM_PROVIDER=mock` or `LLM_PROVIDER=openai`
+- **Required in production?:** Yes (set to `openai` for real calls, `mock` for offline)
+- **Notes:** Defaults to `mock` when unset.
+
+### LLM_MODEL
+- **Purpose:** Model identifier passed to the provider.
+- **Example:** `LLM_MODEL=gpt-4o-mini`
+- **Required in production?:** Yes (when using a real provider)
+- **Notes:** Used by the provider selected in `LLM_PROVIDER`.
+
+### LLM_API_KEY
+- **Purpose:** API key for the configured provider.
+- **Example:** `LLM_API_KEY=sk-...`
+- **Required in production?:** Yes (when using `LLM_PROVIDER=openai`)
+- **Notes:** Never store this value in artifacts or output files.
+
+### LLM_MAX_TOKENS
+- **Purpose:** Cap on output tokens returned by the provider.
+- **Example:** `LLM_MAX_TOKENS=2048`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 1024.
+
+### LLM_TIMEOUT_SECONDS
+- **Purpose:** Hard timeout for provider requests.
+- **Example:** `LLM_TIMEOUT_SECONDS=30`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 30 seconds. Requests are retried up to two times on transient errors.
+
+### LLM_TEMPERATURE
+- **Purpose:** Sampling temperature used by the provider.
+- **Example:** `LLM_TEMPERATURE=0.2`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 0.2.
+
 ### APP_API_KEY
 - **Purpose:** Require an API key for all task endpoints (including rerun review).
 - **Example:** `APP_API_KEY=super-secret-token`

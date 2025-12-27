@@ -492,6 +492,7 @@ def build_container_state(
         "current_task": current_task or (container.current_task if container else None),
         "container_state": container.state.value if container else None,
         "container_progress": container.progress if container else None,
+        "llm_usage_summary": container.metadata.get("llm_usage_summary") if container else None,
         "timestamps": {
             "updated_at": now_iso,
         },
@@ -1560,6 +1561,46 @@ async def process_task_background(task_id: str, description: str):
                 "codex_loaded",
                 normalize_payload(payload),
             )
+
+        async def handle_llm_usage(payload: Dict[str, Any]) -> None:
+            usage = payload.get("usage") if isinstance(payload, dict) else payload
+            await record_event(
+                task_id,
+                "llm_usage",
+                normalize_payload(usage or {}),
+            )
+            usage_report = payload.get("usage_report") if isinstance(payload, dict) else None
+            if usage_report:
+                await record_artifact(
+                    task_id,
+                    "usage_report",
+                    normalize_payload(usage_report),
+                    produced_by="coder",
+                )
+                await record_event(
+                    task_id,
+                    "ArtifactAdded",
+                    normalize_payload({"type": "usage_report"}),
+                )
+            await record_state(
+                task_id,
+                build_container_state(
+                    status="processing",
+                    progress=container.progress,
+                    current_stage=container.state.value,
+                    container=container,
+                    active_role=container.metadata.get("active_role"),
+                    current_task=container.current_task,
+                ),
+            )
+            await persist_container_snapshot(task_id, container)
+
+        async def handle_llm_error(payload: Dict[str, Any]) -> None:
+            await record_event(
+                task_id,
+                "llm_error",
+                normalize_payload(payload),
+            )
         
         # Обрабатываем задачу
         result = await orchestrator.process_task(
@@ -1572,6 +1613,8 @@ async def process_task_background(task_id: str, description: str):
                 "review_finished": handle_review_finished,
                 "review_result": handle_review_result,
                 "codex_loaded": handle_codex_loaded,
+                "llm_usage": handle_llm_usage,
+                "llm_error": handle_llm_error,
             },
         )
 

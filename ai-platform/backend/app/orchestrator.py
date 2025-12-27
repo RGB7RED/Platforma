@@ -13,6 +13,7 @@ from datetime import datetime
 
 from .models import Container, ProjectState
 from .agents import AIResearcher, AIDesigner, AICoder, AIReviewer
+from .llm import LLMProviderError
 
 
 # Настройка логирования
@@ -234,10 +235,30 @@ class AIOrchestrator:
                 self.container.metadata["active_role"] = "coder"
                 
                 # 3.2 Кодер выполняет задачу
-                coder_result = await self.roles["coder"].execute(
-                    next_task,
-                    self.container
-                )
+                try:
+                    coder_result = await self.roles["coder"].execute(
+                        next_task,
+                        self.container
+                    )
+                except LLMProviderError as exc:
+                    await self._run_hook(
+                        callbacks.get("llm_error") if callbacks else None,
+                        {
+                            "stage": "implementation",
+                            "error": str(exc),
+                        },
+                    )
+                    raise
+
+                if isinstance(coder_result, dict) and coder_result.get("llm_usage"):
+                    await self._run_hook(
+                        callbacks.get("llm_usage") if callbacks else None,
+                        {
+                            "stage": "implementation",
+                            "usage": coder_result.get("llm_usage"),
+                            "usage_report": coder_result.get("usage_report"),
+                        },
+                    )
                 
                 # 3.3 Ревьюер проверяет результат
                 self.container.metadata["active_role"] = "reviewer"
