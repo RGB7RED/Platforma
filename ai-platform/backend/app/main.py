@@ -58,6 +58,9 @@ class Storage:
         self.active_tasks: Dict[str, Dict] = {}
         self.containers: Dict[str, Container] = {}
         self.user_sessions: Dict[str, List[str]] = {}  # user_id -> [task_ids]
+        self.events: Dict[str, List[Dict[str, Any]]] = {}
+        self.artifacts: Dict[str, List[Dict[str, Any]]] = {}
+        self.state: Dict[str, Dict[str, Any]] = {}
 
 storage = Storage()
 database_url = os.getenv("DATABASE_URL")
@@ -78,6 +81,7 @@ class ConnectionManager:
             logger.info(f"WebSocket disconnected for task {task_id}")
     
     async def send_progress(self, task_id: str, data: dict):
+        await record_event(task_id, "ProgressUpdate", normalize_payload(data))
         if task_id in self.active_connections:
             try:
                 await self.active_connections[task_id].send_json(jsonable_encoder(data))
@@ -206,6 +210,107 @@ async def ensure_task_exists(task_id: str) -> Dict[str, Any]:
     if task_data is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task_data
+
+
+def ensure_task_exists_in_memory(task_id: str) -> None:
+    if task_id not in storage.active_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+
+def store_in_memory_event(task_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    events = storage.events.setdefault(task_id, [])
+    events.append(
+        {
+            "id": str(uuid.uuid4()),
+            "type": event_type,
+            "payload": normalize_payload(payload or {}),
+            "created_at": db.now_utc(),
+        }
+    )
+
+
+def store_in_memory_artifact(
+    task_id: str,
+    artifact_type: str,
+    payload: Optional[Dict[str, Any]] = None,
+    produced_by: Optional[str] = None,
+) -> None:
+    artifacts = storage.artifacts.setdefault(task_id, [])
+    artifacts.append(
+        {
+            "id": str(uuid.uuid4()),
+            "type": artifact_type,
+            "produced_by": produced_by,
+            "payload": normalize_payload(payload or {}),
+            "created_at": db.now_utc(),
+        }
+    )
+
+
+def store_in_memory_state(task_id: str, state: Dict[str, Any]) -> None:
+    storage.state[task_id] = {
+        "task_id": task_id,
+        "state": normalize_payload(state),
+        "updated_at": db.now_utc(),
+    }
+
+
+async def record_event(task_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    if db.is_enabled():
+        await db.append_event(task_id, event_type, normalize_payload(payload or {}))
+    else:
+        store_in_memory_event(task_id, event_type, payload)
+
+
+async def record_artifact(
+    task_id: str,
+    artifact_type: str,
+    payload: Optional[Dict[str, Any]] = None,
+    produced_by: Optional[str] = None,
+) -> None:
+    if db.is_enabled():
+        await db.add_artifact(
+            task_id,
+            artifact_type,
+            normalize_payload(payload or {}),
+            produced_by=produced_by,
+        )
+    else:
+        store_in_memory_artifact(task_id, artifact_type, payload, produced_by=produced_by)
+
+
+async def record_state(task_id: str, state: Dict[str, Any]) -> None:
+    if db.is_enabled():
+        await db.set_container_state(task_id, normalize_payload(state))
+    else:
+        store_in_memory_state(task_id, state)
+
+
+def get_in_memory_events(task_id: str, limit: int, order: str) -> List[Dict[str, Any]]:
+    events = storage.events.get(task_id, [])
+    ordered = sorted(events, key=lambda item: item.get("created_at"), reverse=order == "desc")
+    return ordered[:limit]
+
+
+def get_in_memory_artifacts(
+    task_id: str,
+    artifact_type: Optional[str],
+    limit: int,
+    order: str,
+) -> List[Dict[str, Any]]:
+    artifacts = storage.artifacts.get(task_id, [])
+    if artifact_type:
+        artifacts = [artifact for artifact in artifacts if artifact.get("type") == artifact_type]
+    ordered = sorted(
+        artifacts,
+        key=lambda item: item.get("created_at"),
+        reverse=order == "desc",
+    )
+    return ordered[:limit]
+
+
+def get_in_memory_state(task_id: str) -> Optional[Dict[str, Any]]:
+    return storage.state.get(task_id)
 
 
 def build_container_state(
@@ -401,20 +506,6 @@ async def create_task(request: TaskRequest, req: Request):
             codex_version=request.codex_version,
             client_ip=client_ip,
         )
-        await db.append_event(
-            task_id,
-            "TaskCreated",
-            normalize_payload({"user_id": user_id, "codex_version": request.codex_version}),
-        )
-        await db.set_container_state(
-            task_id,
-            build_container_state(
-                status="created",
-                progress=0.0,
-                current_stage=None,
-                include_created_at=True,
-            ),
-        )
     else:
         # Сохраняем задачу
         storage.active_tasks[task_id] = {
@@ -432,6 +523,21 @@ async def create_task(request: TaskRequest, req: Request):
         if user_id not in storage.user_sessions:
             storage.user_sessions[user_id] = []
         storage.user_sessions[user_id].append(task_id)
+
+    await record_event(
+        task_id,
+        "TaskCreated",
+        normalize_payload({"user_id": user_id, "codex_version": request.codex_version}),
+    )
+    await record_state(
+        task_id,
+        build_container_state(
+            status="created",
+            progress=0.0,
+            current_stage=None,
+            include_created_at=True,
+        ),
+    )
     
     # Запускаем обработку в фоне
     asyncio.create_task(process_task_background(task_id, request.description))
@@ -463,12 +569,13 @@ async def get_task_status(task_id: str):
 @app.get("/api/tasks/{task_id}/events", response_model=EventsResponse)
 async def get_task_events(task_id: str, limit: int = 200, order: str = "desc"):
     """Получение событий контейнера"""
-    if not db.is_enabled():
-        raise HTTPException(status_code=501, detail="Database not enabled")
-
-    await ensure_task_exists(task_id)
     normalized_order = validate_order(order)
-    events = await db.get_events(task_id, limit=limit, order=normalized_order)
+    if db.is_enabled():
+        await ensure_task_exists(task_id)
+        events = await db.get_events(task_id, limit=limit, order=normalized_order)
+    else:
+        ensure_task_exists_in_memory(task_id)
+        events = get_in_memory_events(task_id, limit=limit, order=normalized_order)
     return {
         "task_id": task_id,
         "total": len(events),
@@ -484,12 +591,13 @@ async def get_task_artifacts(
     order: str = "desc",
 ):
     """Получение артефактов контейнера"""
-    if not db.is_enabled():
-        raise HTTPException(status_code=501, detail="Database not enabled")
-
-    await ensure_task_exists(task_id)
     normalized_order = validate_order(order)
-    artifacts = await db.get_artifacts(task_id, type=type, limit=limit, order=normalized_order)
+    if db.is_enabled():
+        await ensure_task_exists(task_id)
+        artifacts = await db.get_artifacts(task_id, type=type, limit=limit, order=normalized_order)
+    else:
+        ensure_task_exists_in_memory(task_id)
+        artifacts = get_in_memory_artifacts(task_id, type, limit=limit, order=normalized_order)
     return {
         "task_id": task_id,
         "total": len(artifacts),
@@ -500,11 +608,12 @@ async def get_task_artifacts(
 @app.get("/api/tasks/{task_id}/state", response_model=ContainerStateResponse)
 async def get_task_state(task_id: str):
     """Получение состояния контейнера"""
-    if not db.is_enabled():
-        raise HTTPException(status_code=501, detail="Database not enabled")
-
-    await ensure_task_exists(task_id)
-    state_row = await db.get_container_state(task_id)
+    if db.is_enabled():
+        await ensure_task_exists(task_id)
+        state_row = await db.get_container_state(task_id)
+    else:
+        ensure_task_exists_in_memory(task_id)
+        state_row = get_in_memory_state(task_id)
     return {
         "task_id": task_id,
         "state": normalize_container_state(state_row["state"]) if state_row else ContainerStateSnapshot(),
@@ -664,12 +773,12 @@ async def process_task_background(task_id: str, description: str):
                 "current_stage": "initializing",
             }
         )
-        await db.append_event(
+        await record_event(
             task_id,
             "StageStarted",
             normalize_payload({"stage": "initializing"}),
         )
-        await db.set_container_state(
+        await record_state(
             task_id,
             build_container_state(
                 status="processing",
@@ -705,12 +814,12 @@ async def process_task_background(task_id: str, description: str):
                     "current_stage": stage,
                 }
             )
-            await db.append_event(
+            await record_event(
                 task_id,
                 "StageStarted",
                 normalize_payload({"stage": stage}),
             )
-            await db.set_container_state(
+            await record_state(
                 task_id,
                 build_container_state(
                     status="processing",
@@ -723,13 +832,13 @@ async def process_task_background(task_id: str, description: str):
 
         async def handle_research_complete(payload: Dict[str, Any]) -> None:
             result = payload.get("result")
-            await db.add_artifact(
+            await record_artifact(
                 task_id,
                 "research_summary",
                 normalize_payload(result),
                 produced_by="researcher",
             )
-            await db.append_event(
+            await record_event(
                 task_id,
                 "ArtifactAdded",
                 normalize_payload({"type": "research_summary"}),
@@ -737,13 +846,13 @@ async def process_task_background(task_id: str, description: str):
 
         async def handle_design_complete(payload: Dict[str, Any]) -> None:
             result = payload.get("result")
-            await db.add_artifact(
+            await record_artifact(
                 task_id,
                 "architecture",
                 normalize_payload(result),
                 produced_by="designer",
             )
-            await db.append_event(
+            await record_event(
                 task_id,
                 "ArtifactAdded",
                 normalize_payload({"type": "architecture"}),
@@ -751,7 +860,7 @@ async def process_task_background(task_id: str, description: str):
 
         async def handle_review_result(payload: Dict[str, Any]) -> None:
             result = payload.get("result")
-            await db.add_artifact(
+            await record_artifact(
                 task_id,
                 "review_report",
                 normalize_payload(result),
@@ -759,7 +868,7 @@ async def process_task_background(task_id: str, description: str):
             )
             issues = result.get("issues") if isinstance(result, dict) else None
             issues_count = len(issues) if isinstance(issues, list) else 0
-            await db.append_event(
+            await record_event(
                 task_id,
                 "ReviewResult",
                 normalize_payload(
@@ -795,14 +904,14 @@ async def process_task_background(task_id: str, description: str):
                 "completed_at": db.now_utc() if db.is_enabled() else asyncio.get_event_loop().time(),
             }
         )
-        await db.append_event(
+        await record_event(
             task_id,
             "TaskCompleted",
             normalize_payload(
                 {"status": result["status"], "progress": result.get("progress", 1.0)}
             ),
         )
-        await db.set_container_state(
+        await record_state(
             task_id,
             build_container_state(
                 status=result["status"],
@@ -825,12 +934,12 @@ async def process_task_background(task_id: str, description: str):
                 "current_stage": "failed",
             }
         )
-        await db.append_event(
+        await record_event(
             task_id,
             "TaskFailed",
             normalize_payload({"error": str(e)}),
         )
-        await db.set_container_state(
+        await record_state(
             task_id,
             build_container_state(
                 status="error",

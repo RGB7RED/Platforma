@@ -150,57 +150,57 @@ async def init_container_tables(pool: Optional[asyncpg.Pool] = None) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS events (
+            CREATE TABLE IF NOT EXISTS task_events (
                 id UUID PRIMARY KEY,
                 task_id UUID NOT NULL,
                 type TEXT NOT NULL,
-                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
-        await _ensure_jsonb_column(conn, table="events", column="payload", nullable=False)
+        await _ensure_jsonb_column(conn, table="task_events", column="payload_json", nullable=False)
         await conn.execute(
             """
             CREATE INDEX IF NOT EXISTS events_task_id_created_at_idx
-            ON events (task_id, created_at);
+            ON task_events (task_id, created_at);
             """
         )
         await conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS artifacts (
+            CREATE TABLE IF NOT EXISTS task_artifacts (
                 id UUID PRIMARY KEY,
                 task_id UUID NOT NULL,
                 type TEXT NOT NULL,
-                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
                 produced_by TEXT NULL,
+                payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
-        await _ensure_jsonb_column(conn, table="artifacts", column="payload", nullable=False)
+        await _ensure_jsonb_column(conn, table="task_artifacts", column="payload_json", nullable=False)
         await conn.execute(
             """
             CREATE INDEX IF NOT EXISTS artifacts_task_id_created_at_idx
-            ON artifacts (task_id, created_at);
+            ON task_artifacts (task_id, created_at);
             """
         )
         await conn.execute(
             """
             CREATE INDEX IF NOT EXISTS artifacts_task_id_type_idx
-            ON artifacts (task_id, type);
+            ON task_artifacts (task_id, type);
             """
         )
         await conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS container_state (
+            CREATE TABLE IF NOT EXISTS task_state (
                 task_id UUID PRIMARY KEY,
-                state JSONB NOT NULL DEFAULT '{}'::jsonb,
+                state_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
-        await _ensure_jsonb_column(conn, table="container_state", column="state", nullable=False)
+        await _ensure_jsonb_column(conn, table="task_state", column="state_json", nullable=False)
     logger.info("Database initialized for container persistence")
 
 
@@ -258,7 +258,7 @@ async def append_event(task_id: str, type: str, payload: Optional[Dict[str, Any]
     try:
         await _pool.execute(
             """
-            INSERT INTO events (id, task_id, type, payload)
+            INSERT INTO task_events (id, task_id, type, payload_json)
             VALUES ($1, $2, $3, $4::jsonb);
             """,
             uuid.uuid4(),
@@ -287,7 +287,7 @@ async def add_artifact(
     try:
         await _pool.execute(
             """
-            INSERT INTO artifacts (id, task_id, type, payload, produced_by)
+            INSERT INTO task_artifacts (id, task_id, type, payload_json, produced_by)
             VALUES ($1, $2, $3, $4::jsonb, $5);
             """,
             uuid.uuid4(),
@@ -311,8 +311,8 @@ async def get_events(task_id: str, limit: int = 200, order: str = "desc") -> Lis
 
     direction = "DESC" if order.lower() == "desc" else "ASC"
     query = f"""
-        SELECT id, type, payload, created_at
-        FROM events
+        SELECT id, type, payload_json, created_at
+        FROM task_events
         WHERE task_id = $1
         ORDER BY created_at {direction}
         LIMIT $2;
@@ -320,7 +320,7 @@ async def get_events(task_id: str, limit: int = 200, order: str = "desc") -> Lis
     rows = await _pool.fetch(query, _coerce_task_id(task_id), limit)
     events = [dict(row) for row in rows]
     for event in events:
-        event["payload"] = _coerce_json_value(event.get("payload"))
+        event["payload"] = _coerce_json_value(event.pop("payload_json", None))
     return events
 
 
@@ -337,8 +337,8 @@ async def get_artifacts(
     direction = "DESC" if order.lower() == "desc" else "ASC"
     if type:
         query = f"""
-            SELECT id, type, produced_by, payload, created_at
-            FROM artifacts
+            SELECT id, type, produced_by, payload_json, created_at
+            FROM task_artifacts
             WHERE task_id = $1 AND type = $2
             ORDER BY created_at {direction}
             LIMIT $3;
@@ -346,8 +346,8 @@ async def get_artifacts(
         rows = await _pool.fetch(query, _coerce_task_id(task_id), type, limit)
     else:
         query = f"""
-            SELECT id, type, produced_by, payload, created_at
-            FROM artifacts
+            SELECT id, type, produced_by, payload_json, created_at
+            FROM task_artifacts
             WHERE task_id = $1
             ORDER BY created_at {direction}
             LIMIT $2;
@@ -356,7 +356,7 @@ async def get_artifacts(
 
     artifacts = [dict(row) for row in rows]
     for artifact in artifacts:
-        artifact["payload"] = _coerce_json_value(artifact.get("payload"))
+        artifact["payload"] = _coerce_json_value(artifact.pop("payload_json", None))
     return artifacts
 
 
@@ -368,10 +368,10 @@ async def set_container_state(task_id: str, state: Optional[Dict[str, Any]] = No
     try:
         await _pool.execute(
             """
-            INSERT INTO container_state (task_id, state)
+            INSERT INTO task_state (task_id, state_json)
             VALUES ($1, $2::jsonb)
             ON CONFLICT (task_id)
-            DO UPDATE SET state = EXCLUDED.state, updated_at = NOW();
+            DO UPDATE SET state_json = EXCLUDED.state_json, updated_at = NOW();
             """,
             _coerce_task_id(task_id),
             _json_payload(state),
@@ -387,12 +387,12 @@ async def get_container_state(task_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     row = await _pool.fetchrow(
-        "SELECT task_id, state, updated_at FROM container_state WHERE task_id = $1;",
+        "SELECT task_id, state_json, updated_at FROM task_state WHERE task_id = $1;",
         _coerce_task_id(task_id),
     )
     data = _row_to_dict(row)
     if data:
-        data["state"] = _coerce_json_value(data.get("state"))
+        data["state"] = _coerce_json_value(data.pop("state_json", None))
     return data
 
 
