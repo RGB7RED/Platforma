@@ -42,12 +42,48 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Optional
 - **Notes:** Defaults to 2000. Exceeding this limit will fail the task with a clear error.
 
+### MAX_CONCURRENT_TASKS
+- **Purpose:** Cap on concurrent task execution slots.
+- **Example:** `MAX_CONCURRENT_TASKS=4`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 4. Tasks beyond the limit remain in `queued` status until a slot frees up.
+
+### RATE_LIMIT_CREATE_TASKS_PER_MIN
+- **Purpose:** Per-API-key rate limit for task creation.
+- **Example:** `RATE_LIMIT_CREATE_TASKS_PER_MIN=10`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 0 (disabled). Returns HTTP 429 with `Retry-After` when exceeded.
+
+### RATE_LIMIT_RERUN_REVIEW_PER_MIN
+- **Purpose:** Per-API-key rate limit for `/api/tasks/{task_id}/rerun-review`.
+- **Example:** `RATE_LIMIT_RERUN_REVIEW_PER_MIN=5`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 0 (disabled). Returns HTTP 429 with `Retry-After` when exceeded.
+
+### RATE_LIMIT_DOWNLOADS_PER_MIN
+- **Purpose:** Per-API-key rate limit for task download endpoints.
+- **Example:** `RATE_LIMIT_DOWNLOADS_PER_MIN=20`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 0 (disabled). Returns HTTP 429 with `Retry-After` when exceeded.
+
+### MAX_TOKENS_PER_DAY
+- **Purpose:** Daily token cap (input + output) per API key.
+- **Example:** `MAX_TOKENS_PER_DAY=200000`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 0 (disabled). Enforced at task start and before each LLM call.
+
+### MAX_COMMAND_RUNS_PER_DAY
+- **Purpose:** Daily command execution cap per API key.
+- **Example:** `MAX_COMMAND_RUNS_PER_DAY=200`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 0 (disabled). Enforced at task start and before each LLM call.
+
 ### TASK_TTL_DAYS
 - **Purpose:** Optional retention window (days) for cleaning up old tasks in Postgres.
 - **Example:** `TASK_TTL_DAYS=30`
 - **Required in production?:** Optional
-- **Notes:** No automatic cleanup is scheduled. Use this value when running a manual cleanup
-  script (e.g., delete tasks older than `TASK_TTL_DAYS` along with related rows).
+- **Notes:** Defaults to 30. On startup, tasks/events/artifacts/files/snapshots older than the
+  TTL are purged.
 
 ### WORKSPACE_ROOT
 - **Purpose:** Base directory for per-task workspaces on disk.
@@ -59,7 +95,7 @@ Open `http://localhost` in your browser.
 - **Purpose:** Cleanup threshold (days) for removing old task workspaces on startup.
 - **Example:** `WORKSPACE_TTL_DAYS=7`
 - **Required in production?:** Optional
-- **Notes:** When unset or `0`, workspaces are retained.
+- **Notes:** Defaults to `TASK_TTL_DAYS` when unset. When set to `0`, workspaces are retained.
 
 ### ALLOWED_COMMANDS
 - **Purpose:** Allowlist for safe command runner executables.
