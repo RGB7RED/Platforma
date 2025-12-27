@@ -255,6 +255,24 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Optional
 - **Notes:** When set, tokens must include this audience.
 
+### GOOGLE_CLIENT_ID
+- **Purpose:** Google OAuth client ID for "Sign in with Google".
+- **Example:** `GOOGLE_CLIENT_ID=1234567890-abcdefg.apps.googleusercontent.com`
+- **Required in production?:** Yes (when enabling Google OAuth)
+- **Notes:** Configure this in the Google Cloud Console OAuth credentials.
+
+### GOOGLE_CLIENT_SECRET
+- **Purpose:** Google OAuth client secret for exchanging authorization codes.
+- **Example:** `GOOGLE_CLIENT_SECRET=your-google-client-secret`
+- **Required in production?:** Yes (when enabling Google OAuth)
+- **Notes:** Keep this secret secure; rotate if compromised.
+
+### GOOGLE_REDIRECT_URL
+- **Purpose:** Redirect URL registered with Google that points to the backend callback.
+- **Example:** `GOOGLE_REDIRECT_URL=https://your-domain.com/auth/google/callback`
+- **Required in production?:** Yes (when enabling Google OAuth)
+- **Notes:** Must exactly match the authorized redirect URI in Google Cloud Console.
+
 ### PUBLIC_BASE_URL
 - **Purpose:** Base URL used to generate email verification and password reset links.
 - **Example:** `PUBLIC_BASE_URL=https://your-domain.com`

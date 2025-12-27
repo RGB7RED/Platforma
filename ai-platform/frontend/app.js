@@ -87,6 +87,7 @@
     saveApiKeyBtn: document.getElementById('saveApiKeyBtn'),
     accessTokenInput: document.getElementById('accessTokenInput'),
     saveAccessTokenBtn: document.getElementById('saveAccessTokenBtn'),
+    googleSignInBtn: document.getElementById('googleSignInBtn'),
     taskError: document.getElementById('taskError'),
     clarificationPanel: document.getElementById('clarificationPanel'),
     clarificationMessage: document.getElementById('clarificationMessage'),
@@ -266,6 +267,27 @@
     if (elements.accessTokenInput) {
       elements.accessTokenInput.value = value || '';
     }
+  };
+
+  const syncAccessTokenFromHash = () => {
+    if (!window.location.hash) {
+      return;
+    }
+    const hash = window.location.hash.startsWith('#')
+      ? window.location.hash.slice(1)
+      : window.location.hash;
+    const params = new URLSearchParams(hash);
+    const accessToken = params.get('access_token');
+    if (!accessToken) {
+      return;
+    }
+    setStoredAccessToken(accessToken);
+    showToast('Signed in with Google. Access token saved.', '✅');
+    window.history.replaceState(
+      null,
+      document.title,
+      `${window.location.pathname}${window.location.search}`
+    );
   };
 
   const hasAuthCredentials = () => Boolean(getStoredAccessToken() || getStoredApiKey());
@@ -1821,6 +1843,13 @@
   if (elements.saveAccessTokenBtn) {
     elements.saveAccessTokenBtn.addEventListener('click', saveAccessToken);
   }
+  if (elements.googleSignInBtn) {
+    elements.googleSignInBtn.addEventListener('click', () => {
+      const returnTo = `${window.location.origin}${window.location.pathname}`;
+      const loginUrl = buildApiUrl(`/auth/google/login?return_to=${encodeURIComponent(returnTo)}`);
+      window.location.assign(loginUrl);
+    });
+  }
 
   if (elements.apiKeyInput) {
     elements.apiKeyInput.addEventListener('keydown', (event) => {
@@ -2025,6 +2054,7 @@
 
   updateCharCount();
   updateApiBaseUrl();
+  syncAccessTokenFromHash();
   updateApiKeyInputs(getStoredApiKey());
   updateAccessTokenInputs(getStoredAccessToken());
   loadTemplates();

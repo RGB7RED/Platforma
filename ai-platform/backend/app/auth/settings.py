@@ -26,6 +26,13 @@ class AuthSettings:
     password_reset_ttl_hours: int
 
 
+@dataclass(frozen=True)
+class GoogleOAuthSettings:
+    client_id: str
+    client_secret: str
+    redirect_url: str
+
+
 @lru_cache
 def get_auth_settings() -> AuthSettings:
     mode = os.getenv("AUTH_MODE", "apikey").lower()
@@ -63,4 +70,13 @@ def get_auth_settings() -> AuthSettings:
         action_token_secret=action_token_secret,
         email_verify_ttl_hours=email_verify_ttl_hours,
         password_reset_ttl_hours=password_reset_ttl_hours,
+    )
+
+
+@lru_cache
+def get_google_oauth_settings() -> GoogleOAuthSettings:
+    return GoogleOAuthSettings(
+        client_id=os.getenv("GOOGLE_CLIENT_ID", ""),
+        client_secret=os.getenv("GOOGLE_CLIENT_SECRET", ""),
+        redirect_url=os.getenv("GOOGLE_REDIRECT_URL", ""),
     )
