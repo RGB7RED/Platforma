@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
+from urllib.parse import urlparse
 
 from .models import Container, ProjectState
 from .orchestrator import AIOrchestrator
@@ -45,6 +46,7 @@ from .schemas import (
     TaskResumeResponse,
 )
 from .auth import get_auth_settings, get_user_from_access_token, router as auth_router
+from .auth.settings import get_google_oauth_settings
 from . import db
 from .logging_utils import (
     configure_logging,
@@ -802,24 +804,29 @@ async def request_id_middleware(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     return response
 
-def parse_allowed_origins() -> tuple[list[str], str, bool]:
+def parse_allowed_origins() -> tuple[list[str], str]:
     raw_origins = os.getenv("ALLOWED_ORIGINS")
     raw_value = raw_origins or ""
     parsed_origins = [origin.strip() for origin in raw_value.split(",") if origin.strip()]
-    allow_all_origins = "*" in parsed_origins
+    has_wildcard = "*" in parsed_origins
     origins = [origin for origin in parsed_origins if origin != "*"]
     environment = os.getenv("ENVIRONMENT", "").lower()
     is_production = environment == "production"
     source = "env" if raw_origins is not None else "unset"
 
+    if has_wildcard:
+        logger.warning(
+            "ALLOWED_ORIGINS contains '*', but allow_credentials is enabled; ignoring wildcard entry."
+        )
+
     if is_production:
-        if not origins and not allow_all_origins:
+        if not origins:
             source = "empty"
             logger.warning(
                 "ALLOWED_ORIGINS is empty in production; CORS will block all cross-origin requests."
             )
     else:
-        if not origins and not allow_all_origins:
+        if not origins:
             origins = [
                 "http://localhost",
                 "http://127.0.0.1",
@@ -828,10 +835,10 @@ def parse_allowed_origins() -> tuple[list[str], str, bool]:
             ]
             source = "dev-defaults"
 
-    return origins, source, allow_all_origins
+    return origins, source
 
 
-allowed_origins, cors_source, allow_all_origins = parse_allowed_origins()
+allowed_origins, cors_source = parse_allowed_origins()
 
 def parse_bool_env(value: Optional[str]) -> Optional[bool]:
     if value is None:
@@ -852,6 +859,14 @@ def parse_int_env(value: Optional[str], default: int) -> int:
     except ValueError:
         logger.warning("Invalid integer env value '%s', using default=%s", value, default)
         return default
+
+
+def build_base_urls(request: Request) -> tuple[str, str]:
+    base_url = str(request.base_url).rstrip("/")
+    parsed = urlparse(base_url)
+    ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+    ws_base_url = parsed._replace(scheme=ws_scheme).geturl()
+    return base_url, ws_base_url
 
 
 MAX_CONCURRENT_TASKS = parse_int_env(MAX_CONCURRENT_TASKS_ENV, 4)
@@ -1915,7 +1930,7 @@ async def build_git_export_zip_response(task_id: str, request: Request) -> Strea
 # CORS для Telegram Mini App и локальной разработки
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if allow_all_origins else allowed_origins,
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1924,6 +1939,31 @@ app.add_middleware(
 app.include_router(auth_router)
 
 # Роуты API
+@app.get("/api/config")
+async def get_runtime_config(request: Request) -> Dict[str, object]:
+    settings = get_auth_settings()
+    google_settings = get_google_oauth_settings()
+    api_base_url, ws_base_url = build_base_urls(request)
+    password_auth_enabled = (
+        settings.mode in {"auth", "hybrid"}
+        and bool(settings.jwt_secret)
+        and db.is_enabled()
+    )
+    google_oauth_enabled = (
+        password_auth_enabled
+        and bool(google_settings.client_id)
+        and bool(google_settings.client_secret)
+        and bool(google_settings.redirect_url)
+    )
+    return {
+        "auth_mode": settings.mode,
+        "google_oauth_enabled": google_oauth_enabled,
+        "password_auth_enabled": password_auth_enabled,
+        "api_base_url": api_base_url,
+        "ws_base_url": ws_base_url,
+    }
+
+
 @app.get("/")
 async def root():
     """Корневой endpoint для проверки работы"""

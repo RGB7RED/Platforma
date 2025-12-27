@@ -43,7 +43,7 @@ _bearer = HTTPBearer(auto_error=False)
 
 def _ensure_auth_enabled() -> None:
     settings = get_auth_settings()
-    if settings.mode == "apikey":
+    if settings.mode == "api_key":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Auth mode disabled")
     if not settings.jwt_secret:
         raise HTTPException(
@@ -193,7 +193,7 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(_bearer),
 ) -> Dict[str, object]:
     settings = get_auth_settings()
-    if settings.mode == "apikey":
+    if settings.mode == "api_key":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth mode disabled")
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token")

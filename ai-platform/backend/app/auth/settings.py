@@ -33,9 +33,18 @@ class GoogleOAuthSettings:
     redirect_url: str
 
 
+def normalize_auth_mode(raw_mode: str | None) -> str:
+    normalized = (raw_mode or "").strip().lower()
+    if normalized in {"auth", "hybrid"}:
+        return normalized
+    if normalized in {"api_key", "apikey", "api-key"}:
+        return "api_key"
+    return "api_key"
+
+
 @lru_cache
 def get_auth_settings() -> AuthSettings:
-    mode = os.getenv("AUTH_MODE", "apikey").lower()
+    mode = normalize_auth_mode(os.getenv("AUTH_MODE"))
     jwt_secret = os.getenv("AUTH_JWT_SECRET", "")
     jwt_algorithm = os.getenv("AUTH_JWT_ALGORITHM", "HS256")
     access_ttl_minutes = int(os.getenv("AUTH_ACCESS_TOKEN_TTL_MINUTES", "15"))

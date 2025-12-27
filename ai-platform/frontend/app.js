@@ -20,33 +20,67 @@
     if (typeof metaValue === 'string' && metaValue.trim()) {
       return metaValue.trim().toLowerCase();
     }
-    return 'apikey';
+    return 'api_key';
   };
 
-  const API_BASE_URL = resolveApiBaseUrl();
-  const AUTH_MODE = resolveAuthMode();
-  const AUTH_MODE_APIKEY = 'apikey';
+  const AUTH_MODE_APIKEY = 'api_key';
   const AUTH_MODE_AUTH = 'auth';
   const AUTH_MODE_HYBRID = 'hybrid';
-  const isAuthEnabled = AUTH_MODE === AUTH_MODE_AUTH || AUTH_MODE === AUTH_MODE_HYBRID;
-  const isApiKeyEnabled = AUTH_MODE === AUTH_MODE_APIKEY || AUTH_MODE === AUTH_MODE_HYBRID;
+  const normalizeAuthMode = (value) => {
+    if (!value) {
+      return AUTH_MODE_APIKEY;
+    }
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'apikey') {
+      return AUTH_MODE_APIKEY;
+    }
+    if ([AUTH_MODE_APIKEY, AUTH_MODE_AUTH, AUTH_MODE_HYBRID].includes(normalized)) {
+      return normalized;
+    }
+    return AUTH_MODE_APIKEY;
+  };
+
+  const runtimeConfig = {
+    apiBaseUrl: resolveApiBaseUrl(),
+    wsBaseUrl: '',
+    authMode: normalizeAuthMode(resolveAuthMode()),
+    googleOAuthEnabled: false,
+    passwordAuthEnabled: false
+  };
+
+  const getAuthMode = () => runtimeConfig.authMode;
+  const isAuthEnabled = () => {
+    const mode = getAuthMode();
+    return mode === AUTH_MODE_AUTH || mode === AUTH_MODE_HYBRID;
+  };
+  const isApiKeyEnabled = () => {
+    const mode = getAuthMode();
+    return mode === AUTH_MODE_APIKEY || mode === AUTH_MODE_HYBRID;
+  };
+  const isPasswordAuthEnabled = () => runtimeConfig.passwordAuthEnabled;
+  const isGoogleAuthEnabled = () => runtimeConfig.googleOAuthEnabled;
   const normalizeBaseUrl = (value) => value.replace(/\/+$/, '');
   const normalizePath = (value) => (value.startsWith('/') ? value : `/${value}`);
   const buildApiUrl = (path) => {
     const resolvedPath = normalizePath(path);
-    if (!API_BASE_URL) {
+    if (!runtimeConfig.apiBaseUrl) {
       return resolvedPath;
     }
-    return `${normalizeBaseUrl(API_BASE_URL)}${resolvedPath}`;
+    return `${normalizeBaseUrl(runtimeConfig.apiBaseUrl)}${resolvedPath}`;
   };
   const buildWebSocketUrl = (taskId) => {
     const wsPath = `/ws/${taskId}`;
     const fallbackProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    if (!API_BASE_URL) {
+    const wsBaseUrl = runtimeConfig.wsBaseUrl
+      ? normalizeBaseUrl(runtimeConfig.wsBaseUrl)
+      : runtimeConfig.apiBaseUrl
+        ? normalizeBaseUrl(runtimeConfig.apiBaseUrl)
+        : '';
+    if (!wsBaseUrl) {
       return `${fallbackProtocol}://${window.location.host}${wsPath}`;
     }
     try {
-      const apiUrl = new URL(API_BASE_URL);
+      const apiUrl = new URL(wsBaseUrl);
       const wsProtocol = apiUrl.protocol === 'https:' ? 'wss:' : 'ws:';
       const basePath = apiUrl.pathname.replace(/\/+$/, '');
       return `${wsProtocol}//${apiUrl.host}${basePath}${wsPath}`;
@@ -105,6 +139,7 @@
     apiBaseUrl: document.getElementById('apiBaseUrl'),
     authPanel: document.getElementById('authPanel'),
     authStatus: document.getElementById('authStatus'),
+    authModeIndicator: document.getElementById('authModeIndicator'),
     authShowLoginBtn: document.getElementById('authShowLoginBtn'),
     authShowRegisterBtn: document.getElementById('authShowRegisterBtn'),
     authShowForgotBtn: document.getElementById('authShowForgotBtn'),
@@ -264,7 +299,14 @@
     if (!elements.apiBaseUrl) {
       return;
     }
-    elements.apiBaseUrl.textContent = API_BASE_URL || '(same origin)';
+    elements.apiBaseUrl.textContent = runtimeConfig.apiBaseUrl || '(same origin)';
+  };
+
+  const updateAuthModeIndicator = () => {
+    if (!elements.authModeIndicator) {
+      return;
+    }
+    elements.authModeIndicator.textContent = getAuthMode() || '-';
   };
 
   const updateAuthStatus = () => {
@@ -286,23 +328,41 @@
   };
 
   const updateAuthModeVisibility = () => {
+    const authEnabled = isAuthEnabled();
+    const apiKeyEnabled = isApiKeyEnabled();
+    const passwordAuthEnabled = isPasswordAuthEnabled();
+    const googleAuthEnabled = isGoogleAuthEnabled();
     if (elements.authPanel) {
-      elements.authPanel.classList.toggle('hidden', !isAuthEnabled);
+      elements.authPanel.classList.toggle('hidden', !authEnabled);
     }
     if (elements.apiKeyGroup) {
-      elements.apiKeyGroup.classList.toggle('hidden', !isApiKeyEnabled);
+      elements.apiKeyGroup.classList.toggle('hidden', !apiKeyEnabled);
     }
     if (elements.accessTokenGroup) {
-      const shouldShowAccessTokenInput = AUTH_MODE === AUTH_MODE_HYBRID;
+      const shouldShowAccessTokenInput = getAuthMode() === AUTH_MODE_HYBRID;
       elements.accessTokenGroup.classList.toggle('hidden', !shouldShowAccessTokenInput);
     }
     if (elements.googleSignInBtn) {
-      elements.googleSignInBtn.classList.toggle('hidden', !isAuthEnabled);
+      elements.googleSignInBtn.classList.toggle('hidden', !(authEnabled && googleAuthEnabled));
     }
+    const authItems = [
+      elements.authShowLoginBtn,
+      elements.authShowRegisterBtn,
+      elements.authShowForgotBtn,
+      elements.authLoginScreen,
+      elements.authRegisterScreen,
+      elements.authForgotScreen
+    ];
+    authItems.forEach((item) => {
+      if (!item) {
+        return;
+      }
+      item.classList.toggle('hidden', !(authEnabled && passwordAuthEnabled));
+    });
   };
 
   const getStoredApiKey = () => {
-    if (!isApiKeyEnabled) {
+    if (!isApiKeyEnabled()) {
       return '';
     }
     const value = window.localStorage.getItem(API_KEY_STORAGE_KEY);
@@ -310,7 +370,7 @@
   };
 
   const setStoredApiKey = (value) => {
-    if (!isApiKeyEnabled) {
+    if (!isApiKeyEnabled()) {
       return;
     }
     const normalized = value.trim();
@@ -375,7 +435,38 @@
   };
 
   const hasAuthCredentials = () =>
-    Boolean(getStoredAccessToken() || (isApiKeyEnabled && getStoredApiKey()));
+    Boolean(getStoredAccessToken() || (isApiKeyEnabled() && getStoredApiKey()));
+
+  const fetchRuntimeConfig = async () => {
+    const bootstrapBase = resolveApiBaseUrl();
+    const configUrl = bootstrapBase
+      ? `${normalizeBaseUrl(bootstrapBase)}${normalizePath('/api/config')}`
+      : '/api/config';
+    try {
+      const response = await fetch(configUrl, { credentials: 'include' });
+      if (!response.ok) {
+        return;
+      }
+      const data = await response.json();
+      runtimeConfig.authMode = normalizeAuthMode(data?.auth_mode || runtimeConfig.authMode);
+      runtimeConfig.apiBaseUrl =
+        typeof data?.api_base_url === 'string' && data.api_base_url.trim()
+          ? data.api_base_url.trim()
+          : runtimeConfig.apiBaseUrl;
+      runtimeConfig.wsBaseUrl =
+        typeof data?.ws_base_url === 'string' && data.ws_base_url.trim()
+          ? data.ws_base_url.trim()
+          : runtimeConfig.wsBaseUrl;
+      runtimeConfig.googleOAuthEnabled = Boolean(data?.google_oauth_enabled);
+      runtimeConfig.passwordAuthEnabled = Boolean(data?.password_auth_enabled);
+    } catch (error) {
+      // Ignore config fetch errors and fallback to meta/defaults.
+    } finally {
+      updateApiBaseUrl();
+      updateAuthModeIndicator();
+      updateAuthModeVisibility();
+    }
+  };
 
   const setTemplateOptions = (templates) => {
     if (!elements.templateSelect) {
@@ -407,8 +498,9 @@
       const response = await apiFetch(buildApiUrl('/api/templates'));
       if (response.status === 401) {
         setTemplateOptions([]);
-        if (isAuthEnabled) {
+        if (isAuthEnabled()) {
           updateAuthStatus();
+          setAuthView('login');
           showToast('Sign in to load templates.', '⚠️');
         }
         return;
@@ -439,7 +531,7 @@
   };
 
   const refreshAccessToken = async () => {
-    if (!isAuthEnabled) {
+    if (!isAuthEnabled()) {
       return null;
     }
     if (refreshPromise) {
@@ -478,7 +570,7 @@
     const headers = includeAuth ? buildAuthHeaders(extraHeaders) : { ...(extraHeaders || {}) };
     const accessToken = getStoredAccessToken();
     const apiKey = getStoredApiKey();
-    const shouldIncludeCredentials = isAuthEnabled;
+    const shouldIncludeCredentials = isAuthEnabled();
     const response = await fetch(url, {
       ...rest,
       headers,
@@ -487,7 +579,7 @@
     if (
       response.status === 401 &&
       retryOnUnauthorized &&
-      isAuthEnabled &&
+      isAuthEnabled() &&
       (accessToken || !apiKey)
     ) {
       const refreshed = await refreshAccessToken();
@@ -499,6 +591,9 @@
   };
 
   const setAuthView = (view) => {
+    if (!isPasswordAuthEnabled()) {
+      return;
+    }
     const views = [
       { key: 'login', element: elements.authLoginScreen },
       { key: 'register', element: elements.authRegisterScreen },
@@ -592,7 +687,7 @@
   };
 
   const logout = async () => {
-    if (!isAuthEnabled) {
+    if (!isAuthEnabled()) {
       setStoredAccessToken('', null);
       return;
     }
@@ -609,7 +704,7 @@
   };
 
   const bootstrapAuthSession = async () => {
-    if (!isAuthEnabled) {
+    if (!isAuthEnabled()) {
       return;
     }
     const token = await refreshAccessToken();
@@ -1746,7 +1841,7 @@
     const accessToken = getStoredAccessToken();
     const apiKey = getStoredApiKey();
     let wsUrl = '';
-    if (isAuthEnabled && (accessToken || !apiKey)) {
+    if (isAuthEnabled() && (accessToken || !apiKey)) {
       const wsToken = await fetchWsToken();
       if (!wsToken) {
         showToast('Unable to start live updates. Please refresh.', '⚠️');
@@ -2416,13 +2511,16 @@
 
   updateCharCount();
   updateApiBaseUrl();
+  updateAuthModeIndicator();
   updateAuthModeVisibility();
   updateAuthStatus();
   setAuthView('login');
   syncAccessTokenFromHash();
   updateApiKeyInputs(getStoredApiKey());
   updateAccessTokenInputs(getStoredAccessToken());
-  void bootstrapAuthSession().then(loadTemplates);
+  void fetchRuntimeConfig()
+    .then(() => bootstrapAuthSession())
+    .then(loadTemplates);
   setActiveInspectorTab(activeInspectorTab);
   updateTimeTakenDisplay({});
 })();
