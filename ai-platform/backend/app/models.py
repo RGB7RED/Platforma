@@ -51,7 +51,9 @@ class Container:
             "tests": [],
             "documentation": [],
             "decisions": [],
-            "review_report": []
+            "review_report": [],
+            "patch_diff": [],
+            "repro_manifest": [],
         }
         
         # Уровень 3: История изменений

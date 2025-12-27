@@ -21,9 +21,15 @@ from pathlib import Path, PurePosixPath
 from datetime import datetime, timezone
 import hashlib
 import mimetypes
+import difflib
+import platform
+import shutil
+import subprocess
+import sys
 
 from .models import Container, ProjectState
 from .orchestrator import AIOrchestrator
+from .agents import AIReviewer
 from .schemas import (
     ArtifactsResponse,
     ArtifactItem,
@@ -378,6 +384,43 @@ async def record_state(task_id: str, state: Dict[str, Any]) -> None:
         store_in_memory_state(task_id, state)
 
 
+async def run_review_for_task(task_id: str, container: Container) -> Dict[str, Any]:
+    run_id = str(uuid.uuid4())
+    started_at = db.now_utc().isoformat()
+    await record_event(
+        task_id,
+        "review_started",
+        normalize_payload({"run_id": run_id, "started_at": started_at}),
+    )
+    reviewer = AIReviewer(AIOrchestrator().codex)
+    review_result = await reviewer.execute(container)
+    finished_at = db.now_utc().isoformat()
+    review_result["run_id"] = run_id
+    review_result["started_at"] = started_at
+    review_result["finished_at"] = finished_at
+    await record_artifact(
+        task_id,
+        "review_report",
+        normalize_payload(review_result),
+        produced_by="reviewer",
+    )
+    await record_event(
+        task_id,
+        "review_finished",
+        normalize_payload(
+            {
+                "run_id": run_id,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "passed": review_result.get("passed"),
+                "status": review_result.get("status"),
+            }
+        ),
+    )
+    await persist_container_snapshot(task_id, container)
+    return review_result
+
+
 def get_in_memory_events(task_id: str, limit: int, order: str) -> List[Dict[str, Any]]:
     events = storage.events.get(task_id, [])
     ordered = sorted(events, key=lambda item: item.get("created_at"), reverse=order == "desc")
@@ -694,6 +737,189 @@ def build_container_snapshot(container: Container) -> Dict[str, Any]:
     }
 
 
+def build_file_record(content: Any) -> Dict[str, Any]:
+    if isinstance(content, (bytes, bytearray)):
+        payload = bytes(content)
+        text_content = None
+        is_binary = True
+    else:
+        text_content = str(content)
+        payload = text_content.encode("utf-8")
+        is_binary = False
+    return {
+        "content": text_content,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+        "is_binary": is_binary,
+    }
+
+
+def capture_baseline_files(container: Container) -> Dict[str, Dict[str, Any]]:
+    return {path: build_file_record(content) for path, content in container.files.items()}
+
+
+def build_patch_diff_payload(
+    baseline_files: Dict[str, Dict[str, Any]],
+    final_files: Dict[str, Any],
+) -> Dict[str, Any]:
+    changed_files: List[Dict[str, Any]] = []
+    diff_lines: List[str] = []
+    stats = {
+        "changed_total": 0,
+        "added": 0,
+        "removed": 0,
+        "modified": 0,
+        "text_files": 0,
+        "binary_files": 0,
+        "diff_lines": 0,
+    }
+
+    final_records = {path: build_file_record(content) for path, content in final_files.items()}
+    all_paths = sorted(set(baseline_files.keys()) | set(final_records.keys()))
+
+    for path in all_paths:
+        baseline_record = baseline_files.get(path)
+        final_record = final_records.get(path)
+        if baseline_record is None:
+            change_type = "added"
+        elif final_record is None:
+            change_type = "removed"
+        elif baseline_record["sha256"] != final_record["sha256"]:
+            change_type = "modified"
+        else:
+            continue
+
+        is_binary = bool(
+            (baseline_record and baseline_record.get("is_binary"))
+            or (final_record and final_record.get("is_binary"))
+        )
+        changed_files.append(
+            {
+                "path": path,
+                "change_type": change_type,
+                "sha256_before": baseline_record["sha256"] if baseline_record else None,
+                "sha256_after": final_record["sha256"] if final_record else None,
+                "size_before": baseline_record["size_bytes"] if baseline_record else None,
+                "size_after": final_record["size_bytes"] if final_record else None,
+                "is_binary": is_binary,
+            }
+        )
+        stats[change_type] += 1
+        stats["changed_total"] += 1
+
+        if is_binary:
+            stats["binary_files"] += 1
+            continue
+
+        stats["text_files"] += 1
+        before_text = (baseline_record or {}).get("content") or ""
+        after_text = (final_record or {}).get("content") or ""
+        before_lines = before_text.splitlines()
+        after_lines = after_text.splitlines()
+        diff = difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
+        )
+        diff_lines.extend(list(diff))
+
+    stats["diff_lines"] = len(diff_lines)
+    diff_text = "\n".join(diff_lines)
+    return {
+        "diff": diff_text,
+        "changed_files": changed_files,
+        "stats": stats,
+    }
+
+
+def resolve_latest_review_summary(container: Optional[Container]) -> Dict[str, Any]:
+    if not container:
+        return {}
+    review_reports = container.artifacts.get("review_report", [])
+    if not review_reports:
+        return {}
+    latest = review_reports[-1].content if hasattr(review_reports[-1], "content") else review_reports[-1]
+    if not isinstance(latest, dict):
+        return {}
+    issues = latest.get("issues")
+    issues_count = len(issues) if isinstance(issues, list) else 0
+    return {
+        "passed": latest.get("passed"),
+        "status": latest.get("status"),
+        "issues_count": issues_count,
+        "run_id": latest.get("run_id"),
+    }
+
+
+def get_tool_version(command: List[str]) -> Optional[str]:
+    executable = command[0]
+    if not shutil.which(executable):
+        return None
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = (result.stdout or result.stderr or "").strip()
+    return output or None
+
+
+def get_requirements_hash() -> Dict[str, Optional[str]]:
+    requirements_path = Path(__file__).resolve().parents[1] / "requirements.txt"
+    if requirements_path.exists():
+        payload = requirements_path.read_bytes()
+        return {
+            "requirements_path": str(requirements_path),
+            "requirements_sha256": hashlib.sha256(payload).hexdigest(),
+            "pip_freeze_sha256": None,
+        }
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "freeze"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = (result.stdout or "").encode("utf-8")
+    return {
+        "requirements_path": None,
+        "requirements_sha256": None,
+        "pip_freeze_sha256": hashlib.sha256(output).hexdigest(),
+    }
+
+
+def build_repro_manifest_payload(
+    *,
+    task_id: str,
+    container: Optional[Container],
+    task_data: Optional[Dict[str, Any]],
+    review_summary: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    requirements = get_requirements_hash()
+    codex_version = container.metadata.get("codex_version") if container else None
+    codex_hash = container.metadata.get("codex_hash") if container else None
+    created_at = to_iso_string(task_data.get("created_at")) if task_data else None
+    completed_at = to_iso_string(task_data.get("completed_at")) if task_data else None
+    return {
+        "task_id": task_id,
+        "generated_at": db.now_utc().isoformat(),
+        "created_at": created_at,
+        "completed_at": completed_at,
+        "python_version": sys.version.replace("\n", " "),
+        "platform": platform.platform(),
+        "requirements_path": requirements["requirements_path"],
+        "requirements_sha256": requirements["requirements_sha256"],
+        "pip_freeze_sha256": requirements["pip_freeze_sha256"],
+        "ruff_version": get_tool_version(["ruff", "--version"]),
+        "pytest_version": get_tool_version(["pytest", "--version"]),
+        "codex_version": codex_version,
+        "codex_hash": codex_hash,
+        "review_summary": review_summary or {},
+    }
+
+
 async def persist_container_snapshot(task_id: str, container: Container) -> None:
     if not db.is_enabled():
         return
@@ -938,6 +1164,21 @@ async def get_task_status(task_id: str, request: Request):
     return enrich_task_data(task_id, task_data)
 
 
+@app.post("/api/tasks/{task_id}/rerun-review")
+async def rerun_review(task_id: str, request: Request):
+    """Перезапуск ревью для существующей задачи"""
+    await ensure_task_owner(task_id, request)
+    container = await resolve_container_with_db(task_id)
+    if not container:
+        raise HTTPException(status_code=404, detail="Container not found")
+    review_result = await run_review_for_task(task_id, container)
+    return {
+        "task_id": task_id,
+        "run_id": review_result.get("run_id"),
+        "review_report": review_result,
+    }
+
+
 @app.get("/api/tasks/{task_id}/events", response_model=EventsResponse)
 async def get_task_events(task_id: str, request: Request, limit: int = 200, order: str = "desc"):
     """Получение событий контейнера"""
@@ -1165,6 +1406,8 @@ async def process_task_background(task_id: str, description: str):
         # Создаем оркестратор и контейнер
         orchestrator = AIOrchestrator()
         container = orchestrator.initialize_project(f"Task-{task_id[:8]}")
+        baseline_files = capture_baseline_files(container)
+        container.metadata["baseline_files"] = baseline_files
         await persist_container_snapshot(task_id, container)
         storage.containers[task_id] = container
 
@@ -1305,6 +1548,53 @@ async def process_task_background(task_id: str, description: str):
                 "codex_loaded": handle_codex_loaded,
             },
         )
+
+        review_summary = resolve_latest_review_summary(container)
+        patch_payload = build_patch_diff_payload(
+            container.metadata.get("baseline_files") or {},
+            container.files,
+        )
+        container.add_artifact("patch_diff", patch_payload, "system")
+        await record_artifact(
+            task_id,
+            "patch_diff",
+            normalize_payload(patch_payload),
+            produced_by="system",
+        )
+        await record_event(
+            task_id,
+            "ArtifactAdded",
+            normalize_payload({"type": "patch_diff"}),
+        )
+
+        completed_at = db.now_utc()
+        manifest_payload = build_repro_manifest_payload(
+            task_id=task_id,
+            container=container,
+            task_data={
+                "created_at": storage.active_tasks.get(task_id, {}).get("created_at")
+                if not db.is_enabled()
+                else None,
+                "completed_at": completed_at,
+            },
+            review_summary=review_summary,
+        )
+        if db.is_enabled():
+            task_data = await db.get_task_row(task_id)
+            if task_data:
+                manifest_payload["created_at"] = to_iso_string(task_data.get("created_at"))
+        container.add_artifact("repro_manifest", manifest_payload, "system")
+        await record_artifact(
+            task_id,
+            "repro_manifest",
+            normalize_payload(manifest_payload),
+            produced_by="system",
+        )
+        await record_event(
+            task_id,
+            "ArtifactAdded",
+            normalize_payload({"type": "repro_manifest"}),
+        )
         
         # Сохраняем контейнер в файл (для persistence)
         save_container_to_file(task_id, container)
@@ -1318,7 +1608,7 @@ async def process_task_background(task_id: str, description: str):
                 "progress": result.get("progress", 1.0),
                 "current_stage": "completed",
                 "result": result,
-                "completed_at": db.now_utc(),
+                "completed_at": completed_at,
             }
         )
         await record_event(
