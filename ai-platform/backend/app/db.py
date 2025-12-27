@@ -201,6 +201,42 @@ async def init_container_tables(pool: Optional[asyncpg.Pool] = None) -> None:
             """
         )
         await _ensure_jsonb_column(conn, table="task_state", column="state_json", nullable=False)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_files (
+                task_id UUID NOT NULL,
+                path TEXT NOT NULL,
+                content TEXT NULL,
+                content_bytes BYTEA NULL,
+                mime_type TEXT NULL,
+                sha256 TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (task_id, path)
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS task_files_task_id_idx
+            ON task_files (task_id);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_container_snapshots (
+                task_id UUID PRIMARY KEY,
+                snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await _ensure_jsonb_column(
+            conn,
+            table="task_container_snapshots",
+            column="snapshot_json",
+            nullable=False,
+        )
     logger.info("Database initialized for container persistence")
 
 
@@ -393,6 +429,191 @@ async def get_container_state(task_id: str) -> Optional[Dict[str, Any]]:
     data = _row_to_dict(row)
     if data:
         data["state"] = _coerce_json_value(data.pop("state_json", None))
+    return data
+
+
+async def upsert_task_file(
+    task_id: str,
+    path: str,
+    *,
+    content: Optional[str],
+    content_bytes: Optional[bytes],
+    mime_type: Optional[str],
+    sha256: str,
+    size_bytes: int,
+    max_bytes: Optional[int] = None,
+    max_files: Optional[int] = None,
+) -> None:
+    if _pool is None:
+        logger.debug("Database not enabled; skipping upsert_task_file for task %s", task_id)
+        return
+
+    try:
+        async with _pool.acquire() as conn:
+            async with conn.transaction():
+                existing = await conn.fetchrow(
+                    """
+                    SELECT size_bytes
+                    FROM task_files
+                    WHERE task_id = $1 AND path = $2;
+                    """,
+                    _coerce_task_id(task_id),
+                    path,
+                )
+                stats = await conn.fetchrow(
+                    """
+                    SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes), 0) AS total
+                    FROM task_files
+                    WHERE task_id = $1;
+                    """,
+                    _coerce_task_id(task_id),
+                )
+                current_count = int(stats["count"]) if stats else 0
+                current_total = int(stats["total"]) if stats else 0
+                previous_size = int(existing["size_bytes"]) if existing else 0
+                new_count = current_count if existing else current_count + 1
+                new_total = current_total - previous_size + size_bytes
+
+                if max_files is not None and max_files > 0 and new_count > max_files:
+                    raise ValueError(
+                        f"Task file count limit exceeded ({new_count} > {max_files})"
+                    )
+                if max_bytes is not None and max_bytes > 0 and new_total > max_bytes:
+                    raise ValueError(
+                        f"Task storage limit exceeded ({new_total} > {max_bytes} bytes)"
+                    )
+
+                await conn.execute(
+                    """
+                    INSERT INTO task_files (
+                        task_id,
+                        path,
+                        content,
+                        content_bytes,
+                        mime_type,
+                        sha256,
+                        size_bytes,
+                        updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                    ON CONFLICT (task_id, path)
+                    DO UPDATE SET
+                        content = EXCLUDED.content,
+                        content_bytes = EXCLUDED.content_bytes,
+                        mime_type = EXCLUDED.mime_type,
+                        sha256 = EXCLUDED.sha256,
+                        size_bytes = EXCLUDED.size_bytes,
+                        updated_at = NOW();
+                    """,
+                    _coerce_task_id(task_id),
+                    path,
+                    content,
+                    content_bytes,
+                    mime_type,
+                    sha256,
+                    size_bytes,
+                )
+    except Exception:
+        _log_db_error(
+            "upsert_task_file",
+            {
+                "task_id": task_id,
+                "path": path,
+                "size_bytes": size_bytes,
+                "mime_type": mime_type,
+            },
+        )
+        raise
+
+
+async def list_task_files(task_id: str) -> List[Dict[str, Any]]:
+    if _pool is None:
+        logger.debug("Database not enabled; returning empty task files for task %s", task_id)
+        return []
+
+    rows = await _pool.fetch(
+        """
+        SELECT path, mime_type, sha256, size_bytes, updated_at
+        FROM task_files
+        WHERE task_id = $1
+        ORDER BY path ASC;
+        """,
+        _coerce_task_id(task_id),
+    )
+    return [dict(row) for row in rows]
+
+
+async def get_task_file(task_id: str, path: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        logger.debug("Database not enabled; returning empty task file for task %s", task_id)
+        return None
+
+    row = await _pool.fetchrow(
+        """
+        SELECT path, content, content_bytes, mime_type, sha256, size_bytes, updated_at
+        FROM task_files
+        WHERE task_id = $1 AND path = $2;
+        """,
+        _coerce_task_id(task_id),
+        path,
+    )
+    return _row_to_dict(row)
+
+
+async def list_task_files_with_payload(task_id: str) -> List[Dict[str, Any]]:
+    if _pool is None:
+        logger.debug("Database not enabled; returning empty task files for task %s", task_id)
+        return []
+
+    rows = await _pool.fetch(
+        """
+        SELECT path, content, content_bytes, mime_type, sha256, size_bytes, updated_at
+        FROM task_files
+        WHERE task_id = $1
+        ORDER BY path ASC;
+        """,
+        _coerce_task_id(task_id),
+    )
+    return [dict(row) for row in rows]
+
+
+async def upsert_container_snapshot(task_id: str, snapshot: Dict[str, Any]) -> None:
+    if _pool is None:
+        logger.debug("Database not enabled; skipping upsert_container_snapshot for task %s", task_id)
+        return
+
+    try:
+        await _pool.execute(
+            """
+            INSERT INTO task_container_snapshots (task_id, snapshot_json)
+            VALUES ($1, $2::jsonb)
+            ON CONFLICT (task_id)
+            DO UPDATE SET snapshot_json = EXCLUDED.snapshot_json, updated_at = NOW();
+            """,
+            _coerce_task_id(task_id),
+            _json_payload(snapshot),
+        )
+    except Exception:
+        _log_db_error("upsert_container_snapshot", {"task_id": task_id})
+        raise
+
+
+async def get_container_snapshot(task_id: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        logger.debug("Database not enabled; returning empty container snapshot for task %s", task_id)
+        return None
+
+    row = await _pool.fetchrow(
+        """
+        SELECT task_id, snapshot_json, updated_at
+        FROM task_container_snapshots
+        WHERE task_id = $1;
+        """,
+        _coerce_task_id(task_id),
+    )
+    data = _row_to_dict(row)
+    if data:
+        data["snapshot"] = _coerce_json_value(data.pop("snapshot_json", None))
     return data
 
 

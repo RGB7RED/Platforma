@@ -7,7 +7,7 @@ import json
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Callable
 from dataclasses import dataclass, field, asdict
 
 
@@ -70,6 +70,7 @@ class Container:
             "ai_models_used": [],
             "total_tokens": 0
         }
+        self.file_update_hook: Optional[Callable[[str, Any], None]] = None
         
         # Логируем создание контейнера
         self._add_history_entry("container_created", 
@@ -81,6 +82,8 @@ class Container:
         self.updated_at = datetime.now()
         self._add_history_entry("file_added", 
                                {"filepath": filepath, "size": len(content)})
+        if self.file_update_hook:
+            self.file_update_hook(filepath, content)
     
     def add_artifact(self, artifact_type: str, content: Any, 
                     created_by: str = "system") -> str:
