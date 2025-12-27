@@ -100,6 +100,8 @@
     artifactsCount: document.getElementById('artifactsCount'),
     iterationsCount: document.getElementById('iterationsCount'),
     timeTaken: document.getElementById('timeTaken'),
+    latestReviewResult: document.getElementById('latestReviewResult'),
+    rerunReviewBtn: document.getElementById('rerunReviewBtn'),
     downloadZipBtn: document.getElementById('downloadZipBtn'),
     fileCategories: document.getElementById('fileCategories'),
     fileList: document.getElementById('fileList'),
@@ -520,6 +522,9 @@
     if (elements.resultStatus) {
       elements.resultStatus.innerHTML = '<span class="status-badge">In progress</span>';
     }
+    if (elements.latestReviewResult) {
+      elements.latestReviewResult.textContent = '—';
+    }
     resetFilePanel();
   };
 
@@ -628,6 +633,19 @@
           ? 'n/a'
           : payload.pytest.exit_code;
       return `Review ${passed} (ruff: ${ruffExit}, pytest: ${pytestExit})`;
+    }
+    if (artifact?.type === 'patch_diff' && payload && typeof payload === 'object') {
+      const total = payload?.stats?.changed_total ?? 0;
+      const textFiles = payload?.stats?.text_files ?? 0;
+      const binaryFiles = payload?.stats?.binary_files ?? 0;
+      return `Patch diff: ${total} changed (${textFiles} text, ${binaryFiles} binary)`;
+    }
+    if (artifact?.type === 'repro_manifest' && payload && typeof payload === 'object') {
+      const python = payload?.python_version?.split(' ')[0] || 'python';
+      const review = payload?.review_summary?.passed;
+      const reviewLabel =
+        review === true ? 'review passed' : review === false ? 'review failed' : 'review n/a';
+      return `Repro manifest: ${python}, ${reviewLabel}`;
     }
     return formatPayloadSummary(payload);
   };
@@ -851,10 +869,33 @@
       .join('');
   };
 
+  const updateLatestReviewResult = (artifacts) => {
+    if (!elements.latestReviewResult) {
+      return;
+    }
+    if (!Array.isArray(artifacts)) {
+      elements.latestReviewResult.textContent = '—';
+      return;
+    }
+    const reviewArtifact = artifacts.find((item) => item?.type === 'review_report');
+    if (!reviewArtifact) {
+      if (!artifactTypeFilter || artifactTypeFilter === 'review_report') {
+        elements.latestReviewResult.textContent = '—';
+      }
+      return;
+    }
+    const payload = reviewArtifact?.payload ?? reviewArtifact;
+    const passed = payload?.passed;
+    const statusLabel =
+      passed === true ? 'Passed' : passed === false ? 'Failed' : 'Unknown';
+    elements.latestReviewResult.textContent = statusLabel;
+  };
+
   const renderArtifacts = (artifacts) => {
     if (!elements.artifactsList) {
       return;
     }
+    updateLatestReviewResult(artifacts);
     if (!Array.isArray(artifacts) || artifacts.length === 0) {
       elements.artifactsList.innerHTML = '<div class="artifact-item">No artifacts yet.</div>';
       return;
@@ -1168,6 +1209,51 @@
     pollFiles(currentTaskId);
   };
 
+  const rerunReview = async () => {
+    if (!currentTaskId) {
+      showToast('No active task to review.', 'ℹ️');
+      return;
+    }
+    if (!getStoredApiKey()) {
+      showToast('Please save your API key before rerunning review.', '⚠️');
+      return;
+    }
+    if (elements.rerunReviewBtn) {
+      elements.rerunReviewBtn.disabled = true;
+    }
+    setLoading(true, 'Running review...', 'Executing ruff and pytest checks');
+    try {
+      const response = await fetch(buildApiUrl(`/api/tasks/${currentTaskId}/rerun-review`), {
+        method: 'POST',
+        headers: buildAuthHeaders({
+          'Content-Type': 'application/json'
+        })
+      });
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'Invalid API Key or no access to this task.'
+          : response.status === 404
+            ? 'Task or container not found'
+            : `Review rerun failed (${response.status})`;
+        throw new Error(message);
+      }
+      await response.json();
+      showToast('Review rerun completed.', '✅');
+      await pollArtifacts(currentTaskId);
+      const { data } = await fetchArtifacts(currentTaskId, { type: 'review_report', limit: 5 });
+      const reviewArtifacts = Array.isArray(data) ? data : data?.artifacts || data?.items || [];
+      updateLatestReviewResult(reviewArtifacts);
+    } catch (error) {
+      const message = error?.message || 'Unable to rerun review.';
+      showToast(message, '⚠️');
+    } finally {
+      setLoading(false);
+      if (elements.rerunReviewBtn) {
+        elements.rerunReviewBtn.disabled = false;
+      }
+    }
+  };
+
   const loadTask = () => {
     const taskId = elements.taskIdInput?.value.trim();
     if (!taskId) {
@@ -1267,6 +1353,10 @@
 
   if (elements.copyTaskIdBtn) {
     elements.copyTaskIdBtn.addEventListener('click', copyTaskId);
+  }
+
+  if (elements.rerunReviewBtn) {
+    elements.rerunReviewBtn.addEventListener('click', rerunReview);
   }
 
   if (elements.inspectorTabs) {

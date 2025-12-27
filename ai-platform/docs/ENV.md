@@ -54,3 +54,9 @@ Open `http://localhost` in your browser.
 - **Example:** `CODEX_PATH=ai-platform/backend/app/codex.json`
 - **Required in production?:** Optional
 - **Notes:** Defaults to `backend/app/codex.json` relative to the backend source.
+
+### APP_API_KEY
+- **Purpose:** Require an API key for all task endpoints (including rerun review).
+- **Example:** `APP_API_KEY=super-secret-token`
+- **Required in production?:** Recommended
+- **Notes:** Clients must send `X-API-Key` with the configured value.
