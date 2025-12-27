@@ -6,11 +6,26 @@ from typing import Dict
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from .schemas import LoginRequest, LogoutResponse, MeResponse, RefreshResponse, RegisterRequest, TokenResponse, UserResponse
+from .email import build_public_link, send_email
+from .schemas import (
+    DetailResponse,
+    EmailRequest,
+    LoginRequest,
+    LogoutResponse,
+    MeResponse,
+    RefreshResponse,
+    RegisterRequest,
+    ResetPasswordRequest,
+    TokenResponse,
+    UserResponse,
+    VerifyEmailRequest,
+)
 from .security import (
     create_access_token,
+    generate_action_token,
     generate_refresh_token,
     get_user_from_access_token,
+    hash_action_token,
     hash_password,
     hash_refresh_token,
     verify_password,
@@ -83,7 +98,11 @@ def _clear_refresh_cookie(response: Response) -> None:
 
 
 def _normalize_user(user: Dict[str, object]) -> UserResponse:
-    return UserResponse(id=str(user["id"]), email=user["email"])
+    return UserResponse(
+        id=str(user["id"]),
+        email=user["email"],
+        email_verified=user.get("email_verified_at") is not None,
+    )
 
 
 def _access_token_response(user: Dict[str, object]) -> TokenResponse:
@@ -221,3 +240,86 @@ async def logout(request: Request, response: Response) -> LogoutResponse:
 async def me(user: Dict[str, object] = Depends(get_current_user)) -> MeResponse:
     _ensure_auth_enabled()
     return MeResponse(user=_normalize_user(user))
+
+
+@router.post("/request-email-verify", response_model=DetailResponse)
+async def request_email_verify(payload: EmailRequest) -> DetailResponse:
+    _ensure_auth_enabled()
+    _ensure_db_ready()
+    email = payload.email.strip().lower()
+    user = await db.get_auth_user_by_email(email)
+    if not user or user.get("email_verified_at") is not None:
+        return DetailResponse(detail="If the account exists, a verification email was sent.")
+
+    raw_token = generate_action_token()
+    token_hash = hash_action_token(raw_token)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=get_auth_settings().email_verify_ttl_hours)
+    await db.create_email_verify_token(
+        user_id=str(user["id"]),
+        token_hash=token_hash,
+        expires_at=expires_at,
+    )
+    verify_link = build_public_link(f"/auth/verify-email?token={raw_token}")
+    send_email(
+        to_email=email,
+        subject="Verify your email",
+        body=f"Verify your email by visiting: {verify_link}",
+    )
+    return DetailResponse(detail="If the account exists, a verification email was sent.")
+
+
+@router.post("/verify-email", response_model=DetailResponse)
+async def verify_email(payload: VerifyEmailRequest) -> DetailResponse:
+    _ensure_auth_enabled()
+    _ensure_db_ready()
+    token_hash = hash_action_token(payload.token)
+    token_row = await db.consume_email_verify_token(token_hash)
+    if not token_row:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid verification token")
+    expires_at = token_row.get("expires_at")
+    if isinstance(expires_at, datetime) and expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Verification token expired")
+    await db.mark_auth_user_email_verified(user_id=str(token_row["user_id"]))
+    return DetailResponse(detail="Email verified")
+
+
+@router.post("/request-password-reset", response_model=DetailResponse)
+async def request_password_reset(payload: EmailRequest) -> DetailResponse:
+    _ensure_auth_enabled()
+    _ensure_db_ready()
+    email = payload.email.strip().lower()
+    user = await db.get_auth_user_by_email(email)
+    if not user:
+        return DetailResponse(detail="If the account exists, a reset email was sent.")
+
+    raw_token = generate_action_token()
+    token_hash = hash_action_token(raw_token)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=get_auth_settings().password_reset_ttl_hours)
+    await db.create_password_reset_token(
+        user_id=str(user["id"]),
+        token_hash=token_hash,
+        expires_at=expires_at,
+    )
+    reset_link = build_public_link(f"/auth/reset-password?token={raw_token}")
+    send_email(
+        to_email=email,
+        subject="Reset your password",
+        body=f"Reset your password by visiting: {reset_link}",
+    )
+    return DetailResponse(detail="If the account exists, a reset email was sent.")
+
+
+@router.post("/reset-password", response_model=DetailResponse)
+async def reset_password(payload: ResetPasswordRequest) -> DetailResponse:
+    _ensure_auth_enabled()
+    _ensure_db_ready()
+    token_hash = hash_action_token(payload.token)
+    token_row = await db.consume_password_reset_token(token_hash)
+    if not token_row:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid reset token")
+    expires_at = token_row.get("expires_at")
+    if isinstance(expires_at, datetime) and expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reset token expired")
+    password_hash = hash_password(payload.password)
+    await db.update_auth_user_password(user_id=str(token_row["user_id"]), password_hash=password_hash)
+    return DetailResponse(detail="Password updated")

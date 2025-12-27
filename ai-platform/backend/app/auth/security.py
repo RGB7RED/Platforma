@@ -87,6 +87,25 @@ def hash_refresh_token(token: str) -> str:
     return digest
 
 
+def generate_action_token() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def hash_action_token(token: str) -> str:
+    settings = get_auth_settings()
+    if not settings.action_token_secret:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_ACTION_TOKEN_SECRET is not configured",
+        )
+    digest = hmac.new(
+        settings.action_token_secret.encode("utf-8"),
+        token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest
+
+
 async def get_user_from_access_token(token: str) -> Optional[Dict[str, Any]]:
     if not db.is_enabled():
         raise HTTPException(

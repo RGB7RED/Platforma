@@ -21,6 +21,9 @@ class AuthSettings:
     issuer: Optional[str]
     audience: Optional[str]
     refresh_hash_secret: str
+    action_token_secret: str
+    email_verify_ttl_hours: int
+    password_reset_ttl_hours: int
 
 
 @lru_cache
@@ -35,6 +38,9 @@ def get_auth_settings() -> AuthSettings:
     refresh_cookie_domain = os.getenv("AUTH_REFRESH_COOKIE_DOMAIN")
     refresh_cookie_samesite = os.getenv("AUTH_REFRESH_COOKIE_SAMESITE", "lax")
     refresh_hash_secret = os.getenv("AUTH_REFRESH_TOKEN_SECRET") or jwt_secret
+    action_token_secret = os.getenv("AUTH_ACTION_TOKEN_SECRET") or jwt_secret
+    email_verify_ttl_hours = int(os.getenv("AUTH_EMAIL_VERIFY_TTL_HOURS", "24"))
+    password_reset_ttl_hours = int(os.getenv("AUTH_PASSWORD_RESET_TTL_HOURS", "2"))
     environment = os.getenv("ENVIRONMENT", "").lower()
     refresh_cookie_secure = environment == "production"
     issuer = os.getenv("AUTH_JWT_ISSUER")
@@ -54,4 +60,7 @@ def get_auth_settings() -> AuthSettings:
         issuer=issuer,
         audience=audience,
         refresh_hash_secret=refresh_hash_secret,
+        action_token_secret=action_token_secret,
+        email_verify_ttl_hours=email_verify_ttl_hours,
+        password_reset_ttl_hours=password_reset_ttl_hours,
     )

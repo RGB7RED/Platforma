@@ -189,6 +189,12 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Yes (when using refresh tokens)
 - **Notes:** Defaults to `AUTH_JWT_SECRET` if unset.
 
+### AUTH_ACTION_TOKEN_SECRET
+- **Purpose:** HMAC secret for hashing email verification and password reset tokens.
+- **Example:** `AUTH_ACTION_TOKEN_SECRET=another-long-random-string`
+- **Required in production?:** Recommended
+- **Notes:** Defaults to `AUTH_JWT_SECRET` if unset.
+
 ### AUTH_ACCESS_TOKEN_TTL_MINUTES
 - **Purpose:** Access token lifetime in minutes.
 - **Example:** `AUTH_ACCESS_TOKEN_TTL_MINUTES=15`
@@ -225,6 +231,18 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Optional
 - **Notes:** Defaults to `lax`. Use `none` only when required and with HTTPS.
 
+### AUTH_EMAIL_VERIFY_TTL_HOURS
+- **Purpose:** Lifetime in hours for email verification tokens.
+- **Example:** `AUTH_EMAIL_VERIFY_TTL_HOURS=24`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 24 hours.
+
+### AUTH_PASSWORD_RESET_TTL_HOURS
+- **Purpose:** Lifetime in hours for password reset tokens.
+- **Example:** `AUTH_PASSWORD_RESET_TTL_HOURS=2`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 2 hours.
+
 ### AUTH_JWT_ISSUER
 - **Purpose:** Optional issuer claim for access tokens.
 - **Example:** `AUTH_JWT_ISSUER=ai-platform`
@@ -236,6 +254,42 @@ Open `http://localhost` in your browser.
 - **Example:** `AUTH_JWT_AUDIENCE=ai-platform-clients`
 - **Required in production?:** Optional
 - **Notes:** When set, tokens must include this audience.
+
+### PUBLIC_BASE_URL
+- **Purpose:** Base URL used to generate email verification and password reset links.
+- **Example:** `PUBLIC_BASE_URL=https://your-domain.com`
+- **Required in production?:** Recommended
+- **Notes:** Defaults to `http://localhost` when unset.
+
+### SMTP_HOST
+- **Purpose:** SMTP server host for sending auth emails.
+- **Example:** `SMTP_HOST=smtp.mailgun.org`
+- **Required in production?:** Recommended
+- **Notes:** When unset, emails are logged instead of sent.
+
+### SMTP_PORT
+- **Purpose:** SMTP server port for sending auth emails.
+- **Example:** `SMTP_PORT=587`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 25. Port 465 uses implicit TLS.
+
+### SMTP_USER
+- **Purpose:** SMTP username for sending auth emails.
+- **Example:** `SMTP_USER=postmaster@your-domain.com`
+- **Required in production?:** Optional
+- **Notes:** Used with `SMTP_PASS` for authenticated SMTP.
+
+### SMTP_PASS
+- **Purpose:** SMTP password for sending auth emails.
+- **Example:** `SMTP_PASS=super-secret`
+- **Required in production?:** Optional
+- **Notes:** Used with `SMTP_USER` for authenticated SMTP.
+
+### SMTP_FROM
+- **Purpose:** Sender address for auth emails.
+- **Example:** `SMTP_FROM=no-reply@your-domain.com`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `SMTP_USER` or `no-reply@localhost` when unset.
 
 ### Clarification loop endpoints
 - **Purpose:** `/api/tasks/{task_id}/questions`, `/input`, and `/resume` use the same API key enforcement.

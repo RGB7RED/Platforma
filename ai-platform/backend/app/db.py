@@ -121,10 +121,14 @@ async def init_db(database_url: str) -> None:
                 id UUID PRIMARY KEY,
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
+                email_verified_at TIMESTAMPTZ NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
+        )
+        await conn.execute(
+            "ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;"
         )
         await conn.execute(
             """
@@ -147,6 +151,40 @@ async def init_db(database_url: str) -> None:
             """
             CREATE INDEX IF NOT EXISTS auth_refresh_sessions_user_id_idx
             ON auth_refresh_sessions (user_id);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_verify_tokens (
+                id UUID PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS email_verify_tokens_user_id_idx
+            ON email_verify_tokens (user_id);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id UUID PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS password_reset_tokens_user_id_idx
+            ON password_reset_tokens (user_id);
             """
         )
     logger.info("Database initialized for task persistence")
@@ -1281,7 +1319,7 @@ async def create_auth_user(*, email: str, password_hash: str) -> Dict[str, Any]:
             """
             INSERT INTO auth_users (id, email, password_hash)
             VALUES ($1, $2, $3)
-            RETURNING id, email, password_hash, created_at, updated_at;
+            RETURNING id, email, password_hash, email_verified_at, created_at, updated_at;
             """,
             uuid.uuid4(),
             email,
@@ -1298,7 +1336,7 @@ async def get_auth_user_by_email(email: str) -> Optional[Dict[str, Any]]:
         raise RuntimeError("Database pool is not initialized")
     row = await _pool.fetchrow(
         """
-        SELECT id, email, password_hash, created_at, updated_at
+        SELECT id, email, password_hash, email_verified_at, created_at, updated_at
         FROM auth_users
         WHERE email = $1;
         """,
@@ -1312,11 +1350,44 @@ async def get_auth_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
         raise RuntimeError("Database pool is not initialized")
     row = await _pool.fetchrow(
         """
-        SELECT id, email, password_hash, created_at, updated_at
+        SELECT id, email, password_hash, email_verified_at, created_at, updated_at
         FROM auth_users
         WHERE id = $1;
         """,
         _coerce_user_id(user_id),
+    )
+    return _row_to_dict(row)
+
+
+async def mark_auth_user_email_verified(*, user_id: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    row = await _pool.fetchrow(
+        """
+        UPDATE auth_users
+        SET email_verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, email, password_hash, email_verified_at, created_at, updated_at;
+        """,
+        _coerce_user_id(user_id),
+    )
+    return _row_to_dict(row)
+
+
+async def update_auth_user_password(*, user_id: str, password_hash: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    row = await _pool.fetchrow(
+        """
+        UPDATE auth_users
+        SET password_hash = $2,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, email, password_hash, email_verified_at, created_at, updated_at;
+        """,
+        _coerce_user_id(user_id),
+        password_hash,
     )
     return _row_to_dict(row)
 
@@ -1421,6 +1492,102 @@ async def revoke_refresh_session(*, session_id: str) -> None:
     except Exception:
         _log_db_error("revoke_refresh_session", {"session_id": session_id})
         raise
+
+
+async def create_email_verify_token(
+    *,
+    user_id: str,
+    token_hash: str,
+    expires_at: datetime,
+) -> Dict[str, Any]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    try:
+        row = await _pool.fetchrow(
+            """
+            INSERT INTO email_verify_tokens (id, user_id, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4)
+            RETURNING *;
+            """,
+            uuid.uuid4(),
+            _coerce_user_id(user_id),
+            token_hash,
+            expires_at,
+        )
+    except Exception:
+        _log_db_error("create_email_verify_token", {"user_id": user_id})
+        raise
+    return _row_to_dict(row) or {}
+
+
+async def consume_email_verify_token(token_hash: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT *
+                FROM email_verify_tokens
+                WHERE token_hash = $1;
+                """,
+                token_hash,
+            )
+            if not row:
+                return None
+            await conn.execute(
+                "DELETE FROM email_verify_tokens WHERE id = $1;",
+                row["id"],
+            )
+    return _row_to_dict(row)
+
+
+async def create_password_reset_token(
+    *,
+    user_id: str,
+    token_hash: str,
+    expires_at: datetime,
+) -> Dict[str, Any]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    try:
+        row = await _pool.fetchrow(
+            """
+            INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4)
+            RETURNING *;
+            """,
+            uuid.uuid4(),
+            _coerce_user_id(user_id),
+            token_hash,
+            expires_at,
+        )
+    except Exception:
+        _log_db_error("create_password_reset_token", {"user_id": user_id})
+        raise
+    return _row_to_dict(row) or {}
+
+
+async def consume_password_reset_token(token_hash: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT *
+                FROM password_reset_tokens
+                WHERE token_hash = $1;
+                """,
+                token_hash,
+            )
+            if not row:
+                return None
+            await conn.execute(
+                "DELETE FROM password_reset_tokens WHERE id = $1;",
+                row["id"],
+            )
+    return _row_to_dict(row)
 
 
 async def cleanup_expired_data(ttl_days: int) -> Dict[str, int]:
