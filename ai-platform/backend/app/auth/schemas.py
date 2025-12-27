@@ -18,6 +18,7 @@ class LoginRequest(BaseModel):
 class UserResponse(BaseModel):
     id: str
     email: EmailStr
+    email_verified: bool
 
 
 class TokenResponse(BaseModel):
@@ -40,3 +41,20 @@ class LogoutResponse(BaseModel):
 
 class MeResponse(BaseModel):
     user: UserResponse
+
+
+class EmailRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    password: str = Field(min_length=8)
+
+
+class DetailResponse(BaseModel):
+    detail: str
