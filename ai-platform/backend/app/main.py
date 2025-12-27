@@ -6,7 +6,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Requ
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse, PlainTextResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -1965,28 +1965,19 @@ async def get_runtime_config(request: Request) -> Dict[str, object]:
 
 
 @app.get("/")
-async def root():
+async def root() -> PlainTextResponse:
     """Корневой endpoint для проверки работы"""
-    return {
-        "message": "AI Collaboration Platform API",
-        "version": "1.0.0-mvp",
-        "status": "operational",
-        "endpoints": {
-            "api_docs": "/docs",
-            "health": "/health",
-            "create_task": "/api/tasks (POST)",
-            "get_task": "/api/tasks/{task_id} (GET)"
-        }
-    }
+    return PlainTextResponse("OK")
 
 @app.get("/health")
 async def health_check():
     """Health check для мониторинга"""
     return {
+        "ok": True,
         "status": "healthy",
         "timestamp": asyncio.get_event_loop().time(),
         "active_tasks": len(storage.active_tasks),
-        "active_connections": len(manager.active_connections)
+        "active_connections": len(manager.active_connections),
     }
 
 
@@ -3332,7 +3323,7 @@ if __name__ == "__main__":
     import uvicorn
 
     environment = os.getenv("ENVIRONMENT", "").lower()
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", "8080"))
 
     uvicorn.run(
         "main:app",
