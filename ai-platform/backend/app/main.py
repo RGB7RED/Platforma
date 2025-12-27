@@ -39,12 +39,16 @@ from .schemas import (
     EventItem,
 )
 from . import db
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+from .logging_utils import (
+    configure_logging,
+    get_request_id,
+    reset_request_id,
+    reset_task_id,
+    set_request_id,
+    set_task_id,
 )
+
+configure_logging()
 logger = logging.getLogger(__name__)
 
 # Модели запросов/ответов
@@ -127,11 +131,23 @@ def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
     time_taken_seconds = compute_time_taken_seconds(task_data)
     if time_taken_seconds is not None:
         task_data["time_taken_seconds"] = time_taken_seconds
+    if task_data.get("failure_reason") is None and task_data.get("error"):
+        task_data["failure_reason"] = task_data.get("error")
     return task_data
 
 
 def normalize_payload(payload: Any) -> Any:
     return jsonable_encoder(payload)
+
+
+def build_event_payload(task_id: str, payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    data = normalize_payload(payload or {})
+    if isinstance(data, dict):
+        data.setdefault("task_id", task_id)
+        request_id = get_request_id()
+        if request_id:
+            data.setdefault("request_id", request_id)
+    return data
 
 
 def get_request_api_key(request: Request) -> Optional[str]:
@@ -379,8 +395,9 @@ def store_in_memory_state(task_id: str, state: Dict[str, Any]) -> None:
 
 
 async def record_event(task_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    payload = build_event_payload(task_id, payload)
     if db.is_enabled():
-        await db.append_event(task_id, event_type, normalize_payload(payload or {}))
+        await db.append_event(task_id, event_type, payload)
     else:
         store_in_memory_event(task_id, event_type, payload)
 
@@ -548,6 +565,18 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request_token = set_request_id(request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        reset_request_id(request_token)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 def parse_allowed_origins() -> tuple[list[str], str]:
     raw_origins = os.getenv("ALLOWED_ORIGINS")
     raw_value = raw_origins or ""
@@ -645,6 +674,36 @@ def compute_time_taken_seconds(task_data: Dict[str, Any]) -> Optional[float]:
         return None
     delta = (end - start).total_seconds()
     return max(0.0, delta)
+
+
+def aggregate_llm_usage(summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    totals = {
+        "total_tokens_in": 0,
+        "total_tokens_out": 0,
+        "total_tokens": 0,
+        "by_stage": {},
+        "models": {},
+    }
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        totals["total_tokens_in"] += summary.get("total_tokens_in", 0) or 0
+        totals["total_tokens_out"] += summary.get("total_tokens_out", 0) or 0
+        for stage, values in (summary.get("by_stage") or {}).items():
+            stage_bucket = totals["by_stage"].setdefault(
+                stage,
+                {"tokens_in": 0, "tokens_out": 0, "total_tokens": 0, "models": {}},
+            )
+            stage_bucket["tokens_in"] += values.get("tokens_in", 0) or 0
+            stage_bucket["tokens_out"] += values.get("tokens_out", 0) or 0
+            stage_bucket["total_tokens"] += values.get("total_tokens", 0) or 0
+            for model, count in (values.get("models") or {}).items():
+                stage_bucket["models"][model] = stage_bucket["models"].get(model, 0) + count
+        for model, count in (summary.get("models") or {}).items():
+            totals["models"][model] = totals["models"].get(model, 0) + count
+
+    totals["total_tokens"] = totals["total_tokens_in"] + totals["total_tokens_out"]
+    return totals
 
 
 def sanitize_zip_path(path: str) -> str:
@@ -1110,6 +1169,66 @@ async def health_check():
         "active_connections": len(manager.active_connections)
     }
 
+
+@app.get("/ops/status")
+async def ops_status():
+    """Operational status endpoint for observability."""
+    generated_at = db.now_utc().isoformat()
+    if db.is_enabled():
+        metrics = await db.get_task_status_metrics()
+        states = await db.list_task_states()
+        llm_summaries = []
+        for state_row in states:
+            state = state_row.get("state") or {}
+            if isinstance(state, dict):
+                summary = state.get("llm_usage_summary")
+                if summary:
+                    llm_summaries.append(summary)
+        success = metrics.get("completed", 0) or 0
+        failed = metrics.get("failed", 0) or 0
+        total_terminal = success + failed
+        return {
+            "generated_at": generated_at,
+            "active_tasks": metrics.get("active_tasks", 0) or 0,
+            "average_duration_seconds": metrics.get("avg_duration_seconds"),
+            "success_rate": (success / total_terminal) if total_terminal else None,
+            "fail_rate": (failed / total_terminal) if total_terminal else None,
+            "success_count": success,
+            "fail_count": failed,
+            "llm_usage_totals": aggregate_llm_usage(llm_summaries),
+        }
+
+    tasks = list(storage.active_tasks.values())
+    terminal_statuses = {"completed", "failed", "error"}
+    active_tasks = len([task for task in tasks if task.get("status") not in terminal_statuses])
+    completed = len([task for task in tasks if task.get("status") == "completed"])
+    failed = len([task for task in tasks if task.get("status") in {"failed", "error"}])
+    durations = [
+        compute_time_taken_seconds(task)
+        for task in tasks
+        if task.get("status") in terminal_statuses
+    ]
+    durations = [duration for duration in durations if duration is not None]
+    avg_duration = sum(durations) / len(durations) if durations else None
+    llm_summaries = []
+    for state_row in storage.state.values():
+        state = state_row.get("state") or {}
+        if isinstance(state, dict):
+            summary = state.get("llm_usage_summary")
+            if summary:
+                llm_summaries.append(summary)
+    total_terminal = completed + failed
+    return {
+        "generated_at": generated_at,
+        "active_tasks": active_tasks,
+        "average_duration_seconds": avg_duration,
+        "success_rate": (completed / total_terminal) if total_terminal else None,
+        "fail_rate": (failed / total_terminal) if total_terminal else None,
+        "success_count": completed,
+        "fail_count": failed,
+        "llm_usage_totals": aggregate_llm_usage(llm_summaries),
+    }
+
 @app.post("/api/tasks", response_model=TaskResponse)
 async def create_task(request: TaskRequest, req: Request):
     """Создание новой задачи для обработки ИИ"""
@@ -1117,109 +1236,127 @@ async def create_task(request: TaskRequest, req: Request):
     owner_key_hash = hash_api_key(api_key)
     task_id = str(uuid.uuid4())
     user_id = request.user_id or f"user_{uuid.uuid4().hex[:8]}"
+    request_id = get_request_id()
+    task_token = set_task_id(task_id)
+    try:
+        logger.info("Creating new task task_id=%s user_id=%s", task_id, user_id)
     
-    logger.info("Creating new task task_id=%s user_id=%s", task_id, user_id)
-    
-    client_ip = req.client.host if req.client else None
+        client_ip = req.client.host if req.client else None
 
-    if db.is_enabled():
-        await db.create_task_row(
-            task_id=task_id,
-            user_id=user_id,
-            description=request.description,
-            status="created",
-            progress=0.0,
-            current_stage=None,
-            codex_version=request.codex_version,
-            client_ip=client_ip,
-            owner_key_hash=owner_key_hash,
+        if db.is_enabled():
+            await db.create_task_row(
+                task_id=task_id,
+                user_id=user_id,
+                description=request.description,
+                status="created",
+                progress=0.0,
+                current_stage=None,
+                codex_version=request.codex_version,
+                client_ip=client_ip,
+                owner_key_hash=owner_key_hash,
+            )
+        else:
+            # Сохраняем задачу
+            now = db.now_utc()
+            storage.active_tasks[task_id] = {
+                "id": task_id,
+                "description": request.description,
+                "user_id": user_id,
+                "status": "created",
+                "progress": 0.0,
+                "created_at": now,
+                "updated_at": now,
+                "codex_version": request.codex_version,
+                "client_ip": client_ip,
+                "owner_key_hash": owner_key_hash,
+                "request_id": request_id,
+                "failure_reason": None,
+            }
+            
+            # Сохраняем связь пользователь -> задача
+            if user_id not in storage.user_sessions:
+                storage.user_sessions[user_id] = []
+            storage.user_sessions[user_id].append(task_id)
+
+        await record_event(
+            task_id,
+            "TaskCreated",
+            normalize_payload({"user_id": user_id, "codex_version": request.codex_version}),
         )
-    else:
-        # Сохраняем задачу
-        now = db.now_utc()
-        storage.active_tasks[task_id] = {
-            "id": task_id,
-            "description": request.description,
-            "user_id": user_id,
-            "status": "created",
-            "progress": 0.0,
-            "created_at": now,
-            "updated_at": now,
-            "codex_version": request.codex_version,
-            "client_ip": client_ip,
-            "owner_key_hash": owner_key_hash,
-        }
+        await record_state(
+            task_id,
+            build_container_state(
+                status="created",
+                progress=0.0,
+                current_stage=None,
+                include_created_at=True,
+            ),
+        )
         
-        # Сохраняем связь пользователь -> задача
-        if user_id not in storage.user_sessions:
-            storage.user_sessions[user_id] = []
-        storage.user_sessions[user_id].append(task_id)
-
-    await record_event(
-        task_id,
-        "TaskCreated",
-        normalize_payload({"user_id": user_id, "codex_version": request.codex_version}),
-    )
-    await record_state(
-        task_id,
-        build_container_state(
+        # Запускаем обработку в фоне
+        asyncio.create_task(process_task_background(task_id, request.description, request_id))
+        
+        return TaskResponse(
+            task_id=task_id,
             status="created",
+            message="Task started processing",
             progress=0.0,
-            current_stage=None,
-            include_created_at=True,
-        ),
-    )
-    
-    # Запускаем обработку в фоне
-    asyncio.create_task(process_task_background(task_id, request.description))
-    
-    return TaskResponse(
-        task_id=task_id,
-        status="created",
-        message="Task started processing",
-        progress=0.0,
-        estimated_time=60  # Примерное время в секундах
-    )
+            estimated_time=60  # Примерное время в секундах
+        )
+    finally:
+        reset_task_id(task_token)
 
 @app.get("/api/tasks/{task_id}")
 async def get_task_status(task_id: str, request: Request):
     """Получение статуса задачи"""
-    task_data = await ensure_task_owner(task_id, request)
-    if db.is_enabled():
-        await resolve_container_with_db(task_id)
-    return enrich_task_data(task_id, task_data)
+    task_token = set_task_id(task_id)
+    try:
+        task_data = await ensure_task_owner(task_id, request)
+        if db.is_enabled():
+            await resolve_container_with_db(task_id)
+        return enrich_task_data(task_id, task_data)
+    finally:
+        reset_task_id(task_token)
 
 
 @app.post("/api/tasks/{task_id}/rerun-review")
 async def rerun_review(task_id: str, request: Request):
     """Перезапуск ревью для существующей задачи"""
-    await ensure_task_owner(task_id, request)
-    container = await resolve_container_with_db(task_id)
-    if not container:
-        raise HTTPException(status_code=404, detail="Container not found")
-    review_result = await run_review_for_task(task_id, container)
-    return {
-        "task_id": task_id,
-        "run_id": review_result.get("run_id"),
-        "review_report": review_result,
-    }
+    task_token = set_task_id(task_id)
+    try:
+        await ensure_task_owner(task_id, request)
+        container = await resolve_container_with_db(task_id)
+        if not container:
+            raise HTTPException(status_code=404, detail="Container not found")
+        review_result = await run_review_for_task(task_id, container)
+        return {
+            "task_id": task_id,
+            "run_id": review_result.get("run_id"),
+            "review_report": review_result,
+        }
+    finally:
+        reset_task_id(task_token)
 
 
 @app.get("/api/tasks/{task_id}/events", response_model=EventsResponse)
 async def get_task_events(task_id: str, request: Request, limit: int = 200, order: str = "desc"):
     """Получение событий контейнера"""
-    normalized_order = validate_order(order)
-    await ensure_task_owner(task_id, request)
-    if db.is_enabled():
-        events = await db.get_events(task_id, limit=limit, order=normalized_order)
-    else:
-        ensure_task_exists_in_memory(task_id)
-        events = get_in_memory_events(task_id, limit=limit, order=normalized_order)
-    return {
-        "task_id": task_id,
-        "total": len(events),
-        "events": [normalize_event_item(event) for event in events],
-    }
+    task_token = set_task_id(task_id)
+    try:
+        normalized_order = validate_order(order)
+        await ensure_task_owner(task_id, request)
+        if db.is_enabled():
+            events = await db.get_events(task_id, limit=limit, order=normalized_order)
+        else:
+            ensure_task_exists_in_memory(task_id)
+            events = get_in_memory_events(task_id, limit=limit, order=normalized_order)
+        return {
+            "task_id": task_id,
+            "total": len(events),
+            "events": [normalize_event_item(event) for event in events],
+        }
+    finally:
+        reset_task_id(task_token)
 
 
 @app.get("/api/tasks/{task_id}/artifacts", response_model=ArtifactsResponse)
@@ -1231,43 +1368,53 @@ async def get_task_artifacts(
     order: str = "desc",
 ):
     """Получение артефактов контейнера"""
-    normalized_order = validate_order(order)
-    await ensure_task_owner(task_id, request)
-    if db.is_enabled():
-        artifacts = await db.get_artifacts(task_id, type=type, limit=limit, order=normalized_order)
-    else:
-        ensure_task_exists_in_memory(task_id)
-        artifacts = get_in_memory_artifacts(task_id, type, limit=limit, order=normalized_order)
-    artifacts = dedupe_artifacts(artifacts)
-    return {
-        "task_id": task_id,
-        "total": len(artifacts),
-        "artifacts": [normalize_artifact_item(artifact) for artifact in artifacts],
-    }
+    task_token = set_task_id(task_id)
+    try:
+        normalized_order = validate_order(order)
+        await ensure_task_owner(task_id, request)
+        if db.is_enabled():
+            artifacts = await db.get_artifacts(task_id, type=type, limit=limit, order=normalized_order)
+        else:
+            ensure_task_exists_in_memory(task_id)
+            artifacts = get_in_memory_artifacts(task_id, type, limit=limit, order=normalized_order)
+        artifacts = dedupe_artifacts(artifacts)
+        return {
+            "task_id": task_id,
+            "total": len(artifacts),
+            "artifacts": [normalize_artifact_item(artifact) for artifact in artifacts],
+        }
+    finally:
+        reset_task_id(task_token)
 
 
 @app.get("/api/tasks/{task_id}/state", response_model=ContainerStateResponse)
 async def get_task_state(task_id: str, request: Request):
     """Получение состояния контейнера"""
-    await ensure_task_owner(task_id, request)
-    if db.is_enabled():
-        state_row = await db.get_container_state(task_id)
-    else:
-        ensure_task_exists_in_memory(task_id)
-        state_row = get_in_memory_state(task_id)
-    return {
-        "task_id": task_id,
-        "state": normalize_container_state(state_row["state"]) if state_row else ContainerStateSnapshot(),
-        "updated_at": to_iso_string(state_row["updated_at"]) if state_row else None,
-    }
+    task_token = set_task_id(task_id)
+    try:
+        await ensure_task_owner(task_id, request)
+        if db.is_enabled():
+            state_row = await db.get_container_state(task_id)
+        else:
+            ensure_task_exists_in_memory(task_id)
+            state_row = get_in_memory_state(task_id)
+        return {
+            "task_id": task_id,
+            "state": normalize_container_state(state_row["state"]) if state_row else ContainerStateSnapshot(),
+            "updated_at": to_iso_string(state_row["updated_at"]) if state_row else None,
+        }
+    finally:
+        reset_task_id(task_token)
 
 @app.get("/api/tasks/{task_id}/files")
 async def get_task_files(task_id: str, request: Request):
     """Получение списка файлов задачи"""
-    await ensure_task_owner(task_id, request)
-    container = await resolve_container_with_db(task_id)
-    if not container:
-        raise HTTPException(status_code=404, detail="Container not found")
+    task_token = set_task_id(task_id)
+    try:
+        await ensure_task_owner(task_id, request)
+        container = await resolve_container_with_db(task_id)
+        if not container:
+            raise HTTPException(status_code=404, detail="Container not found")
     
     # Группируем файлы по типам
     files_by_type = {
@@ -1284,19 +1431,23 @@ async def get_task_files(task_id: str, request: Request):
         )]
     }
     
-    return {
-        "total": len(container.files),
-        "by_type": files_by_type,
-        "all_files": list(container.files.keys())
-    }
+        return {
+            "total": len(container.files),
+            "by_type": files_by_type,
+            "all_files": list(container.files.keys())
+        }
+    finally:
+        reset_task_id(task_token)
 
 @app.get("/api/tasks/{task_id}/files/{filepath:path}")
 async def get_file_content(task_id: str, filepath: str, request: Request):
     """Получение содержимого файла"""
-    await ensure_task_owner(task_id, request)
-    container = await resolve_container_with_db(task_id)
-    if not container:
-        raise HTTPException(status_code=404, detail="Container not found")
+    task_token = set_task_id(task_id)
+    try:
+        await ensure_task_owner(task_id, request)
+        container = await resolve_container_with_db(task_id)
+        if not container:
+            raise HTTPException(status_code=404, detail="Container not found")
     
     # Ищем файл (с учетом возможных путей)
     actual_path = None
@@ -1312,25 +1463,35 @@ async def get_file_content(task_id: str, filepath: str, request: Request):
     if isinstance(content, bytes):
         content = content.decode("utf-8", errors="replace")
     
-    return {
-        "path": actual_path,
-        "content": content,
-        "size": len(content),
-        "language": get_language_from_extension(actual_path)
-    }
+        return {
+            "path": actual_path,
+            "content": content,
+            "size": len(content),
+            "language": get_language_from_extension(actual_path)
+        }
+    finally:
+        reset_task_id(task_token)
 
 @app.post("/api/tasks/{task_id}/download")
 async def download_task_files(task_id: str, request: Request):
     """Скачать файлы задачи ZIP архивом"""
-    await ensure_task_owner(task_id, request)
-    return await build_zip_response(task_id, request)
+    task_token = set_task_id(task_id)
+    try:
+        await ensure_task_owner(task_id, request)
+        return await build_zip_response(task_id, request)
+    finally:
+        reset_task_id(task_token)
 
 
 @app.get("/api/tasks/{task_id}/download.zip")
 async def download_task_files_get(task_id: str, request: Request):
     """Скачать файлы задачи ZIP архивом (GET alias)"""
-    await ensure_task_owner(task_id, request)
-    return await build_zip_response(task_id, request)
+    task_token = set_task_id(task_id)
+    try:
+        await ensure_task_owner(task_id, request)
+        return await build_zip_response(task_id, request)
+    finally:
+        reset_task_id(task_token)
 
 @app.get("/api/users/{user_id}/tasks")
 async def get_user_tasks(user_id: str, limit: int = 10):
@@ -1365,36 +1526,43 @@ async def get_user_tasks(user_id: str, limit: int = 10):
 @app.websocket("/ws/{task_id}")
 async def websocket_endpoint(websocket: WebSocket, task_id: str):
     """WebSocket для real-time обновлений прогресса"""
-    access_key = await ensure_websocket_owner(websocket, task_id)
-    if access_key is None:
-        return
-    await manager.connect(websocket, task_id)
-    
+    task_token = set_task_id(task_id)
     try:
-        # Отправляем текущее состояние при подключении
-        if db.is_enabled():
-            task_data = await db.get_task_row(task_id)
-            if task_data:
-                await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
-        elif task_id in storage.active_tasks:
-            await manager.send_progress(task_id, storage.active_tasks[task_id])
+        access_key = await ensure_websocket_owner(websocket, task_id)
+        if access_key is None:
+            return
+        await manager.connect(websocket, task_id)
         
-        # Держим соединение открытым
-        while True:
-            data = await websocket.receive_text()
-            # Можно обрабатывать команды от клиента
-            if data == "ping":
-                await websocket.send_text("pong")
-                
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected for task_id=%s", task_id)
-        manager.disconnect(task_id)
-    except Exception as e:
-        logger.error("WebSocket error for task_id=%s: %s", task_id, e)
-        manager.disconnect(task_id)
+        try:
+            # Отправляем текущее состояние при подключении
+            if db.is_enabled():
+                task_data = await db.get_task_row(task_id)
+                if task_data:
+                    await manager.send_progress(task_id, enrich_task_data(task_id, task_data))
+            elif task_id in storage.active_tasks:
+                await manager.send_progress(task_id, storage.active_tasks[task_id])
+            
+            # Держим соединение открытым
+            while True:
+                data = await websocket.receive_text()
+                # Можно обрабатывать команды от клиента
+                if data == "ping":
+                    await websocket.send_text("pong")
+                    
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected for task_id=%s", task_id)
+            manager.disconnect(task_id)
+        except Exception as e:
+            logger.error("WebSocket error for task_id=%s: %s", task_id, e)
+            manager.disconnect(task_id)
+    finally:
+        reset_task_id(task_token)
 
-async def process_task_background(task_id: str, description: str):
+async def process_task_background(task_id: str, description: str, request_id: Optional[str] = None):
     """Фоновая обработка задачи ИИ-агентами"""
+    request_token = set_request_id(request_id)
+    task_token = set_task_id(task_id)
+    failure_context: Dict[str, Optional[str]] = {"stage": None, "reason": None}
     try:
         logger.info("Starting AI processing for task_id=%s", task_id)
 
@@ -1601,6 +1769,25 @@ async def process_task_background(task_id: str, description: str):
                 "llm_error",
                 normalize_payload(payload),
             )
+
+        async def handle_stage_failed(payload: Dict[str, Any]) -> None:
+            stage = payload.get("stage") if isinstance(payload, dict) else None
+            reason = payload.get("reason") if isinstance(payload, dict) else None
+            error = payload.get("error") if isinstance(payload, dict) else None
+            failure_context["stage"] = stage or failure_context["stage"]
+            failure_context["reason"] = reason or error or failure_context["reason"]
+            await record_event(
+                task_id,
+                "stage_failed",
+                normalize_payload(
+                    {
+                        "stage": stage,
+                        "reason": reason,
+                        "error": error,
+                        "status": "failed",
+                    }
+                ),
+            )
         
         # Обрабатываем задачу
         result = await orchestrator.process_task(
@@ -1615,6 +1802,7 @@ async def process_task_background(task_id: str, description: str):
                 "codex_loaded": handle_codex_loaded,
                 "llm_usage": handle_llm_usage,
                 "llm_error": handle_llm_error,
+                "stage_failed": handle_stage_failed,
             },
         )
 
@@ -1679,6 +1867,21 @@ async def process_task_background(task_id: str, description: str):
         result["progress"] = final_progress
         if result.get("max_iterations") is None:
             result["max_iterations"] = container.metadata.get("max_iterations")
+        failure_reason = result.get("failure_reason") or failure_context.get("reason")
+        if final_status in {"failed", "error"}:
+            if failure_reason:
+                result["failure_reason"] = failure_reason
+            await record_event(
+                task_id,
+                "stage_failed",
+                normalize_payload(
+                    {
+                        "stage": failure_context.get("stage") or final_stage,
+                        "reason": failure_reason,
+                        "status": final_status,
+                    }
+                ),
+            )
         await apply_task_update(
             {
                 "status": final_status,
@@ -1686,6 +1889,8 @@ async def process_task_background(task_id: str, description: str):
                 "current_stage": final_stage,
                 "result": result,
                 "completed_at": completed_at,
+                "error": failure_reason,
+                "failure_reason": failure_reason,
             }
         )
         await record_event(
@@ -1710,10 +1915,23 @@ async def process_task_background(task_id: str, description: str):
         
     except Exception as e:
         logger.error(f"Error processing task {task_id}: {e}")
+        failure_reason = str(e)
+        await record_event(
+            task_id,
+            "stage_failed",
+            normalize_payload(
+                {
+                    "stage": failure_context.get("stage") or "processing",
+                    "reason": failure_reason,
+                    "status": "error",
+                }
+            ),
+        )
         await apply_task_update(
             {
                 "status": "error",
-                "error": str(e),
+                "error": failure_reason,
+                "failure_reason": failure_reason,
                 "progress": 0.0,
                 "current_stage": "failed",
             }
@@ -1721,7 +1939,7 @@ async def process_task_background(task_id: str, description: str):
         await record_event(
             task_id,
             "TaskFailed",
-            normalize_payload({"error": str(e)}),
+            normalize_payload({"error": failure_reason}),
         )
         await record_state(
             task_id,
@@ -1732,6 +1950,9 @@ async def process_task_background(task_id: str, description: str):
                 container=storage.containers.get(task_id),
             ),
         )
+    finally:
+        reset_task_id(task_token)
+        reset_request_id(request_token)
 
 def save_container_to_file(task_id: str, container: Container):
     """Сохраняет контейнер в JSON файл"""
