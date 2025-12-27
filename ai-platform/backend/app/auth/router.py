@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+import secrets
+from typing import Dict, Optional
+from urllib.parse import urlencode, urlparse, urlunparse
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import RedirectResponse
 
-from .email import build_public_link, send_email
+from .email import build_public_link, get_email_settings, send_email
 from .schemas import (
     DetailResponse,
     EmailRequest,
@@ -30,7 +34,7 @@ from .security import (
     hash_refresh_token,
     verify_password,
 )
-from .settings import get_auth_settings
+from .settings import get_auth_settings, get_google_oauth_settings
 from .. import db
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -105,6 +109,55 @@ def _normalize_user(user: Dict[str, object]) -> UserResponse:
     )
 
 
+def _ensure_google_oauth_configured() -> None:
+    settings = get_google_oauth_settings()
+    if not settings.client_id or not settings.client_secret or not settings.redirect_url:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Google OAuth is not configured",
+        )
+
+
+def _google_cookie_settings() -> Dict[str, object]:
+    settings = get_auth_settings()
+    return {
+        "httponly": True,
+        "secure": settings.refresh_cookie_secure,
+        "samesite": "lax",
+        "path": "/auth/google",
+    }
+
+
+def _safe_return_to(return_to: Optional[str], request: Request) -> str:
+    default_path = "/app"
+    if not return_to:
+        return default_path
+    parsed = urlparse(return_to)
+    if not parsed.scheme and not parsed.netloc:
+        return return_to if return_to.startswith("/") else default_path
+
+    allowed_hosts = {request.url.netloc}
+    public_base = get_email_settings().public_base_url
+    if public_base:
+        allowed_hosts.add(urlparse(public_base).netloc)
+    if parsed.netloc in allowed_hosts:
+        return return_to
+    return default_path
+
+
+def _build_oauth_redirect(return_to: str, token: TokenResponse) -> str:
+    parsed = urlparse(return_to)
+    fragment = urlencode(
+        {
+            "access_token": token.access_token,
+            "expires_in": token.expires_in,
+            "token_type": token.token_type,
+        }
+    )
+    updated = parsed._replace(fragment=fragment)
+    return urlunparse(updated)
+
+
 def _access_token_response(user: Dict[str, object]) -> TokenResponse:
     settings = get_auth_settings()
     access_token = create_access_token(user_id=str(user["id"]), email=user["email"])
@@ -114,6 +167,26 @@ def _access_token_response(user: Dict[str, object]) -> TokenResponse:
         expires_in=expires_in,
         user=_normalize_user(user),
     )
+
+
+async def _issue_refresh_session(
+    *,
+    user: Dict[str, object],
+    request: Request,
+    response: Response,
+) -> TokenResponse:
+    refresh_token = generate_refresh_token()
+    refresh_hash = hash_refresh_token(refresh_token)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=get_auth_settings().refresh_ttl_days)
+    await db.create_refresh_session(
+        user_id=str(user["id"]),
+        token_hash=refresh_hash,
+        expires_at=expires_at,
+        user_agent=request.headers.get("User-Agent"),
+        ip_address=request.client.host if request.client else None,
+    )
+    _set_refresh_cookie(response, refresh_token, expires_at)
+    return _access_token_response(user)
 
 
 async def get_current_user(
@@ -141,18 +214,7 @@ async def register(payload: RegisterRequest, request: Request, response: Respons
     password_hash = hash_password(payload.password)
     user = await db.create_auth_user(email=email, password_hash=password_hash)
 
-    refresh_token = generate_refresh_token()
-    refresh_hash = hash_refresh_token(refresh_token)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=get_auth_settings().refresh_ttl_days)
-    await db.create_refresh_session(
-        user_id=str(user["id"]),
-        token_hash=refresh_hash,
-        expires_at=expires_at,
-        user_agent=request.headers.get("User-Agent"),
-        ip_address=request.client.host if request.client else None,
-    )
-    _set_refresh_cookie(response, refresh_token, expires_at)
-    return _access_token_response(user)
+    return await _issue_refresh_session(user=user, request=request, response=response)
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -164,18 +226,7 @@ async def login(payload: LoginRequest, request: Request, response: Response) -> 
     if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-    refresh_token = generate_refresh_token()
-    refresh_hash = hash_refresh_token(refresh_token)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=get_auth_settings().refresh_ttl_days)
-    await db.create_refresh_session(
-        user_id=str(user["id"]),
-        token_hash=refresh_hash,
-        expires_at=expires_at,
-        user_agent=request.headers.get("User-Agent"),
-        ip_address=request.client.host if request.client else None,
-    )
-    _set_refresh_cookie(response, refresh_token, expires_at)
-    return _access_token_response(user)
+    return await _issue_refresh_session(user=user, request=request, response=response)
 
 
 @router.post("/refresh", response_model=RefreshResponse)
@@ -240,6 +291,158 @@ async def logout(request: Request, response: Response) -> LogoutResponse:
 async def me(user: Dict[str, object] = Depends(get_current_user)) -> MeResponse:
     _ensure_auth_enabled()
     return MeResponse(user=_normalize_user(user))
+
+
+@router.get("/google/login")
+async def google_login(request: Request, return_to: Optional[str] = None) -> RedirectResponse:
+    _ensure_auth_enabled()
+    _ensure_db_ready()
+    _ensure_google_oauth_configured()
+    settings = get_google_oauth_settings()
+    state = secrets.token_urlsafe(32)
+    safe_return_to = _safe_return_to(return_to, request)
+    params = {
+        "client_id": settings.client_id,
+        "redirect_uri": settings.redirect_url,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "access_type": "online",
+        "prompt": "select_account",
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    response = RedirectResponse(url=auth_url)
+    cookie = _google_cookie_settings()
+    response.set_cookie(
+        key="google_oauth_state",
+        value=state,
+        max_age=300,
+        httponly=cookie["httponly"],
+        secure=cookie["secure"],
+        samesite=cookie["samesite"],
+        path=cookie["path"],
+    )
+    response.set_cookie(
+        key="google_oauth_return_to",
+        value=safe_return_to,
+        max_age=300,
+        httponly=cookie["httponly"],
+        secure=cookie["secure"],
+        samesite=cookie["samesite"],
+        path=cookie["path"],
+    )
+    return response
+
+
+@router.get("/google/callback")
+async def google_callback(
+    request: Request,
+    response: Response,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+) -> Response:
+    _ensure_auth_enabled()
+    _ensure_db_ready()
+    _ensure_google_oauth_configured()
+    if not code:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing authorization code")
+    cookie_state = request.cookies.get("google_oauth_state")
+    if not state or not cookie_state or state != cookie_state:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth state")
+
+    settings = get_google_oauth_settings()
+    token_payload = {
+        "client_id": settings.client_id,
+        "client_secret": settings.client_secret,
+        "code": code,
+        "redirect_uri": settings.redirect_url,
+        "grant_type": "authorization_code",
+    }
+
+    try:
+        timeout = httpx.Timeout(10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            token_response = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data=token_payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            token_response.raise_for_status()
+            token_data = token_response.json()
+            access_token = token_data.get("access_token")
+            if not access_token:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Google OAuth token response missing access token",
+                )
+            userinfo_response = await client.get(
+                "https://openidconnect.googleapis.com/v1/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            userinfo_response.raise_for_status()
+            profile = userinfo_response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Failed to authenticate with Google",
+        ) from exc
+
+    email = profile.get("email")
+    email_verified = profile.get("email_verified")
+    provider_account_id = profile.get("sub")
+    if not email or not provider_account_id or not email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Google account email is not verified",
+        )
+
+    oauth_account = await db.get_oauth_account(
+        provider="google",
+        provider_account_id=provider_account_id,
+    )
+    user = None
+    if oauth_account:
+        user = await db.get_auth_user_by_id(str(oauth_account["user_id"]))
+
+    if not user:
+        normalized_email = email.strip().lower()
+        user = await db.get_auth_user_by_email(normalized_email)
+        if not user:
+            random_password = secrets.token_urlsafe(32)
+            password_hash = hash_password(random_password)
+            user = await db.create_auth_user(email=normalized_email, password_hash=password_hash)
+        if user.get("email_verified_at") is None:
+            verified_user = await db.mark_auth_user_email_verified(user_id=str(user["id"]))
+            if verified_user:
+                user = verified_user
+
+    await db.upsert_oauth_account(
+        provider="google",
+        provider_account_id=provider_account_id,
+        user_id=str(user["id"]),
+        email=email,
+    )
+
+    cookie = _google_cookie_settings()
+    return_to_cookie = request.cookies.get("google_oauth_return_to")
+    safe_return_to = _safe_return_to(return_to_cookie, request) if return_to_cookie else None
+    if safe_return_to:
+        redirect_response = RedirectResponse(url=safe_return_to)
+        token_response = await _issue_refresh_session(
+            user=user,
+            request=request,
+            response=redirect_response,
+        )
+        redirect_url = _build_oauth_redirect(safe_return_to, token_response)
+        redirect_response.headers["Location"] = redirect_url
+        redirect_response.delete_cookie(key="google_oauth_state", path=cookie["path"])
+        redirect_response.delete_cookie(key="google_oauth_return_to", path=cookie["path"])
+        return redirect_response
+
+    token_response = await _issue_refresh_session(user=user, request=request, response=response)
+    response.delete_cookie(key="google_oauth_state", path=cookie["path"])
+    response.delete_cookie(key="google_oauth_return_to", path=cookie["path"])
+    return token_response
 
 
 @router.post("/request-email-verify", response_model=DetailResponse)

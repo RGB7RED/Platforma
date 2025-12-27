@@ -187,6 +187,27 @@ async def init_db(database_url: str) -> None:
             ON password_reset_tokens (user_id);
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_oauth_accounts (
+                id UUID PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+                provider TEXT NOT NULL,
+                provider_account_id TEXT NOT NULL,
+                email TEXT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (provider, provider_account_id),
+                UNIQUE (user_id, provider)
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS auth_oauth_accounts_user_id_idx
+            ON auth_oauth_accounts (user_id);
+            """
+        )
     logger.info("Database initialized for task persistence")
 
 
@@ -1390,6 +1411,58 @@ async def update_auth_user_password(*, user_id: str, password_hash: str) -> Opti
         password_hash,
     )
     return _row_to_dict(row)
+
+
+async def get_oauth_account(
+    *, provider: str, provider_account_id: str
+) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    row = await _pool.fetchrow(
+        """
+        SELECT id, user_id, provider, provider_account_id, email, created_at, updated_at
+        FROM auth_oauth_accounts
+        WHERE provider = $1 AND provider_account_id = $2;
+        """,
+        provider,
+        provider_account_id,
+    )
+    return _row_to_dict(row)
+
+
+async def upsert_oauth_account(
+    *,
+    provider: str,
+    provider_account_id: str,
+    user_id: str,
+    email: Optional[str],
+) -> Dict[str, Any]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    row = await _pool.fetchrow(
+        """
+        INSERT INTO auth_oauth_accounts (
+            id,
+            user_id,
+            provider,
+            provider_account_id,
+            email
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (provider, provider_account_id)
+        DO UPDATE SET
+            user_id = EXCLUDED.user_id,
+            email = EXCLUDED.email,
+            updated_at = NOW()
+        RETURNING id, user_id, provider, provider_account_id, email, created_at, updated_at;
+        """,
+        uuid.uuid4(),
+        _coerce_user_id(user_id),
+        provider,
+        provider_account_id,
+        email,
+    )
+    return _row_to_dict(row) or {}
 
 
 async def create_refresh_session(
