@@ -111,6 +111,20 @@
                     </div>
                 </div>
 
+                <div class="task-lookup">
+                    <div class="task-lookup-field">
+                        <label for="taskIdInput">Load Task</label>
+                        <div class="task-lookup-actions">
+                            <input type="text" id="taskIdInput" class="task-id-input" placeholder="Paste task_id">
+                            <button class="secondary-btn" id="loadTaskBtn">Load</button>
+                            <button class="secondary-btn" id="copyTaskIdBtn">Copy task_id</button>
+                        </div>
+                    </div>
+                    <div class="task-lookup-hint">
+                        Paste an existing task_id to inspect state, events, and artifacts.
+                    </div>
+                </div>
+
                 <!-- Progress Visualization -->
                 <div class="progress-visualization">
                     <div class="progress-bar-container">
@@ -150,6 +164,36 @@
                         <strong>API:</strong> <span id="apiBaseUrl">-</span>
                     </div>
                     <div class="status-row error-message hidden" id="taskError"></div>
+                </div>
+
+                <div class="container-inspector">
+                    <div class="inspector-header">
+                        <h3>Container Inspector</h3>
+                        <div class="inspector-tabs" id="inspectorTabs">
+                            <button class="tab-btn active" data-tab="state">State (Текущее состояние)</button>
+                            <button class="tab-btn" data-tab="events">Events (История / события)</button>
+                            <button class="tab-btn" data-tab="artifacts">Artifacts (Артефакты)</button>
+                        </div>
+                    </div>
+                    <div class="inspector-panels">
+                        <div class="inspector-panel" id="statePanel">
+                            <div class="panel-error hidden" id="stateError"></div>
+                            <div class="state-table" id="stateTable"></div>
+                        </div>
+                        <div class="inspector-panel hidden" id="eventsPanel">
+                            <div class="panel-error hidden" id="eventsError"></div>
+                            <div class="events-list" id="eventsList"></div>
+                        </div>
+                        <div class="inspector-panel hidden" id="artifactsPanel">
+                            <div class="artifacts-controls">
+                                <label for="artifactTypeInput">Artifact type</label>
+                                <input type="text" id="artifactTypeInput" class="artifact-type-input" placeholder="Filter by type">
+                                <button class="secondary-btn" id="artifactFilterBtn">Apply</button>
+                            </div>
+                            <div class="panel-error hidden" id="artifactsError"></div>
+                            <div class="artifacts-list" id="artifactsList"></div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Real-time Updates -->
