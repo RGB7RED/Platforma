@@ -39,6 +39,7 @@ async def init_db(database_url: str) -> None:
             CREATE TABLE IF NOT EXISTS tasks (
                 id UUID PRIMARY KEY,
                 user_id TEXT NOT NULL,
+                owner_user_id TEXT NULL,
                 description TEXT NOT NULL,
                 status TEXT NOT NULL,
                 progress DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -63,6 +64,9 @@ async def init_db(database_url: str) -> None:
         )
         await conn.execute(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS owner_key_hash TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS owner_user_id TEXT;"
         )
         await conn.execute(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS failure_reason TEXT;"
@@ -339,6 +343,7 @@ async def create_task_row(
     *,
     task_id: str,
     user_id: str,
+    owner_user_id: Optional[str],
     description: str,
     status: str,
     progress: float,
@@ -358,6 +363,7 @@ async def create_task_row(
             INSERT INTO tasks (
                 id,
                 user_id,
+                owner_user_id,
                 description,
                 status,
                 progress,
@@ -368,11 +374,12 @@ async def create_task_row(
                 client_ip,
                 owner_key_hash
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING *;
             """,
             _coerce_task_id(task_id),
             user_id,
+            owner_user_id,
             description,
             status,
             progress,
@@ -816,20 +823,77 @@ async def get_task_row(task_id: str) -> Optional[Dict[str, Any]]:
     return data
 
 
-async def list_tasks_for_user(user_id: str, limit: int) -> List[Dict[str, Any]]:
+async def list_tasks_for_owner_user(
+    owner_user_id: str,
+    owner_key_hash: Optional[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
     if _pool is None:
         raise RuntimeError("Database pool is not initialized")
 
-    rows = await _pool.fetch(
-        """
-        SELECT * FROM tasks
-        WHERE user_id = $1
-        ORDER BY created_at DESC
-        LIMIT $2;
-        """,
-        user_id,
-        limit,
-    )
+    if owner_key_hash:
+        rows = await _pool.fetch(
+            """
+            SELECT * FROM tasks
+            WHERE owner_user_id = $1
+               OR (owner_user_id IS NULL AND owner_key_hash = $2)
+            ORDER BY created_at DESC
+            LIMIT $3;
+            """,
+            owner_user_id,
+            owner_key_hash,
+            limit,
+        )
+    else:
+        rows = await _pool.fetch(
+            """
+            SELECT * FROM tasks
+            WHERE owner_user_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2;
+            """,
+            owner_user_id,
+            limit,
+        )
+    tasks = [dict(row) for row in rows]
+    for task in tasks:
+        task["result"] = _coerce_json_value(task.get("result"))
+        task["container_state"] = _coerce_json_value(task.get("container_state"))
+    return tasks
+
+
+async def list_tasks_for_owner_key(
+    owner_key_hash: str,
+    limit: int,
+    *,
+    user_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+
+    if user_id:
+        rows = await _pool.fetch(
+            """
+            SELECT * FROM tasks
+            WHERE owner_key_hash = $1 AND user_id = $2
+            ORDER BY created_at DESC
+            LIMIT $3;
+            """,
+            owner_key_hash,
+            user_id,
+            limit,
+        )
+    else:
+        rows = await _pool.fetch(
+            """
+            SELECT * FROM tasks
+            WHERE owner_key_hash = $1
+            ORDER BY created_at DESC
+            LIMIT $2;
+            """,
+            owner_key_hash,
+            limit,
+        )
     tasks = [dict(row) for row in rows]
     for task in tasks:
         task["result"] = _coerce_json_value(task.get("result"))

@@ -37,7 +37,12 @@
     }
   };
 
-  const appendApiKeyQuery = (url) => {
+  const appendAuthQuery = (url) => {
+    const accessToken = getStoredAccessToken();
+    if (accessToken) {
+      const separator = url.includes('?') ? '&' : '?';
+      return `${url}${separator}access_token=${encodeURIComponent(accessToken)}`;
+    }
     const apiKey = getStoredApiKey();
     if (!apiKey) {
       return url;
@@ -51,6 +56,7 @@
   const POLL_TIMEOUT_MS = 3 * 60 * 1000;
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'error']);
   const API_KEY_STORAGE_KEY = 'aiPlatformApiKey';
+  const ACCESS_TOKEN_STORAGE_KEY = 'aiPlatformAccessToken';
 
   const elements = {
     welcomeScreen: document.getElementById('welcomeScreen'),
@@ -79,6 +85,8 @@
     apiBaseUrl: document.getElementById('apiBaseUrl'),
     apiKeyInput: document.getElementById('apiKeyInput'),
     saveApiKeyBtn: document.getElementById('saveApiKeyBtn'),
+    accessTokenInput: document.getElementById('accessTokenInput'),
+    saveAccessTokenBtn: document.getElementById('saveAccessTokenBtn'),
     taskError: document.getElementById('taskError'),
     clarificationPanel: document.getElementById('clarificationPanel'),
     clarificationMessage: document.getElementById('clarificationMessage'),
@@ -232,11 +240,35 @@
     updateApiKeyInputs(normalized);
   };
 
+  const getStoredAccessToken = () => {
+    const value = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY);
+    return typeof value === 'string' ? value.trim() : '';
+  };
+
+  const setStoredAccessToken = (value) => {
+    const normalized = value.trim();
+    if (!normalized) {
+      window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY);
+      updateAccessTokenInputs('');
+      return;
+    }
+    window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, normalized);
+    updateAccessTokenInputs(normalized);
+  };
+
   const updateApiKeyInputs = (value) => {
     if (elements.apiKeyInput) {
       elements.apiKeyInput.value = value || '';
     }
   };
+
+  const updateAccessTokenInputs = (value) => {
+    if (elements.accessTokenInput) {
+      elements.accessTokenInput.value = value || '';
+    }
+  };
+
+  const hasAuthCredentials = () => Boolean(getStoredAccessToken() || getStoredApiKey());
 
   const setTemplateOptions = (templates) => {
     if (!elements.templateSelect) {
@@ -281,6 +313,11 @@
 
   const buildAuthHeaders = (extraHeaders = {}) => {
     const headers = { ...extraHeaders };
+    const accessToken = getStoredAccessToken();
+    if (accessToken) {
+      headers.Authorization = `Bearer ${accessToken}`;
+      return headers;
+    }
     const apiKey = getStoredApiKey();
     if (apiKey) {
       headers['X-API-Key'] = apiKey;
@@ -576,6 +613,21 @@
     loadTemplates();
   };
 
+  const saveAccessToken = () => {
+    if (!elements.accessTokenInput) {
+      return;
+    }
+    const value = elements.accessTokenInput.value || '';
+    if (!value.trim()) {
+      setStoredAccessToken('');
+      showToast('Access token cleared.', 'ℹ️');
+      return;
+    }
+    setStoredAccessToken(value);
+    showToast('Access token saved.', '✅');
+    loadTemplates();
+  };
+
   const formatProgress = (progress) => {
     if (typeof progress !== 'number' || Number.isNaN(progress)) {
       return { value: 0, percent: 0 };
@@ -723,7 +775,7 @@
       });
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
-          ? 'Invalid API Key or no access to this task.'
+          ? 'Invalid credentials or no access to this task.'
           : response.status === 501
             ? 'DB not enabled on backend'
             : response.status === 404
@@ -1385,10 +1437,10 @@
 
   const startWebSocket = (taskId) => {
     closeWebSocket();
-    if (!getStoredApiKey()) {
+    if (!getStoredAccessToken() && !getStoredApiKey()) {
       return;
     }
-    const wsUrl = appendApiKeyQuery(buildWebSocketUrl(taskId));
+    const wsUrl = appendAuthQuery(buildWebSocketUrl(taskId));
     try {
       activeSocket = new WebSocket(wsUrl);
     } catch (error) {
@@ -1434,7 +1486,7 @@
       });
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
-          ? 'Invalid API Key or no access to this task.'
+          ? 'Invalid credentials or no access to this task.'
           : response.status === 400
             ? 'Please answer all required questions before resuming.'
             : `Request failed (${response.status})`;
@@ -1456,7 +1508,7 @@
       });
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
-          ? 'Invalid API Key or no access to this task.'
+          ? 'Invalid credentials or no access to this task.'
           : response.status === 400
             ? 'Please answer all required questions before resuming.'
             : `Request failed (${response.status})`;
@@ -1511,8 +1563,8 @@
       showToast('Please enter a task description.', '⚠️');
       return;
     }
-    if (!getStoredApiKey()) {
-      showToast('Please save your API key before creating a task.', '⚠️');
+    if (!hasAuthCredentials()) {
+      showToast('Please save your access token or API key before creating a task.', '⚠️');
       return;
     }
 
@@ -1544,7 +1596,7 @@
 
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
-          ? 'Invalid API Key or no access to this task.'
+          ? 'Invalid credentials or no access to this task.'
           : `Request failed (${response.status})`;
         throw new Error(message);
       }
@@ -1593,8 +1645,8 @@
       showToast('No active task to update.', 'ℹ️');
       return;
     }
-    if (!getStoredApiKey()) {
-      showToast('Please save your API key before submitting answers.', '⚠️');
+    if (!hasAuthCredentials()) {
+      showToast('Please save your access token or API key before submitting answers.', '⚠️');
       return;
     }
     const answers = collectClarificationAnswers();
@@ -1614,8 +1666,8 @@
       showToast('No active task to resume.', 'ℹ️');
       return;
     }
-    if (!getStoredApiKey()) {
-      showToast('Please save your API key before resuming.', '⚠️');
+    if (!hasAuthCredentials()) {
+      showToast('Please save your access token or API key before resuming.', '⚠️');
       return;
     }
     const answers = collectClarificationAnswers();
@@ -1643,8 +1695,8 @@
       showToast('No active task to review.', 'ℹ️');
       return;
     }
-    if (!getStoredApiKey()) {
-      showToast('Please save your API key before rerunning review.', '⚠️');
+    if (!hasAuthCredentials()) {
+      showToast('Please save your access token or API key before rerunning review.', '⚠️');
       return;
     }
     if (elements.rerunReviewBtn) {
@@ -1660,7 +1712,7 @@
       });
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
-          ? 'Invalid API Key or no access to this task.'
+          ? 'Invalid credentials or no access to this task.'
           : response.status === 404
             ? 'Task or container not found'
             : `Review rerun failed (${response.status})`;
@@ -1689,8 +1741,8 @@
       showToast('Please enter a task_id to load.', '⚠️');
       return;
     }
-    if (!getStoredApiKey()) {
-      showToast('Please save your API key before loading a task.', '⚠️');
+    if (!hasAuthCredentials()) {
+      showToast('Please save your access token or API key before loading a task.', '⚠️');
       return;
     }
     resetResultPanel();
@@ -1766,12 +1818,23 @@
   if (elements.saveApiKeyBtn) {
     elements.saveApiKeyBtn.addEventListener('click', saveApiKey);
   }
+  if (elements.saveAccessTokenBtn) {
+    elements.saveAccessTokenBtn.addEventListener('click', saveAccessToken);
+  }
 
   if (elements.apiKeyInput) {
     elements.apiKeyInput.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
         event.preventDefault();
         saveApiKey();
+      }
+    });
+  }
+  if (elements.accessTokenInput) {
+    elements.accessTokenInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        saveAccessToken();
       }
     });
   }
@@ -1865,9 +1928,8 @@
   }
 
   const downloadZip = async (taskId) => {
-    const apiKey = getStoredApiKey();
-    if (!apiKey) {
-      showToast('Please save your API key before downloading.', '⚠️');
+    if (!hasAuthCredentials()) {
+      showToast('Please save your access token or API key before downloading.', '⚠️');
       return;
     }
     const downloadUrl = buildApiUrl(`/api/tasks/${taskId}/download.zip`);
@@ -1877,7 +1939,7 @@
       });
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
-          ? 'Invalid API Key or no access to this task.'
+          ? 'Invalid credentials or no access to this task.'
           : `Download failed (${response.status})`;
         showToast(message, '⚠️');
         return;
@@ -1897,9 +1959,8 @@
   };
 
   const downloadGitExport = async (taskId) => {
-    const apiKey = getStoredApiKey();
-    if (!apiKey) {
-      showToast('Please save your API key before downloading.', '⚠️');
+    if (!hasAuthCredentials()) {
+      showToast('Please save your access token or API key before downloading.', '⚠️');
       return;
     }
     const downloadUrl = buildApiUrl(`/api/tasks/${taskId}/git-export.zip`);
@@ -1909,7 +1970,7 @@
       });
       if (!response.ok) {
         const message = response.status === 401 || response.status === 403
-          ? 'Invalid API Key or no access to this task.'
+          ? 'Invalid credentials or no access to this task.'
           : `Download failed (${response.status})`;
         showToast(message, '⚠️');
         return;
@@ -1965,6 +2026,7 @@
   updateCharCount();
   updateApiBaseUrl();
   updateApiKeyInputs(getStoredApiKey());
+  updateAccessTokenInputs(getStoredAccessToken());
   loadTemplates();
   setActiveInspectorTab(activeInspectorTab);
   updateTimeTakenDisplay({});

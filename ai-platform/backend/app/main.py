@@ -230,9 +230,26 @@ async def get_auth_context(request: Request) -> AuthContext:
     )
 
 
+def task_access_allowed(
+    task_data: Dict[str, Any],
+    *,
+    principal: str,
+    owner_key_hash: str,
+    owner_user_id: Optional[str],
+) -> bool:
+    task_owner_user_id = task_data.get("owner_user_id")
+    task_owner_key_hash = task_data.get("owner_key_hash")
+    if principal == "user":
+        if task_owner_user_id:
+            return str(task_owner_user_id) == str(owner_user_id)
+        return bool(task_owner_key_hash) and task_owner_key_hash == owner_key_hash
+    if task_owner_user_id:
+        return False
+    return bool(task_owner_key_hash) and task_owner_key_hash == owner_key_hash
+
+
 async def ensure_task_owner(task_id: str, request: Request) -> Dict[str, Any]:
     auth_context = await get_auth_context(request)
-    api_key_hash = auth_context.owner_key_hash
     if db.is_enabled():
         task_data = await db.get_task_row(task_id)
         if task_data is None:
@@ -241,9 +258,14 @@ async def ensure_task_owner(task_id: str, request: Request) -> Dict[str, Any]:
         task_data = storage.active_tasks.get(task_id)
         if task_data is None:
             raise HTTPException(status_code=404, detail="Task not found")
-    owner_hash = task_data.get("owner_key_hash")
-    if not owner_hash or owner_hash != api_key_hash:
-        raise HTTPException(status_code=403, detail="Invalid API Key or no access to this task.")
+    owner_user_id = str(auth_context.user["id"]) if auth_context.user else None
+    if not task_access_allowed(
+        task_data,
+        principal=auth_context.principal,
+        owner_key_hash=auth_context.owner_key_hash,
+        owner_user_id=owner_user_id,
+    ):
+        raise HTTPException(status_code=403, detail="Invalid credentials or no access to this task.")
     return task_data
 
 
@@ -265,6 +287,8 @@ def get_websocket_access_token(websocket: WebSocket) -> Optional[str]:
 async def ensure_websocket_owner(websocket: WebSocket, task_id: str) -> Optional[str]:
     settings = get_auth_settings()
     api_key_hash: Optional[str] = None
+    principal = "apikey"
+    owner_user_id: Optional[str] = None
     if settings.mode in {"auth", "hybrid"}:
         token = get_websocket_access_token(websocket)
         if token:
@@ -277,6 +301,8 @@ async def ensure_websocket_owner(websocket: WebSocket, task_id: str) -> Optional
                 await websocket.close(code=4401, reason="Invalid access token")
                 return None
             api_key_hash = hash_api_key(str(user["id"]))
+            principal = "user"
+            owner_user_id = str(user["id"])
         elif settings.mode == "auth":
             await websocket.accept()
             await websocket.close(code=4401, reason="Access token required")
@@ -305,8 +331,12 @@ async def ensure_websocket_owner(websocket: WebSocket, task_id: str) -> Optional
             await websocket.accept()
             await websocket.close(code=4404, reason="Task not found")
             return None
-    owner_hash = task_data.get("owner_key_hash")
-    if not owner_hash or owner_hash != api_key_hash:
+    if api_key_hash is None or not task_access_allowed(
+        task_data,
+        principal=principal,
+        owner_key_hash=api_key_hash,
+        owner_user_id=owner_user_id,
+    ):
         await websocket.accept()
         await websocket.close(code=4403, reason="Forbidden")
         return None
@@ -2036,6 +2066,7 @@ async def create_task(request: TaskRequest, req: Request):
     owner_key_hash = auth_context.owner_key_hash
     await enforce_rate_limit(owner_key_hash, "create_task", RATE_LIMIT_CREATE_TASKS_PER_MIN)
     task_id = str(uuid.uuid4())
+    owner_user_id = str(auth_context.user["id"]) if auth_context.user else None
     if auth_context.user:
         user_id = str(auth_context.user["id"])
     else:
@@ -2058,6 +2089,7 @@ async def create_task(request: TaskRequest, req: Request):
             await db.create_task_row(
                 task_id=task_id,
                 user_id=user_id,
+                owner_user_id=owner_user_id,
                 description=request.description,
                 status="queued",
                 progress=0.0,
@@ -2084,6 +2116,7 @@ async def create_task(request: TaskRequest, req: Request):
                 "template_hash": template_hash,
                 "client_ip": client_ip,
                 "owner_key_hash": owner_key_hash,
+                "owner_user_id": owner_user_id,
                 "request_id": request_id,
                 "failure_reason": None,
                 "pending_questions": [],
@@ -2488,10 +2521,42 @@ async def download_git_export(task_id: str, request: Request):
         reset_task_id(task_token)
 
 @app.get("/api/users/{user_id}/tasks")
-async def get_user_tasks(user_id: str, limit: int = 10):
+async def get_user_tasks(user_id: str, request: Request, limit: int = 10):
     """Получение задач пользователя"""
+    auth_context = await get_auth_context(request)
+    owner_key_hash = auth_context.owner_key_hash
+    if auth_context.user:
+        owner_user_id = str(auth_context.user["id"])
+        if user_id != owner_user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        if db.is_enabled():
+            tasks = await db.list_tasks_for_owner_user(owner_user_id, owner_key_hash, limit)
+            tasks = [enrich_task_data(str(task["id"]), task) for task in tasks]
+            return {
+                "user_id": user_id,
+                "tasks": tasks,
+                "total": len(tasks),
+                "limit": limit,
+            }
+        tasks = [
+            task
+            for task in storage.active_tasks.values()
+            if task.get("owner_user_id") == owner_user_id
+            or (
+                not task.get("owner_user_id")
+                and task.get("owner_key_hash") == owner_key_hash
+            )
+        ]
+        tasks = tasks[-limit:]
+        return {
+            "user_id": user_id,
+            "tasks": tasks,
+            "total": len(tasks),
+            "limit": limit,
+        }
+
     if db.is_enabled():
-        tasks = await db.list_tasks_for_user(user_id, limit)
+        tasks = await db.list_tasks_for_owner_key(owner_key_hash, limit, user_id=user_id)
         tasks = [enrich_task_data(str(task["id"]), task) for task in tasks]
         return {
             "user_id": user_id,
@@ -2502,19 +2567,21 @@ async def get_user_tasks(user_id: str, limit: int = 10):
 
     if user_id not in storage.user_sessions:
         return {"tasks": [], "total": 0}
-    
+
     task_ids = storage.user_sessions[user_id][-limit:]  # Последние N задач
-    tasks = []
-    
-    for task_id in task_ids:
-        if task_id in storage.active_tasks:
-            tasks.append(storage.active_tasks[task_id])
-    
+    tasks = [
+        storage.active_tasks[task_id]
+        for task_id in task_ids
+        if task_id in storage.active_tasks
+        and storage.active_tasks[task_id].get("owner_key_hash") == owner_key_hash
+        and not storage.active_tasks[task_id].get("owner_user_id")
+    ]
+
     return {
         "user_id": user_id,
         "tasks": tasks,
         "total": len(tasks),
-        "limit": limit
+        "limit": limit,
     }
 
 @app.websocket("/ws/{task_id}")
@@ -2580,6 +2647,7 @@ async def process_task_background(
         if not task_data:
             raise RuntimeError(f"Task {task_id} not found")
         owner_key_hash = task_data.get("owner_key_hash") or await get_task_owner_hash(task_id)
+        owner_user_id = task_data.get("owner_user_id")
         template_info: Optional[TemplateInfo] = None
         if template_id:
             template_info = resolve_template(template_id)
@@ -2675,6 +2743,8 @@ async def process_task_background(
         workspace.materialize(container)
         container.metadata["workspace_path"] = str(workspace.path)
         container.metadata["owner_key_hash"] = owner_key_hash
+        if owner_user_id:
+            container.metadata["owner_user_id"] = owner_user_id
         container.file_update_hook = workspace.write_file
         command_runner = build_command_runner(task_id, workspace.path, owner_key_hash)
         await persist_container_snapshot(task_id, container)
