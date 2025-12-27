@@ -51,6 +51,8 @@
     artifactFilterBtn: document.getElementById('artifactFilterBtn'),
     resultJson: document.getElementById('resultJson'),
     resultStatus: document.getElementById('resultStatus'),
+    filesCount: document.getElementById('filesCount'),
+    artifactsCount: document.getElementById('artifactsCount'),
     loadingOverlay: document.getElementById('loadingOverlay'),
     loadingMessage: document.getElementById('loadingMessage'),
     loadingSubtext: document.getElementById('loadingSubtext'),
@@ -65,12 +67,15 @@
     status: null,
     state: null,
     events: null,
-    artifacts: null
+    artifacts: null,
+    files: null
   };
   let lastEventSignature = '';
   let lastArtifactSignature = '';
   let artifactTypeFilter = '';
   let activeInspectorTab = 'state';
+  let latestFilesTotal = null;
+  let latestArtifactsTotal = null;
 
   const sections = [
     elements.welcomeScreen,
@@ -86,6 +91,17 @@
         return;
       }
       item.classList.toggle('hidden', item !== section);
+    });
+  };
+
+  const showResultsWithInspector = () => {
+    sections.forEach((item) => {
+      if (!item) {
+        return;
+      }
+      const shouldShow =
+        item === elements.taskProgress || item === elements.taskResults;
+      item.classList.toggle('hidden', !shouldShow);
     });
   };
 
@@ -155,6 +171,53 @@
     element.classList.toggle('hidden', !message);
   };
 
+  const renderCount = (element, value) => {
+    if (!element) {
+      return;
+    }
+    const resolved = typeof value === 'number' && !Number.isNaN(value) ? value : 0;
+    element.textContent = String(resolved);
+  };
+
+  const parseTotalCount = (data) => {
+    if (!data) {
+      return null;
+    }
+    if (typeof data.total === 'number') {
+      return data.total;
+    }
+    if (typeof data.count === 'number') {
+      return data.count;
+    }
+    if (Array.isArray(data)) {
+      return data.length;
+    }
+    if (Array.isArray(data.items)) {
+      return data.items.length;
+    }
+    if (Array.isArray(data.files)) {
+      return data.files.length;
+    }
+    if (Array.isArray(data.artifacts)) {
+      return data.artifacts.length;
+    }
+    return null;
+  };
+
+  const updateSummaryCounts = ({
+    filesTotal = latestFilesTotal,
+    artifactsTotal = latestArtifactsTotal,
+    fallbackFiles,
+    fallbackArtifacts
+  } = {}) => {
+    const resolvedFiles =
+      typeof filesTotal === 'number' ? filesTotal : fallbackFiles ?? 0;
+    const resolvedArtifacts =
+      typeof artifactsTotal === 'number' ? artifactsTotal : fallbackArtifacts ?? 0;
+    renderCount(elements.filesCount, resolvedFiles);
+    renderCount(elements.artifactsCount, resolvedArtifacts);
+  };
+
   const formatProgress = (progress) => {
     if (typeof progress !== 'number' || Number.isNaN(progress)) {
       return { value: 0, percent: 0 };
@@ -188,6 +251,11 @@
     if (elements.resultJson && data.result !== undefined && data.result !== null) {
       elements.resultJson.textContent = JSON.stringify(data.result, null, 2);
     }
+    updateSummaryCounts({
+      fallbackFiles: typeof data.files_count === 'number' ? data.files_count : null,
+      fallbackArtifacts:
+        typeof data.artifacts_count === 'number' ? data.artifacts_count : null
+    });
   };
 
   const resetResultPanel = () => {
@@ -198,6 +266,9 @@
     if (elements.resultJson) {
       elements.resultJson.textContent = '';
     }
+    latestFilesTotal = null;
+    latestArtifactsTotal = null;
+    updateSummaryCounts({ filesTotal: 0, artifactsTotal: 0 });
     if (elements.taskStatus) {
       elements.taskStatus.textContent = '-';
     }
@@ -241,6 +312,7 @@
     pollingIntervals.state = setInterval(() => pollState(taskId), POLL_INTERVAL_MS);
     pollingIntervals.events = setInterval(() => pollEvents(taskId), POLL_SLOW_INTERVAL_MS);
     pollingIntervals.artifacts = setInterval(() => pollArtifacts(taskId), POLL_SLOW_INTERVAL_MS);
+    pollingIntervals.files = setInterval(() => pollFiles(taskId), POLL_SLOW_INTERVAL_MS);
   };
 
   const fetchJson = async (url) => {
@@ -262,6 +334,14 @@
   };
 
   const fetchTask = async (taskId) => fetchJson(`${API_BASE_URL}/api/tasks/${taskId}`);
+
+  const fetchFiles = async (
+    taskId,
+    { limit = 1, order = 'desc' } = {}
+  ) => {
+    const params = new URLSearchParams({ limit: String(limit), order });
+    return fetchJson(`${API_BASE_URL}/api/tasks/${taskId}/files?${params.toString()}`);
+  };
 
   const fetchState = async (taskId) => fetchJson(`${API_BASE_URL}/api/tasks/${taskId}/state`);
 
@@ -416,9 +496,10 @@
         isCompletedByProgress;
 
       if (isTerminal) {
+        await Promise.all([pollFiles(taskId), pollArtifacts(taskId)]);
         stopPolling();
         handleTerminalState(data);
-        showSection(elements.taskResults);
+        showResultsWithInspector();
         setSubmitDisabled(false);
         return;
       }
@@ -459,12 +540,29 @@
     }
     renderPanelError(elements.artifactsError, '');
     const artifacts = Array.isArray(data) ? data : data?.artifacts || data?.items || [];
+    const total = parseTotalCount(data);
+    if (typeof total === 'number') {
+      latestArtifactsTotal = total;
+      updateSummaryCounts();
+    }
     const signature = JSON.stringify(artifacts.slice(0, 20).map(getItemKey));
     if (signature === lastArtifactSignature) {
       return;
     }
     lastArtifactSignature = signature;
     renderArtifacts(artifacts);
+  };
+
+  const pollFiles = async (taskId) => {
+    const { data, error } = await fetchFiles(taskId);
+    if (error) {
+      return;
+    }
+    const total = parseTotalCount(data);
+    if (typeof total === 'number') {
+      latestFilesTotal = total;
+      updateSummaryCounts();
+    }
   };
 
   const startPolling = (taskId) => {
@@ -476,6 +574,7 @@
     pollState(taskId);
     pollEvents(taskId);
     pollArtifacts(taskId);
+    pollFiles(taskId);
     schedulePoll(taskId);
   };
 
@@ -580,6 +679,7 @@
     pollState(currentTaskId);
     pollEvents(currentTaskId);
     pollArtifacts(currentTaskId);
+    pollFiles(currentTaskId);
   };
 
   const loadTask = () => {

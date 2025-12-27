@@ -954,6 +954,11 @@ body {
     color: var(--text-secondary);
 }
 
+.download-info .muted {
+    margin-top: 4px;
+    color: var(--text-tertiary);
+}
+
 /* Previous Tasks */
 .previous-tasks {
     display: flex;
