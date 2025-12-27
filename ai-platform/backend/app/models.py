@@ -53,6 +53,7 @@ class Container:
             "decisions": [],
             "review_report": [],
             "patch_diff": [],
+            "git_export": [],
             "repro_manifest": [],
             "usage_report": [],
         }
