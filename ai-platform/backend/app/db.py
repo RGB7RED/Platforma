@@ -43,6 +43,7 @@ async def init_db(database_url: str) -> None:
                 current_stage TEXT NULL,
                 codex_version TEXT NULL,
                 client_ip TEXT NULL,
+                owner_key_hash TEXT NULL,
                 result JSONB NULL,
                 container_state JSONB NULL,
                 error TEXT NULL,
@@ -51,6 +52,9 @@ async def init_db(database_url: str) -> None:
                 completed_at TIMESTAMPTZ NULL
             );
             """
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS owner_key_hash TEXT;"
         )
         await _ensure_jsonb_column(conn, table="tasks", column="result")
         await _ensure_jsonb_column(conn, table="tasks", column="container_state")
@@ -250,6 +254,7 @@ async def create_task_row(
     current_stage: Optional[str],
     codex_version: Optional[str],
     client_ip: Optional[str],
+    owner_key_hash: str,
 ) -> Dict[str, Any]:
     if _pool is None:
         raise RuntimeError("Database pool is not initialized")
@@ -258,9 +263,17 @@ async def create_task_row(
         row = await _pool.fetchrow(
             """
             INSERT INTO tasks (
-                id, user_id, description, status, progress, current_stage, codex_version, client_ip
+                id,
+                user_id,
+                description,
+                status,
+                progress,
+                current_stage,
+                codex_version,
+                client_ip,
+                owner_key_hash
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *;
             """,
             _coerce_task_id(task_id),
@@ -271,6 +284,7 @@ async def create_task_row(
             current_stage,
             codex_version,
             client_ip,
+            owner_key_hash,
         )
     except Exception:
         _log_db_error(

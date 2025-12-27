@@ -70,6 +70,7 @@ class Storage:
 storage = Storage()
 database_url = os.getenv("DATABASE_URL")
 TASK_TTL_DAYS = os.getenv("TASK_TTL_DAYS")
+APP_API_KEY = os.getenv("APP_API_KEY")
 
 # WebSocket менеджер
 class ConnectionManager:
@@ -124,6 +125,82 @@ def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
 def normalize_payload(payload: Any) -> Any:
     return jsonable_encoder(payload)
 
+
+def get_request_api_key(request: Request) -> Optional[str]:
+    key = request.headers.get("X-API-Key")
+    if not key:
+        return None
+    key = key.strip()
+    return key or None
+
+
+def require_api_key(request: Request) -> str:
+    key = get_request_api_key(request)
+    if not key:
+        raise HTTPException(status_code=401, detail="API key required")
+    if APP_API_KEY and key != APP_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return key
+
+
+def hash_api_key(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+async def ensure_task_owner(task_id: str, request: Request) -> Dict[str, Any]:
+    api_key = require_api_key(request)
+    api_key_hash = hash_api_key(api_key)
+    if db.is_enabled():
+        task_data = await db.get_task_row(task_id)
+        if task_data is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+    else:
+        task_data = storage.active_tasks.get(task_id)
+        if task_data is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+    owner_hash = task_data.get("owner_key_hash")
+    if not owner_hash or owner_hash != api_key_hash:
+        raise HTTPException(status_code=403, detail="Invalid API Key or no access to this task.")
+    return task_data
+
+
+def get_websocket_api_key(websocket: WebSocket) -> Optional[str]:
+    key = websocket.query_params.get("api_key") or websocket.headers.get("X-API-Key")
+    if not key:
+        return None
+    key = key.strip()
+    return key or None
+
+
+async def ensure_websocket_owner(websocket: WebSocket, task_id: str) -> Optional[str]:
+    api_key = get_websocket_api_key(websocket)
+    if not api_key:
+        await websocket.accept()
+        await websocket.close(code=4401, reason="API key required")
+        return None
+    if APP_API_KEY and api_key != APP_API_KEY:
+        await websocket.accept()
+        await websocket.close(code=4401, reason="Invalid API key")
+        return None
+    api_key_hash = hash_api_key(api_key)
+    if db.is_enabled():
+        task_data = await db.get_task_row(task_id)
+        if task_data is None:
+            await websocket.accept()
+            await websocket.close(code=4404, reason="Task not found")
+            return None
+    else:
+        task_data = storage.active_tasks.get(task_id)
+        if task_data is None:
+            await websocket.accept()
+            await websocket.close(code=4404, reason="Task not found")
+            return None
+    owner_hash = task_data.get("owner_key_hash")
+    if not owner_hash or owner_hash != api_key_hash:
+        await websocket.accept()
+        await websocket.close(code=4403, reason="Forbidden")
+        return None
+    return api_key
 
 def to_json_compatible(value: Any) -> Any:
     try:
@@ -784,6 +861,8 @@ async def health_check():
 @app.post("/api/tasks", response_model=TaskResponse)
 async def create_task(request: TaskRequest, req: Request):
     """Создание новой задачи для обработки ИИ"""
+    api_key = require_api_key(req)
+    owner_key_hash = hash_api_key(api_key)
     task_id = str(uuid.uuid4())
     user_id = request.user_id or f"user_{uuid.uuid4().hex[:8]}"
     
@@ -801,6 +880,7 @@ async def create_task(request: TaskRequest, req: Request):
             current_stage=None,
             codex_version=request.codex_version,
             client_ip=client_ip,
+            owner_key_hash=owner_key_hash,
         )
     else:
         # Сохраняем задачу
@@ -815,6 +895,7 @@ async def create_task(request: TaskRequest, req: Request):
             "updated_at": now,
             "codex_version": request.codex_version,
             "client_ip": client_ip,
+            "owner_key_hash": owner_key_hash,
         }
         
         # Сохраняем связь пользователь -> задача
@@ -849,28 +930,20 @@ async def create_task(request: TaskRequest, req: Request):
     )
 
 @app.get("/api/tasks/{task_id}")
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, request: Request):
     """Получение статуса задачи"""
+    task_data = await ensure_task_owner(task_id, request)
     if db.is_enabled():
-        task_data = await db.get_task_row(task_id)
-        if task_data is None:
-            raise HTTPException(status_code=404, detail="Task not found")
         await resolve_container_with_db(task_id)
-        return enrich_task_data(task_id, task_data)
-
-    if task_id not in storage.active_tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    task_data = storage.active_tasks[task_id]
     return enrich_task_data(task_id, task_data)
 
 
 @app.get("/api/tasks/{task_id}/events", response_model=EventsResponse)
-async def get_task_events(task_id: str, limit: int = 200, order: str = "desc"):
+async def get_task_events(task_id: str, request: Request, limit: int = 200, order: str = "desc"):
     """Получение событий контейнера"""
     normalized_order = validate_order(order)
+    await ensure_task_owner(task_id, request)
     if db.is_enabled():
-        await ensure_task_exists(task_id)
         events = await db.get_events(task_id, limit=limit, order=normalized_order)
     else:
         ensure_task_exists_in_memory(task_id)
@@ -885,14 +958,15 @@ async def get_task_events(task_id: str, limit: int = 200, order: str = "desc"):
 @app.get("/api/tasks/{task_id}/artifacts", response_model=ArtifactsResponse)
 async def get_task_artifacts(
     task_id: str,
+    request: Request,
     type: Optional[str] = None,
     limit: int = 200,
     order: str = "desc",
 ):
     """Получение артефактов контейнера"""
     normalized_order = validate_order(order)
+    await ensure_task_owner(task_id, request)
     if db.is_enabled():
-        await ensure_task_exists(task_id)
         artifacts = await db.get_artifacts(task_id, type=type, limit=limit, order=normalized_order)
     else:
         ensure_task_exists_in_memory(task_id)
@@ -905,10 +979,10 @@ async def get_task_artifacts(
 
 
 @app.get("/api/tasks/{task_id}/state", response_model=ContainerStateResponse)
-async def get_task_state(task_id: str):
+async def get_task_state(task_id: str, request: Request):
     """Получение состояния контейнера"""
+    await ensure_task_owner(task_id, request)
     if db.is_enabled():
-        await ensure_task_exists(task_id)
         state_row = await db.get_container_state(task_id)
     else:
         ensure_task_exists_in_memory(task_id)
@@ -920,8 +994,9 @@ async def get_task_state(task_id: str):
     }
 
 @app.get("/api/tasks/{task_id}/files")
-async def get_task_files(task_id: str):
+async def get_task_files(task_id: str, request: Request):
     """Получение списка файлов задачи"""
+    await ensure_task_owner(task_id, request)
     container = await resolve_container_with_db(task_id)
     if not container:
         raise HTTPException(status_code=404, detail="Container not found")
@@ -948,8 +1023,9 @@ async def get_task_files(task_id: str):
     }
 
 @app.get("/api/tasks/{task_id}/files/{filepath:path}")
-async def get_file_content(task_id: str, filepath: str):
+async def get_file_content(task_id: str, filepath: str, request: Request):
     """Получение содержимого файла"""
+    await ensure_task_owner(task_id, request)
     container = await resolve_container_with_db(task_id)
     if not container:
         raise HTTPException(status_code=404, detail="Container not found")
@@ -978,12 +1054,14 @@ async def get_file_content(task_id: str, filepath: str):
 @app.post("/api/tasks/{task_id}/download")
 async def download_task_files(task_id: str, request: Request):
     """Скачать файлы задачи ZIP архивом"""
+    await ensure_task_owner(task_id, request)
     return await build_zip_response(task_id, request)
 
 
 @app.get("/api/tasks/{task_id}/download.zip")
 async def download_task_files_get(task_id: str, request: Request):
     """Скачать файлы задачи ZIP архивом (GET alias)"""
+    await ensure_task_owner(task_id, request)
     return await build_zip_response(task_id, request)
 
 @app.get("/api/users/{user_id}/tasks")
@@ -1019,6 +1097,9 @@ async def get_user_tasks(user_id: str, limit: int = 10):
 @app.websocket("/ws/{task_id}")
 async def websocket_endpoint(websocket: WebSocket, task_id: str):
     """WebSocket для real-time обновлений прогресса"""
+    access_key = await ensure_websocket_owner(websocket, task_id)
+    if access_key is None:
+        return
     await manager.connect(websocket, task_id)
     
     try:
