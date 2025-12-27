@@ -299,7 +299,8 @@
   const updateSummaryCounts = ({
     filesTotal = latestFilesTotal,
     artifactsTotal = latestArtifactsTotal,
-    iterationsTotal = null,
+    iterationsUsed = null,
+    maxIterations = null,
     fallbackFiles,
     fallbackArtifacts
   } = {}) => {
@@ -309,8 +310,23 @@
       typeof artifactsTotal === 'number' ? artifactsTotal : fallbackArtifacts ?? 0;
     renderCount(elements.filesCount, resolvedFiles);
     renderCount(elements.artifactsCount, resolvedArtifacts);
-    if (typeof iterationsTotal === 'number') {
-      renderCount(elements.iterationsCount, iterationsTotal);
+    if (elements.iterationsCount) {
+      const resolvedUsed = typeof iterationsUsed === 'number' && !Number.isNaN(iterationsUsed)
+        ? iterationsUsed
+        : typeof maxIterations === 'number'
+          ? 0
+          : null;
+      const resolvedMax =
+        typeof maxIterations === 'number' && !Number.isNaN(maxIterations) ? maxIterations : null;
+      if (resolvedUsed !== null && resolvedMax !== null) {
+        elements.iterationsCount.textContent = `${resolvedUsed} / ${resolvedMax}`;
+      } else if (resolvedUsed !== null) {
+        elements.iterationsCount.textContent = String(resolvedUsed);
+      } else if (resolvedMax !== null) {
+        elements.iterationsCount.textContent = `0 / ${resolvedMax}`;
+      } else {
+        elements.iterationsCount.textContent = '0';
+      }
     }
   };
 
@@ -324,12 +340,25 @@
     return `${Math.round(seconds)}s`;
   };
 
-  const resolveIterations = (data) => {
+  const resolveIterationsUsed = (data) => {
     if (typeof data?.iterations === 'number') {
       return data.iterations;
     }
     if (typeof data?.result?.iterations === 'number') {
       return data.result.iterations;
+    }
+    return null;
+  };
+
+  const resolveMaxIterations = (data) => {
+    if (typeof data?.max_iterations === 'number') {
+      return data.max_iterations;
+    }
+    if (typeof data?.result?.max_iterations === 'number') {
+      return data.result.max_iterations;
+    }
+    if (typeof data?.result?.workflow?.max_iterations === 'number') {
+      return data.result.workflow.max_iterations;
     }
     return null;
   };
@@ -381,6 +410,21 @@
     return diffSeconds;
   };
 
+  const parseResultPayload = (payload) => {
+    if (typeof payload !== 'string') {
+      return { value: payload, isRawString: false };
+    }
+    const trimmed = payload.trim();
+    if (!trimmed) {
+      return { value: payload, isRawString: true };
+    }
+    try {
+      return { value: JSON.parse(payload), isRawString: false };
+    } catch (error) {
+      return { value: payload, isRawString: true };
+    }
+  };
+
   const renderResultJson = () => {
     if (!elements.resultJson) {
       return;
@@ -390,20 +434,33 @@
       elements.resultJson.textContent = '';
       return;
     }
-    const resolved = { ...result };
-    const iterations = resolveIterations(latestTaskSnapshot);
+    const { value, isRawString } = parseResultPayload(result);
+    if (isRawString) {
+      elements.resultJson.textContent = value;
+      return;
+    }
+    const iterations = resolveIterationsUsed(latestTaskSnapshot);
+    const maxIterations = resolveMaxIterations(latestTaskSnapshot);
     const filesTotal = resolveFilesTotal(latestTaskSnapshot);
     const artifactsTotal = resolveArtifactsTotal(latestTaskSnapshot);
-    if (typeof iterations === 'number') {
-      resolved.iterations = iterations;
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const resolved = { ...value };
+      if (typeof iterations === 'number') {
+        resolved.iterations = iterations;
+      }
+      if (typeof maxIterations === 'number') {
+        resolved.max_iterations = maxIterations;
+      }
+      if (typeof filesTotal === 'number') {
+        resolved.files_count = filesTotal;
+      }
+      if (typeof artifactsTotal === 'number') {
+        resolved.artifacts_count = artifactsTotal;
+      }
+      elements.resultJson.textContent = JSON.stringify(resolved, null, 2);
+      return;
     }
-    if (typeof filesTotal === 'number') {
-      resolved.files_count = filesTotal;
-    }
-    if (typeof artifactsTotal === 'number') {
-      resolved.artifacts_count = artifactsTotal;
-    }
-    elements.resultJson.textContent = JSON.stringify(resolved, null, 2);
+    elements.resultJson.textContent = JSON.stringify(value, null, 2);
   };
 
   const refreshMetricsDisplay = () => {
@@ -413,7 +470,8 @@
     updateSummaryCounts({
       filesTotal: resolveFilesTotal(latestTaskSnapshot),
       artifactsTotal: resolveArtifactsTotal(latestTaskSnapshot),
-      iterationsTotal: resolveIterations(latestTaskSnapshot)
+      iterationsUsed: resolveIterationsUsed(latestTaskSnapshot),
+      maxIterations: resolveMaxIterations(latestTaskSnapshot)
     });
     renderResultJson();
   };
@@ -459,20 +517,40 @@
     return { value: clamped, percent: Math.round(clamped * 100) };
   };
 
+  const normalizeTaskSnapshot = (data) => {
+    if (!data || typeof data !== 'object') {
+      return data;
+    }
+    const normalized = { ...data };
+    const status = String(normalized.status || '').toLowerCase();
+    if (TERMINAL_STATUSES.has(status)) {
+      if (typeof normalized.progress !== 'number' || Number.isNaN(normalized.progress) || normalized.progress < 1) {
+        normalized.progress = 1;
+      }
+    }
+    if (status === 'failed') {
+      if (!normalized.current_stage || normalized.current_stage === 'completed') {
+        normalized.current_stage = 'review';
+      }
+    }
+    return normalized;
+  };
+
   const updateStatusPanel = (data) => {
     if (!data) {
       return;
     }
-    latestTaskSnapshot = data;
-    const isCompleted = String(data.status).toLowerCase() === 'completed';
+    const normalized = normalizeTaskSnapshot(data);
+    latestTaskSnapshot = normalized;
+    const isCompleted = String(normalized.status).toLowerCase() === 'completed';
     setDownloadEnabled(isCompleted);
     if (elements.taskStatus) {
-      elements.taskStatus.textContent = data.status || '-';
+      elements.taskStatus.textContent = normalized.status || '-';
     }
     if (elements.currentStage) {
-      elements.currentStage.textContent = data.current_stage || '-';
+      elements.currentStage.textContent = normalized.current_stage || '-';
     }
-    const progressInfo = formatProgress(data.progress);
+    const progressInfo = formatProgress(normalized.progress);
     if (elements.progressPercentage) {
       elements.progressPercentage.textContent = `${progressInfo.percent}%`;
     }
@@ -480,10 +558,10 @@
       elements.progressBarFill.style.width = `${progressInfo.percent}%`;
     }
     if (elements.taskError) {
-      elements.taskError.textContent = data.error || '';
-      elements.taskError.classList.toggle('hidden', !data.error);
+      elements.taskError.textContent = normalized.error || '';
+      elements.taskError.classList.toggle('hidden', !normalized.error);
     }
-    updateTimeTakenDisplay(data);
+    updateTimeTakenDisplay(normalized);
     refreshMetricsDisplay();
   };
   const isTerminalState = (data) => {
@@ -504,7 +582,7 @@
     latestFilesTotal = null;
     latestArtifactsTotal = null;
     latestTaskSnapshot = null;
-    updateSummaryCounts({ filesTotal: 0, artifactsTotal: 0, iterationsTotal: 0 });
+    updateSummaryCounts({ filesTotal: 0, artifactsTotal: 0, iterationsUsed: 0, maxIterations: null });
     setDownloadEnabled(false);
     updateTimeTakenDisplay({});
     if (elements.taskStatus) {
@@ -544,6 +622,8 @@
     }
     if (data.status === 'completed') {
       elements.resultStatus.innerHTML = '<span class="status-badge success">✓ Completed</span>';
+    } else if (data.status === 'failed') {
+      elements.resultStatus.innerHTML = '<span class="status-badge error">✕ Failed</span>';
     } else {
       elements.resultStatus.innerHTML = '<span class="status-badge error">⚠️ Error</span>';
     }
@@ -652,6 +732,33 @@
 
   const getItemKey = (item) =>
     item?.id || item?._id || item?.event_id || item?.artifact_id || item?.created_at || '';
+
+  const getArtifactKey = (artifact) => {
+    const id = artifact?.id || artifact?._id || artifact?.artifact_id;
+    if (id) {
+      return `id:${id}`;
+    }
+    const type = artifact?.type || '';
+    const producedBy = artifact?.produced_by || '';
+    const createdAt = artifact?.created_at || '';
+    return `meta:${type}|${producedBy}|${createdAt}`;
+  };
+
+  const dedupeArtifacts = (artifacts) => {
+    if (!Array.isArray(artifacts)) {
+      return [];
+    }
+    const seen = new Set();
+    return artifacts.filter((artifact, index) => {
+      const baseKey = getArtifactKey(artifact);
+      const key = baseKey || JSON.stringify(artifact) || `index:${index}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+  };
 
   const normalizeStatePayload = (payload) => {
     if (!payload) {
@@ -951,17 +1058,18 @@
       return;
     }
     if (data) {
-      updateStatusPanel(data);
+      const normalized = normalizeTaskSnapshot(data);
+      updateStatusPanel(normalized);
 
-      const progressInfo = formatProgress(data.progress);
+      const progressInfo = formatProgress(normalized.progress);
       const isCompletedByProgress =
-        progressInfo.value >= 1 && String(data.current_stage).toLowerCase() === 'completed';
-      const isTerminal = isTerminalState(data);
+        progressInfo.value >= 1 && String(normalized.current_stage).toLowerCase() === 'completed';
+      const isTerminal = isTerminalState(normalized);
 
       if (isTerminal) {
         await Promise.all([pollFiles(taskId), pollArtifacts(taskId)]);
         stopPolling();
-        handleTerminalState(data);
+        handleTerminalState(normalized);
         showResultsWithInspector();
         setSubmitDisabled(false);
         return;
@@ -1003,17 +1111,15 @@
     }
     renderPanelError(elements.artifactsError, '');
     const artifacts = Array.isArray(data) ? data : data?.artifacts || data?.items || [];
-    const total = parseTotalCount(data);
-    if (typeof total === 'number') {
-      latestArtifactsTotal = total;
-      refreshMetricsDisplay();
-    }
-    const signature = JSON.stringify(artifacts.slice(0, 20).map(getItemKey));
+    const dedupedArtifacts = dedupeArtifacts(artifacts);
+    latestArtifactsTotal = dedupedArtifacts.length;
+    refreshMetricsDisplay();
+    const signature = JSON.stringify(dedupedArtifacts.slice(0, 20).map(getArtifactKey));
     if (signature === lastArtifactSignature) {
       return;
     }
     lastArtifactSignature = signature;
-    renderArtifacts(artifacts);
+    renderArtifacts(dedupedArtifacts);
   };
 
   const pollFiles = async (taskId) => {
@@ -1080,11 +1186,12 @@
         return;
       }
       if (payload && typeof payload === 'object') {
-        updateStatusPanel(payload);
-        if (isTerminalState(payload)) {
+        const normalized = normalizeTaskSnapshot(payload);
+        updateStatusPanel(normalized);
+        if (isTerminalState(normalized)) {
           await Promise.all([pollFiles(taskId), pollArtifacts(taskId)]);
           stopPolling();
-          handleTerminalState(payload);
+          handleTerminalState(normalized);
           showResultsWithInspector();
           setSubmitDisabled(false);
           closeWebSocket();
@@ -1242,7 +1349,7 @@
       await pollArtifacts(currentTaskId);
       const { data } = await fetchArtifacts(currentTaskId, { type: 'review_report', limit: 5 });
       const reviewArtifacts = Array.isArray(data) ? data : data?.artifacts || data?.items || [];
-      updateLatestReviewResult(reviewArtifacts);
+      updateLatestReviewResult(dedupeArtifacts(reviewArtifacts));
     } catch (error) {
       const message = error?.message || 'Unable to rerun review.';
       showToast(message, '⚠️');

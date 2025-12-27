@@ -117,11 +117,13 @@ def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
         task_data["files_count"] = len(container.files)
         task_data["artifacts_count"] = sum(len(a) for a in container.artifacts.values())
         task_data["iterations"] = container.metadata.get("iterations")
+        task_data["max_iterations"] = container.metadata.get("max_iterations")
         result = task_data.get("result")
         if isinstance(result, dict):
             result["files_count"] = task_data["files_count"]
             result["artifacts_count"] = task_data["artifacts_count"]
             result["iterations"] = task_data.get("iterations", result.get("iterations"))
+            result["max_iterations"] = task_data.get("max_iterations", result.get("max_iterations"))
     time_taken_seconds = compute_time_taken_seconds(task_data)
     if time_taken_seconds is not None:
         task_data["time_taken_seconds"] = time_taken_seconds
@@ -240,6 +242,29 @@ def normalize_artifact_item(artifact: Dict[str, Any]) -> ArtifactItem:
         payload=to_json_compatible(artifact.get("payload", {})) or {},
         created_at=to_iso_string(artifact.get("created_at")) or "",
     )
+
+
+def artifact_dedupe_key(artifact: Dict[str, Any]) -> str:
+    artifact_id = artifact.get("id") or artifact.get("_id") or artifact.get("artifact_id")
+    if artifact_id:
+        return f"id:{artifact_id}"
+    return "meta:{type}:{produced_by}:{created_at}".format(
+        type=artifact.get("type"),
+        produced_by=artifact.get("produced_by"),
+        created_at=artifact.get("created_at"),
+    )
+
+
+def dedupe_artifacts(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    unique: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        key = artifact_dedupe_key(artifact)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(artifact)
+    return unique
 
 
 def normalize_container_state(raw_state: Any) -> ContainerStateSnapshot:
@@ -1212,6 +1237,7 @@ async def get_task_artifacts(
     else:
         ensure_task_exists_in_memory(task_id)
         artifacts = get_in_memory_artifacts(task_id, type, limit=limit, order=normalized_order)
+    artifacts = dedupe_artifacts(artifacts)
     return {
         "task_id": task_id,
         "total": len(artifacts),
@@ -1602,11 +1628,19 @@ async def process_task_background(task_id: str, description: str):
         await persist_container_snapshot(task_id, container)
         
         # Обновляем финальный статус
+        final_status = result.get("status")
+        final_progress = result.get("progress", 1.0)
+        if final_status in {"completed", "failed"}:
+            final_progress = 1.0
+        final_stage = "review" if final_status == "failed" else "completed"
+        result["progress"] = final_progress
+        if result.get("max_iterations") is None:
+            result["max_iterations"] = container.metadata.get("max_iterations")
         await apply_task_update(
             {
-                "status": result["status"],
-                "progress": result.get("progress", 1.0),
-                "current_stage": "completed",
+                "status": final_status,
+                "progress": final_progress,
+                "current_stage": final_stage,
                 "result": result,
                 "completed_at": completed_at,
             }
@@ -1615,21 +1649,21 @@ async def process_task_background(task_id: str, description: str):
             task_id,
             "TaskCompleted",
             normalize_payload(
-                {"status": result["status"], "progress": result.get("progress", 1.0)}
+                {"status": final_status, "progress": final_progress}
             ),
         )
         await record_state(
             task_id,
             build_container_state(
-                status=result["status"],
-                progress=result.get("progress", 1.0),
-                current_stage="completed",
+                status=final_status,
+                progress=final_progress,
+                current_stage=final_stage,
                 container=container,
                 active_role=container.metadata.get("active_role") if container else None,
                 current_task=container.current_task if container else None,
             ),
         )
-        logger.info(f"Task {task_id} completed with status: {result['status']}")
+        logger.info("Task %s completed with status: %s", task_id, final_status)
         
     except Exception as e:
         logger.error(f"Error processing task {task_id}: {e}")
