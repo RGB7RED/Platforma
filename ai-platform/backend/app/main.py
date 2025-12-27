@@ -19,6 +19,14 @@ from pathlib import Path
 
 from .models import Container
 from .orchestrator import AIOrchestrator
+from .schemas import (
+    ArtifactsResponse,
+    ArtifactItem,
+    ContainerStateResponse,
+    ContainerStateSnapshot,
+    EventsResponse,
+    EventItem,
+)
 from . import db
 
 # Настройка логирования
@@ -96,6 +104,94 @@ def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
 
 def normalize_payload(payload: Any) -> Any:
     return jsonable_encoder(payload)
+
+
+def to_json_compatible(value: Any) -> Any:
+    try:
+        return jsonable_encoder(value, custom_encoder={uuid.UUID: str})
+    except (TypeError, ValueError):
+        return json.loads(json.dumps(value, default=str))
+
+
+def to_iso_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def normalize_event_item(event: Dict[str, Any]) -> EventItem:
+    return EventItem(
+        id=str(event.get("id")),
+        type=str(event.get("type")),
+        payload=to_json_compatible(event.get("payload", {})) or {},
+        created_at=to_iso_string(event.get("created_at")) or "",
+    )
+
+
+def normalize_artifact_item(artifact: Dict[str, Any]) -> ArtifactItem:
+    return ArtifactItem(
+        id=str(artifact.get("id")),
+        type=str(artifact.get("type")),
+        produced_by=artifact.get("produced_by"),
+        payload=to_json_compatible(artifact.get("payload", {})) or {},
+        created_at=to_iso_string(artifact.get("created_at")) or "",
+    )
+
+
+def normalize_container_state(raw_state: Any) -> ContainerStateSnapshot:
+    state: Dict[str, Any] = raw_state or {}
+    if isinstance(state, dict) and isinstance(state.get("state"), dict):
+        state = state["state"]
+
+    key_map = {
+        "currentStage": "current_stage",
+        "activeRole": "active_role",
+        "currentTask": "current_task",
+        "codexVersion": "codex_version",
+        "containerState": "container_state",
+        "containerProgress": "container_progress",
+    }
+    normalized: Dict[str, Any] = {}
+    for key, value in state.items():
+        normalized[key_map.get(key, key)] = value
+
+    timestamps = normalized.get("timestamps")
+    if timestamps is not None:
+        normalized["timestamps"] = to_json_compatible(timestamps)
+
+    extras = {
+        key: value
+        for key, value in normalized.items()
+        if key
+        not in {
+            "status",
+            "progress",
+            "current_stage",
+            "active_role",
+            "current_task",
+            "codex_version",
+            "timestamps",
+            "container_state",
+            "container_progress",
+        }
+    }
+    if extras:
+        normalized.setdefault("timestamps", {})
+        normalized["timestamps"]["meta"] = to_json_compatible(extras)
+
+    return ContainerStateSnapshot(
+        status=normalized.get("status"),
+        progress=normalized.get("progress"),
+        current_stage=normalized.get("current_stage"),
+        active_role=normalized.get("active_role"),
+        current_task=normalized.get("current_task"),
+        codex_version=normalized.get("codex_version"),
+        timestamps=normalized.get("timestamps"),
+        container_state=normalized.get("container_state"),
+        container_progress=normalized.get("container_progress"),
+    )
 
 
 def validate_order(order: str) -> str:
@@ -364,11 +460,11 @@ async def get_task_status(task_id: str):
     return enrich_task_data(task_id, task_data)
 
 
-@app.get("/api/tasks/{task_id}/events")
+@app.get("/api/tasks/{task_id}/events", response_model=EventsResponse)
 async def get_task_events(task_id: str, limit: int = 200, order: str = "desc"):
     """Получение событий контейнера"""
     if not db.is_enabled():
-        raise HTTPException(status_code=501, detail="Database persistence not enabled")
+        raise HTTPException(status_code=501, detail="Database not enabled")
 
     await ensure_task_exists(task_id)
     normalized_order = validate_order(order)
@@ -376,11 +472,11 @@ async def get_task_events(task_id: str, limit: int = 200, order: str = "desc"):
     return {
         "task_id": task_id,
         "total": len(events),
-        "events": normalize_payload(events),
+        "events": [normalize_event_item(event) for event in events],
     }
 
 
-@app.get("/api/tasks/{task_id}/artifacts")
+@app.get("/api/tasks/{task_id}/artifacts", response_model=ArtifactsResponse)
 async def get_task_artifacts(
     task_id: str,
     type: Optional[str] = None,
@@ -389,7 +485,7 @@ async def get_task_artifacts(
 ):
     """Получение артефактов контейнера"""
     if not db.is_enabled():
-        raise HTTPException(status_code=501, detail="Database persistence not enabled")
+        raise HTTPException(status_code=501, detail="Database not enabled")
 
     await ensure_task_exists(task_id)
     normalized_order = validate_order(order)
@@ -397,22 +493,22 @@ async def get_task_artifacts(
     return {
         "task_id": task_id,
         "total": len(artifacts),
-        "artifacts": normalize_payload(artifacts),
+        "artifacts": [normalize_artifact_item(artifact) for artifact in artifacts],
     }
 
 
-@app.get("/api/tasks/{task_id}/state")
+@app.get("/api/tasks/{task_id}/state", response_model=ContainerStateResponse)
 async def get_task_state(task_id: str):
     """Получение состояния контейнера"""
     if not db.is_enabled():
-        raise HTTPException(status_code=501, detail="Database persistence not enabled")
+        raise HTTPException(status_code=501, detail="Database not enabled")
 
     await ensure_task_exists(task_id)
     state_row = await db.get_container_state(task_id)
     return {
         "task_id": task_id,
-        "state": normalize_payload(state_row["state"]) if state_row else {},
-        "updated_at": normalize_payload(state_row["updated_at"]) if state_row else None,
+        "state": normalize_container_state(state_row["state"]) if state_row else ContainerStateSnapshot(),
+        "updated_at": to_iso_string(state_row["updated_at"]) if state_row else None,
     }
 
 @app.get("/api/tasks/{task_id}/files")
