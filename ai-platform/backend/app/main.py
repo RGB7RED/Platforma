@@ -18,7 +18,8 @@ from typing import Dict, Optional, List, Any
 import logging
 import os
 from pathlib import Path, PurePosixPath
-from datetime import datetime
+from datetime import datetime, timezone
+import hashlib
 
 from .models import Container
 from .orchestrator import AIOrchestrator
@@ -516,19 +517,79 @@ def resolve_container(task_id: str) -> Optional[Container]:
     return load_container_from_file(task_id)
 
 
-def build_zip_response(task_id: str) -> StreamingResponse:
+async def build_zip_response(task_id: str, request: Request) -> StreamingResponse:
     container = resolve_container(task_id)
     if not container:
         raise HTTPException(status_code=404, detail="Container not found")
 
+    if db.is_enabled():
+        task_data = await db.get_task_row(task_id)
+        if task_data is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+    else:
+        task_data = storage.active_tasks.get(task_id) or {}
+
+    updated_at = parse_datetime(task_data.get("updated_at")) if task_data else None
+    timestamp_source = updated_at or db.now_utc()
+    if timestamp_source.tzinfo is None:
+        timestamp_source = timestamp_source.replace(tzinfo=timezone.utc)
+    timestamp_source = timestamp_source.astimezone(timezone.utc)
+    zip_timestamp = (
+        timestamp_source.year,
+        timestamp_source.month,
+        timestamp_source.day,
+        timestamp_source.hour,
+        timestamp_source.minute,
+        timestamp_source.second,
+    )
+
+    root_folder = f"task_{task_id}/"
+    files_manifest: List[Dict[str, Any]] = []
+    files_count = len(container.files)
+    artifacts_count = sum(len(items) for items in container.artifacts.values())
+    iterations = container.metadata.get("iterations") or 0
+    api_base_url = str(request.base_url).rstrip("/")
+
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        root_info = zipfile.ZipInfo(root_folder)
+        root_info.flag_bits |= 0x800  # UTF-8 filenames
+        root_info.date_time = zip_timestamp
+        root_info.external_attr = 0o40775 << 16
+        zip_file.writestr(root_info, b"")
+
         for filepath, content in container.files.items():
             safe_path = sanitize_zip_path(filepath)
             payload = content.encode("utf-8") if isinstance(content, str) else content
-            zip_info = zipfile.ZipInfo(safe_path)
+            files_manifest.append(
+                {
+                    "path": safe_path,
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+            archive_path = f"{root_folder}{safe_path}"
+            zip_info = zipfile.ZipInfo(archive_path)
             zip_info.flag_bits |= 0x800  # UTF-8 filenames
+            zip_info.date_time = zip_timestamp
             zip_file.writestr(zip_info, payload)
+
+        manifest_payload = {
+            "task_id": task_id,
+            "status": task_data.get("status"),
+            "created_at": to_iso_string(task_data.get("created_at") or container.created_at),
+            "updated_at": to_iso_string(task_data.get("updated_at") or container.updated_at),
+            "iterations": iterations,
+            "files_count": files_count,
+            "artifacts_count": artifacts_count,
+            "api_base_url": api_base_url,
+            "files": files_manifest,
+        }
+        manifest_bytes = json.dumps(manifest_payload, ensure_ascii=False, indent=2).encode("utf-8")
+        manifest_info = zipfile.ZipInfo(f"{root_folder}manifest.json")
+        manifest_info.flag_bits |= 0x800  # UTF-8 filenames
+        manifest_info.date_time = zip_timestamp
+        zip_file.writestr(manifest_info, manifest_bytes)
 
     buffer.seek(0)
     headers = {
@@ -763,15 +824,15 @@ async def get_file_content(task_id: str, filepath: str):
     }
 
 @app.post("/api/tasks/{task_id}/download")
-async def download_task_files(task_id: str):
+async def download_task_files(task_id: str, request: Request):
     """Скачать файлы задачи ZIP архивом"""
-    return build_zip_response(task_id)
+    return await build_zip_response(task_id, request)
 
 
 @app.get("/api/tasks/{task_id}/download.zip")
-async def download_task_files_get(task_id: str):
+async def download_task_files_get(task_id: str, request: Request):
     """Скачать файлы задачи ZIP архивом (GET alias)"""
-    return build_zip_response(task_id)
+    return await build_zip_response(task_id, request)
 
 @app.get("/api/users/{user_id}/tasks")
 async def get_user_tasks(user_id: str, limit: int = 10):
