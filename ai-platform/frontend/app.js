@@ -37,10 +37,20 @@
     }
   };
 
+  const appendApiKeyQuery = (url) => {
+    const apiKey = getStoredApiKey();
+    if (!apiKey) {
+      return url;
+    }
+    const separator = url.includes('?') ? '&' : '?';
+    return `${url}${separator}api_key=${encodeURIComponent(apiKey)}`;
+  };
+
   const POLL_INTERVAL_MS = 2000;
   const POLL_SLOW_INTERVAL_MS = 4000;
   const POLL_TIMEOUT_MS = 3 * 60 * 1000;
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'error']);
+  const API_KEY_STORAGE_KEY = 'aiPlatformApiKey';
 
   const elements = {
     welcomeScreen: document.getElementById('welcomeScreen'),
@@ -66,6 +76,8 @@
     currentStage: document.getElementById('currentStage'),
     taskStatus: document.getElementById('taskStatus'),
     apiBaseUrl: document.getElementById('apiBaseUrl'),
+    apiKeyInput: document.getElementById('apiKeyInput'),
+    saveApiKeyBtn: document.getElementById('saveApiKeyBtn'),
     taskError: document.getElementById('taskError'),
     taskIdInput: document.getElementById('taskIdInput'),
     loadTaskBtn: document.getElementById('loadTaskBtn'),
@@ -191,6 +203,37 @@
       return;
     }
     elements.apiBaseUrl.textContent = API_BASE_URL || '(same origin)';
+  };
+
+  const getStoredApiKey = () => {
+    const value = window.localStorage.getItem(API_KEY_STORAGE_KEY);
+    return typeof value === 'string' ? value.trim() : '';
+  };
+
+  const setStoredApiKey = (value) => {
+    const normalized = value.trim();
+    if (!normalized) {
+      window.localStorage.removeItem(API_KEY_STORAGE_KEY);
+      updateApiKeyInputs('');
+      return;
+    }
+    window.localStorage.setItem(API_KEY_STORAGE_KEY, normalized);
+    updateApiKeyInputs(normalized);
+  };
+
+  const updateApiKeyInputs = (value) => {
+    if (elements.apiKeyInput) {
+      elements.apiKeyInput.value = value || '';
+    }
+  };
+
+  const buildAuthHeaders = (extraHeaders = {}) => {
+    const headers = { ...extraHeaders };
+    const apiKey = getStoredApiKey();
+    if (apiKey) {
+      headers['X-API-Key'] = apiKey;
+    }
+    return headers;
   };
 
   const formatShortDate = (value) => {
@@ -391,6 +434,20 @@
     }
   };
 
+  const saveApiKey = () => {
+    if (!elements.apiKeyInput) {
+      return;
+    }
+    const value = elements.apiKeyInput.value || '';
+    if (!value.trim()) {
+      setStoredApiKey('');
+      showToast('API key cleared.', 'ℹ️');
+      return;
+    }
+    setStoredApiKey(value);
+    showToast('API key saved.', '✅');
+  };
+
   const formatProgress = (progress) => {
     if (typeof progress !== 'number' || Number.isNaN(progress)) {
       return { value: 0, percent: 0 };
@@ -497,13 +554,17 @@
 
   const fetchJson = async (url) => {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, {
+        headers: buildAuthHeaders()
+      });
       if (!response.ok) {
-        const message = response.status === 501
-          ? 'DB not enabled on backend'
-          : response.status === 404
-            ? 'Task not found'
-            : `Request failed (${response.status})`;
+        const message = response.status === 401 || response.status === 403
+          ? 'Invalid API Key or no access to this task.'
+          : response.status === 501
+            ? 'DB not enabled on backend'
+            : response.status === 404
+              ? 'Task not found'
+              : `Request failed (${response.status})`;
         return { error: message, status: response.status };
       }
       const data = await response.json();
@@ -939,7 +1000,10 @@
 
   const startWebSocket = (taskId) => {
     closeWebSocket();
-    const wsUrl = buildWebSocketUrl(taskId);
+    if (!getStoredApiKey()) {
+      return;
+    }
+    const wsUrl = appendApiKeyQuery(buildWebSocketUrl(taskId));
     try {
       activeSocket = new WebSocket(wsUrl);
     } catch (error) {
@@ -1016,6 +1080,10 @@
       showToast('Please enter a task description.', '⚠️');
       return;
     }
+    if (!getStoredApiKey()) {
+      showToast('Please save your API key before creating a task.', '⚠️');
+      return;
+    }
 
     setSubmitDisabled(true);
     resetResultPanel();
@@ -1033,14 +1101,17 @@
     try {
       const response = await fetch(buildApiUrl('/api/tasks'), {
         method: 'POST',
-        headers: {
+        headers: buildAuthHeaders({
           'Content-Type': 'application/json'
-        },
+        }),
         body: JSON.stringify(payload)
       });
 
       if (!response.ok) {
-        throw new Error(`Request failed (${response.status})`);
+        const message = response.status === 401 || response.status === 403
+          ? 'Invalid API Key or no access to this task.'
+          : `Request failed (${response.status})`;
+        throw new Error(message);
       }
 
       const data = await response.json();
@@ -1058,11 +1129,12 @@
     } catch (error) {
       setLoading(false);
       setSubmitDisabled(false);
+      const errorMessage = error?.message || 'Unable to create task. Please try again.';
       if (elements.taskError) {
-        elements.taskError.textContent = 'Unable to create task. Please try again.';
+        elements.taskError.textContent = errorMessage;
         elements.taskError.classList.remove('hidden');
       }
-      showToast('Unable to create task. Please try again.', '⚠️');
+      showToast(errorMessage, '⚠️');
     }
   };
 
@@ -1082,6 +1154,10 @@
     const taskId = elements.taskIdInput?.value.trim();
     if (!taskId) {
       showToast('Please enter a task_id to load.', '⚠️');
+      return;
+    }
+    if (!getStoredApiKey()) {
+      showToast('Please save your API key before loading a task.', '⚠️');
       return;
     }
     resetResultPanel();
@@ -1144,6 +1220,19 @@
 
   if (elements.submitTaskBtn) {
     elements.submitTaskBtn.addEventListener('click', submitTask);
+  }
+
+  if (elements.saveApiKeyBtn) {
+    elements.saveApiKeyBtn.addEventListener('click', saveApiKey);
+  }
+
+  if (elements.apiKeyInput) {
+    elements.apiKeyInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        saveApiKey();
+      }
+    });
   }
 
   if (elements.loadTaskBtn) {
@@ -1230,14 +1319,36 @@
     });
   }
 
-  const submitDownloadForm = (url) => {
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = url;
-    form.style.display = 'none';
-    document.body.appendChild(form);
-    form.submit();
-    document.body.removeChild(form);
+  const downloadZip = async (taskId) => {
+    const apiKey = getStoredApiKey();
+    if (!apiKey) {
+      showToast('Please save your API key before downloading.', '⚠️');
+      return;
+    }
+    const downloadUrl = buildApiUrl(`/api/tasks/${taskId}/download.zip`);
+    try {
+      const response = await fetch(downloadUrl, {
+        headers: buildAuthHeaders()
+      });
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'Invalid API Key or no access to this task.'
+          : `Download failed (${response.status})`;
+        showToast(message, '⚠️');
+        return;
+      }
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = `task_${taskId}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      showToast('Unable to download ZIP. Please try again.', '⚠️');
+    }
   };
 
   if (elements.downloadZipBtn) {
@@ -1250,12 +1361,7 @@
         showToast('ZIP download is available after completion.', 'ℹ️');
         return;
       }
-      const downloadUrl = buildApiUrl(`/api/tasks/${currentTaskId}/download.zip`);
-      if (downloadUrl) {
-        window.location.assign(downloadUrl);
-        return;
-      }
-      submitDownloadForm(buildApiUrl(`/api/tasks/${currentTaskId}/download`));
+      downloadZip(currentTaskId);
     });
   }
 
@@ -1265,6 +1371,7 @@
 
   updateCharCount();
   updateApiBaseUrl();
+  updateApiKeyInputs(getStoredApiKey());
   setActiveInspectorTab(activeInspectorTab);
   updateTimeTakenDisplay({});
 })();

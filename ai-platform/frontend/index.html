@@ -59,7 +59,26 @@
             <section class="task-creation hidden" id="taskCreation">
                 <div class="task-form-card">
                     <h2>Create New Task</h2>
-                    
+
+                    <div class="form-group">
+                        <label for="apiKeyInput">API Key</label>
+                        <div class="task-lookup-actions">
+                            <input
+                                type="password"
+                                id="apiKeyInput"
+                                class="task-id-input"
+                                placeholder="Enter your API key"
+                                autocomplete="off"
+                                autocapitalize="off"
+                                autocorrect="off"
+                                spellcheck="false">
+                            <button class="secondary-btn" id="saveApiKeyBtn">Save</button>
+                        </div>
+                        <div class="task-lookup-hint">
+                            Stored locally on this device (localStorage).
+                        </div>
+                    </div>
+
                     <div class="form-group">
                         <label for="taskDescription">Task Description</label>
                         <textarea 
