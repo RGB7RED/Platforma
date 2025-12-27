@@ -44,6 +44,7 @@ from .schemas import (
     TaskQuestionsResponse,
     TaskResumeResponse,
 )
+from .auth import get_auth_settings, get_user_from_access_token, router as auth_router
 from . import db
 from .logging_utils import (
     configure_logging,
@@ -101,6 +102,14 @@ RATE_LIMIT_RERUN_REVIEW_PER_MIN_ENV = os.getenv("RATE_LIMIT_RERUN_REVIEW_PER_MIN
 RATE_LIMIT_DOWNLOADS_PER_MIN_ENV = os.getenv("RATE_LIMIT_DOWNLOADS_PER_MIN")
 MAX_TOKENS_PER_DAY_ENV = os.getenv("MAX_TOKENS_PER_DAY")
 MAX_COMMAND_RUNS_PER_DAY_ENV = os.getenv("MAX_COMMAND_RUNS_PER_DAY")
+
+# Auth helpers
+@dataclass
+class AuthContext:
+    principal: str
+    owner_key_hash: str
+    api_key: Optional[str] = None
+    user: Optional[Dict[str, Any]] = None
 
 # WebSocket менеджер
 class ConnectionManager:
@@ -191,9 +200,39 @@ def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
-async def ensure_task_owner(task_id: str, request: Request) -> Dict[str, Any]:
+def _parse_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+    return token.strip() or None
+
+
+async def get_auth_context(request: Request) -> AuthContext:
+    settings = get_auth_settings()
+    if settings.mode in {"auth", "hybrid"}:
+        token = _parse_bearer_token(request.headers.get("Authorization"))
+        if token:
+            user = await get_user_from_access_token(token)
+            if not user:
+                raise HTTPException(status_code=401, detail="Invalid access token")
+            owner_key_hash = hash_api_key(str(user["id"]))
+            return AuthContext(principal="user", owner_key_hash=owner_key_hash, user=user)
+        if settings.mode == "auth":
+            raise HTTPException(status_code=401, detail="Authentication required")
+
     api_key = require_api_key(request)
-    api_key_hash = hash_api_key(api_key)
+    return AuthContext(
+        principal="apikey",
+        owner_key_hash=hash_api_key(api_key),
+        api_key=api_key,
+    )
+
+
+async def ensure_task_owner(task_id: str, request: Request) -> Dict[str, Any]:
+    auth_context = await get_auth_context(request)
+    api_key_hash = auth_context.owner_key_hash
     if db.is_enabled():
         task_data = await db.get_task_row(task_id)
         if task_data is None:
@@ -216,17 +255,44 @@ def get_websocket_api_key(websocket: WebSocket) -> Optional[str]:
     return key or None
 
 
+def get_websocket_access_token(websocket: WebSocket) -> Optional[str]:
+    token = websocket.query_params.get("access_token")
+    if token:
+        return token.strip() or None
+    return _parse_bearer_token(websocket.headers.get("Authorization"))
+
+
 async def ensure_websocket_owner(websocket: WebSocket, task_id: str) -> Optional[str]:
-    api_key = get_websocket_api_key(websocket)
-    if not api_key:
-        await websocket.accept()
-        await websocket.close(code=4401, reason="API key required")
-        return None
-    if APP_API_KEY and api_key != APP_API_KEY:
-        await websocket.accept()
-        await websocket.close(code=4401, reason="Invalid API key")
-        return None
-    api_key_hash = hash_api_key(api_key)
+    settings = get_auth_settings()
+    api_key_hash: Optional[str] = None
+    if settings.mode in {"auth", "hybrid"}:
+        token = get_websocket_access_token(websocket)
+        if token:
+            try:
+                user = await get_user_from_access_token(token)
+            except HTTPException:
+                user = None
+            if not user:
+                await websocket.accept()
+                await websocket.close(code=4401, reason="Invalid access token")
+                return None
+            api_key_hash = hash_api_key(str(user["id"]))
+        elif settings.mode == "auth":
+            await websocket.accept()
+            await websocket.close(code=4401, reason="Access token required")
+            return None
+
+    if api_key_hash is None:
+        api_key = get_websocket_api_key(websocket)
+        if not api_key:
+            await websocket.accept()
+            await websocket.close(code=4401, reason="API key required")
+            return None
+        if APP_API_KEY and api_key != APP_API_KEY:
+            await websocket.accept()
+            await websocket.close(code=4401, reason="Invalid API key")
+            return None
+        api_key_hash = hash_api_key(api_key)
     if db.is_enabled():
         task_data = await db.get_task_row(task_id)
         if task_data is None:
@@ -244,7 +310,7 @@ async def ensure_websocket_owner(websocket: WebSocket, task_id: str) -> Optional
         await websocket.accept()
         await websocket.close(code=4403, reason="Forbidden")
         return None
-    return api_key
+    return api_key_hash
 
 def to_json_compatible(value: Any) -> Any:
     try:
@@ -1819,6 +1885,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
+
 # Роуты API
 @app.get("/")
 async def root():
@@ -1958,17 +2026,20 @@ async def ops_status():
 
 @app.get("/api/templates")
 async def list_templates_endpoint(request: Request):
-    require_api_key(request)
+    await get_auth_context(request)
     return {"templates": list_available_templates()}
 
 @app.post("/api/tasks", response_model=TaskResponse)
 async def create_task(request: TaskRequest, req: Request):
     """Создание новой задачи для обработки ИИ"""
-    api_key = require_api_key(req)
-    owner_key_hash = hash_api_key(api_key)
+    auth_context = await get_auth_context(req)
+    owner_key_hash = auth_context.owner_key_hash
     await enforce_rate_limit(owner_key_hash, "create_task", RATE_LIMIT_CREATE_TASKS_PER_MIN)
     task_id = str(uuid.uuid4())
-    user_id = request.user_id or f"user_{uuid.uuid4().hex[:8]}"
+    if auth_context.user:
+        user_id = str(auth_context.user["id"])
+    else:
+        user_id = request.user_id or f"user_{uuid.uuid4().hex[:8]}"
     request_id = get_request_id()
     template_id = request.template_id.strip() if request.template_id else None
     template_hash = None
@@ -2212,9 +2283,9 @@ async def rerun_review(task_id: str, request: Request):
     """Перезапуск ревью для существующей задачи"""
     task_token = set_task_id(task_id)
     try:
-        api_key = require_api_key(request)
+        auth_context = await get_auth_context(request)
         await enforce_rate_limit(
-            hash_api_key(api_key),
+            auth_context.owner_key_hash,
             "rerun_review",
             RATE_LIMIT_RERUN_REVIEW_PER_MIN,
         )
@@ -2371,9 +2442,9 @@ async def download_task_files(task_id: str, request: Request):
     """Скачать файлы задачи ZIP архивом"""
     task_token = set_task_id(task_id)
     try:
-        api_key = require_api_key(request)
+        auth_context = await get_auth_context(request)
         await enforce_rate_limit(
-            hash_api_key(api_key),
+            auth_context.owner_key_hash,
             "download",
             RATE_LIMIT_DOWNLOADS_PER_MIN,
         )
@@ -2388,9 +2459,9 @@ async def download_task_files_get(task_id: str, request: Request):
     """Скачать файлы задачи ZIP архивом (GET alias)"""
     task_token = set_task_id(task_id)
     try:
-        api_key = require_api_key(request)
+        auth_context = await get_auth_context(request)
         await enforce_rate_limit(
-            hash_api_key(api_key),
+            auth_context.owner_key_hash,
             "download",
             RATE_LIMIT_DOWNLOADS_PER_MIN,
         )
@@ -2405,9 +2476,9 @@ async def download_git_export(task_id: str, request: Request):
     """Download git export bundle ZIP."""
     task_token = set_task_id(task_id)
     try:
-        api_key = require_api_key(request)
+        auth_context = await get_auth_context(request)
         await enforce_rate_limit(
-            hash_api_key(api_key),
+            auth_context.owner_key_hash,
             "download",
             RATE_LIMIT_DOWNLOADS_PER_MIN,
         )
