@@ -1,8 +1,41 @@
 (() => {
-  const API_BASE_URL =
-    document.querySelector('meta[name="api-base-url"]')?.content ||
-    window.API_BASE_URL ||
-    '';
+  const resolveApiBaseUrl = () => {
+    const configValue = window.__APP_CONFIG__?.API_BASE_URL;
+    if (typeof configValue === 'string' && configValue.trim()) {
+      return configValue.trim();
+    }
+    const metaValue = document.querySelector('meta[name="api-base-url"]')?.content;
+    if (typeof metaValue === 'string' && metaValue.trim()) {
+      return metaValue.trim();
+    }
+    return '';
+  };
+
+  const API_BASE_URL = resolveApiBaseUrl();
+  const normalizeBaseUrl = (value) => value.replace(/\/+$/, '');
+  const normalizePath = (value) => (value.startsWith('/') ? value : `/${value}`);
+  const buildApiUrl = (path) => {
+    const resolvedPath = normalizePath(path);
+    if (!API_BASE_URL) {
+      return resolvedPath;
+    }
+    return `${normalizeBaseUrl(API_BASE_URL)}${resolvedPath}`;
+  };
+  const buildWebSocketUrl = (taskId) => {
+    const wsPath = `/ws/${taskId}`;
+    const fallbackProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    if (!API_BASE_URL) {
+      return `${fallbackProtocol}://${window.location.host}${wsPath}`;
+    }
+    try {
+      const apiUrl = new URL(API_BASE_URL);
+      const wsProtocol = apiUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+      const basePath = apiUrl.pathname.replace(/\/+$/, '');
+      return `${wsProtocol}//${apiUrl.host}${basePath}${wsPath}`;
+    } catch (error) {
+      return `${fallbackProtocol}://${window.location.host}${wsPath}`;
+    }
+  };
 
   const POLL_INTERVAL_MS = 2000;
   const POLL_SLOW_INTERVAL_MS = 4000;
@@ -76,6 +109,7 @@
   let activeInspectorTab = 'state';
   let latestFilesTotal = null;
   let latestArtifactsTotal = null;
+  let activeSocket = null;
 
   const sections = [
     elements.welcomeScreen,
@@ -257,6 +291,12 @@
         typeof data.artifacts_count === 'number' ? data.artifacts_count : null
     });
   };
+  const isTerminalState = (data) => {
+    const progressInfo = formatProgress(data?.progress);
+    const isCompletedByProgress =
+      progressInfo.value >= 1 && String(data?.current_stage).toLowerCase() === 'completed';
+    return TERMINAL_STATUSES.has(String(data?.status).toLowerCase()) || isCompletedByProgress;
+  };
 
   const resetResultPanel = () => {
     if (elements.taskError) {
@@ -333,21 +373,22 @@
     }
   };
 
-  const fetchTask = async (taskId) => fetchJson(`${API_BASE_URL}/api/tasks/${taskId}`);
+  const fetchTask = async (taskId) => fetchJson(buildApiUrl(`/api/tasks/${taskId}`));
 
   const fetchFiles = async (
     taskId,
     { limit = 1, order = 'desc' } = {}
   ) => {
     const params = new URLSearchParams({ limit: String(limit), order });
-    return fetchJson(`${API_BASE_URL}/api/tasks/${taskId}/files?${params.toString()}`);
+    return fetchJson(buildApiUrl(`/api/tasks/${taskId}/files?${params.toString()}`));
   };
 
-  const fetchState = async (taskId) => fetchJson(`${API_BASE_URL}/api/tasks/${taskId}/state`);
+  const fetchState = async (taskId) =>
+    fetchJson(buildApiUrl(`/api/tasks/${taskId}/state`));
 
   const fetchEvents = async (taskId, { limit = 200, order = 'desc' } = {}) => {
     const params = new URLSearchParams({ limit: String(limit), order });
-    return fetchJson(`${API_BASE_URL}/api/tasks/${taskId}/events?${params.toString()}`);
+    return fetchJson(buildApiUrl(`/api/tasks/${taskId}/events?${params.toString()}`));
   };
 
   const fetchArtifacts = async (
@@ -358,7 +399,7 @@
     if (type) {
       params.set('type', type);
     }
-    return fetchJson(`${API_BASE_URL}/api/tasks/${taskId}/artifacts?${params.toString()}`);
+    return fetchJson(buildApiUrl(`/api/tasks/${taskId}/artifacts?${params.toString()}`));
   };
 
   const formatPayloadSummary = (payload) => {
@@ -492,8 +533,7 @@
       const progressInfo = formatProgress(data.progress);
       const isCompletedByProgress =
         progressInfo.value >= 1 && String(data.current_stage).toLowerCase() === 'completed';
-      const isTerminal = TERMINAL_STATUSES.has(String(data.status).toLowerCase()) ||
-        isCompletedByProgress;
+      const isTerminal = isTerminalState(data);
 
       if (isTerminal) {
         await Promise.all([pollFiles(taskId), pollArtifacts(taskId)]);
@@ -578,6 +618,49 @@
     schedulePoll(taskId);
   };
 
+  const closeWebSocket = () => {
+    if (activeSocket) {
+      activeSocket.close();
+      activeSocket = null;
+    }
+  };
+
+  const startWebSocket = (taskId) => {
+    closeWebSocket();
+    const wsUrl = buildWebSocketUrl(taskId);
+    try {
+      activeSocket = new WebSocket(wsUrl);
+    } catch (error) {
+      activeSocket = null;
+      return;
+    }
+    activeSocket.addEventListener('message', async (event) => {
+      if (!event?.data) {
+        return;
+      }
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch (error) {
+        return;
+      }
+      if (payload && typeof payload === 'object') {
+        updateStatusPanel(payload);
+        if (isTerminalState(payload)) {
+          await Promise.all([pollFiles(taskId), pollArtifacts(taskId)]);
+          stopPolling();
+          handleTerminalState(payload);
+          showResultsWithInspector();
+          setSubmitDisabled(false);
+          closeWebSocket();
+        }
+      }
+    });
+    activeSocket.addEventListener('close', () => {
+      activeSocket = null;
+    });
+  };
+
   const setActiveInspectorTab = (tab) => {
     activeInspectorTab = tab;
     if (elements.inspectorTabs) {
@@ -612,6 +695,7 @@
     }
     showSection(elements.taskProgress);
     startPolling(taskId);
+    startWebSocket(taskId);
   };
 
   const submitTask = async () => {
@@ -635,7 +719,7 @@
     }
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/tasks`, {
+      const response = await fetch(buildApiUrl('/api/tasks'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
