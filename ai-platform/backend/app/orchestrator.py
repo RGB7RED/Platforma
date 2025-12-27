@@ -3,8 +3,10 @@
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Callable
 from datetime import datetime
@@ -25,19 +27,32 @@ class AIOrchestrator:
     """Главный оркестратор, управляющий циклом ИИ-ролей"""
     
     def __init__(self, codex_path: Optional[str] = None):
-        self.codex = self._load_codex(codex_path)
+        self.codex_path = self._resolve_codex_path(codex_path)
+        self.codex = self._load_codex(self.codex_path)
+        self.codex_hash = self._hash_codex(self.codex)
         self.container: Optional[Container] = None
         self.roles = {}
         self.task_history: List[Dict] = []
         
         logger.info(f"Orchestrator initialized with Codex v{self.codex.get('version', 'unknown')}")
     
-    def _load_codex(self, codex_path: Optional[str]) -> Dict[str, Any]:
+    def _resolve_codex_path(self, codex_path: Optional[str]) -> Path:
+        if codex_path:
+            return Path(codex_path)
+        env_path = os.getenv("CODEX_PATH")
+        if env_path:
+            return Path(env_path)
+        return Path(__file__).with_name("codex.json")
+
+    def _load_codex(self, codex_path: Optional[Path]) -> Dict[str, Any]:
         """Загрузить кодекс из файла или использовать дефолтный"""
-        if codex_path and Path(codex_path).exists():
+        if codex_path and codex_path.exists():
             try:
                 with open(codex_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    codex = json.load(f)
+                if self._validate_codex(codex):
+                    return codex
+                logger.error("Codex schema validation failed, using defaults")
             except Exception as e:
                 logger.error(f"Error loading codex: {e}")
         
@@ -47,7 +62,46 @@ class AIOrchestrator:
             "rules": {
                 "researcher": {"max_questions": 3},
                 "coder": {"testing_required": True}
+            },
+            "workflow": {
+                "stages": ["research", "design", "implementation", "review"],
+                "max_iterations": 15,
+                "require_review": True
             }
+        }
+
+    def _validate_codex(self, codex: Any) -> bool:
+        if not isinstance(codex, dict):
+            return False
+        if not isinstance(codex.get("version"), str):
+            return False
+        rules = codex.get("rules")
+        workflow = codex.get("workflow")
+        if not isinstance(rules, dict) or not isinstance(workflow, dict):
+            return False
+        stages = workflow.get("stages")
+        if not isinstance(stages, list) or not stages:
+            return False
+        max_iterations = workflow.get("max_iterations")
+        if max_iterations is not None and (not isinstance(max_iterations, int) or max_iterations <= 0):
+            return False
+        require_review = workflow.get("require_review")
+        if require_review is not None and not isinstance(require_review, bool):
+            return False
+        return True
+
+    def _hash_codex(self, codex: Dict[str, Any]) -> str:
+        payload = json.dumps(codex, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _codex_summary(self) -> Dict[str, Any]:
+        workflow = self.codex.get("workflow", {})
+        rules = self.codex.get("rules", {})
+        return {
+            "workflow_stages": workflow.get("stages", []),
+            "max_iterations": workflow.get("max_iterations"),
+            "require_review": workflow.get("require_review", True),
+            "roles": sorted(rules.keys()),
         }
     
     def initialize_project(self, project_name: str) -> Container:
@@ -55,6 +109,8 @@ class AIOrchestrator:
         self.container = Container()
         self.container.metadata["project_name"] = project_name
         self.container.metadata["started_at"] = datetime.now().isoformat()
+        self.container.metadata["codex_version"] = self.codex.get("version")
+        self.container.metadata["codex_hash"] = self.codex_hash
         
         # Инициализация ролей
         self.roles = {
@@ -88,6 +144,14 @@ class AIOrchestrator:
             self.initialize_project("Auto-generated Project")
         
         logger.info(f"Starting processing of task: {user_task[:50]}...")
+        await self._run_hook(
+            callbacks.get("codex_loaded") if callbacks else None,
+            {
+                "version": self.codex.get("version"),
+                "hash": self.codex_hash,
+                "rules_summary": self._codex_summary(),
+            },
+        )
         
         try:
             # Фаза 1: Исследование
@@ -145,7 +209,8 @@ class AIOrchestrator:
             self.container.update_state(ProjectState.IMPLEMENTATION, "Implementing solution")
             
             iteration = 0
-            max_iterations = 15  # Защита от бесконечного цикла
+            max_iterations = self.codex.get("workflow", {}).get("max_iterations", 15)
+            logger.info("Codex max_iterations=%s", max_iterations)
             
             while not self.container.is_complete() and iteration < max_iterations:
                 iteration += 1
@@ -184,28 +249,34 @@ class AIOrchestrator:
                     # В MVP просто продолжаем, в реальной системе - корректируем
             
             # Фаза 4: Финальное ревью
-            logger.info("Phase 4: Final Review")
-            await self._run_hook(
-                callbacks.get("stage_started") if callbacks else None,
-                {"stage": "review"},
-            )
-            self.container.update_state(ProjectState.REVIEW, "Final quality check")
-            
-            final_review = await self.roles["reviewer"].execute(
-                self.container
-            )
-            await self._run_hook(
-                callbacks.get("review_result") if callbacks else None,
-                {"result": final_review, "kind": "final"},
-            )
-            
-            if final_review["status"] in {"approved", "approved_with_warnings"}:
-                self.container.update_state(ProjectState.COMPLETE, "Project completed")
-                self.container.update_progress(1.0)
-                logger.info("Project completed successfully")
+            require_review = self.codex.get("workflow", {}).get("require_review", True)
+            if require_review:
+                logger.info("Phase 4: Final Review")
+                await self._run_hook(
+                    callbacks.get("stage_started") if callbacks else None,
+                    {"stage": "review"},
+                )
+                self.container.update_state(ProjectState.REVIEW, "Final quality check")
+                
+                final_review = await self.roles["reviewer"].execute(
+                    self.container
+                )
+                await self._run_hook(
+                    callbacks.get("review_result") if callbacks else None,
+                    {"result": final_review, "kind": "final"},
+                )
+                
+                if final_review["status"] in {"approved", "approved_with_warnings"}:
+                    self.container.update_state(ProjectState.COMPLETE, "Project completed")
+                    self.container.update_progress(1.0)
+                    logger.info("Project completed successfully")
+                else:
+                    logger.error(f"Project failed final review: {final_review.get('issues')}")
+                    self.container.update_state(ProjectState.ERROR, "Failed final review")
             else:
-                logger.error(f"Project failed final review: {final_review.get('issues')}")
-                self.container.update_state(ProjectState.ERROR, "Failed final review")
+                logger.info("Codex allows skipping final review stage")
+                self.container.update_state(ProjectState.COMPLETE, "Project completed (review skipped)")
+                self.container.update_progress(1.0)
             
             # Сохраняем историю задачи
             self.task_history.append({
