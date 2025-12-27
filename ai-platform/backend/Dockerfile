@@ -30,4 +30,4 @@ RUN mkdir -p /app/data/tasks /app/data/logs
 EXPOSE 8000
 
 # Команда для запуска приложения
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["python", "run.py"]
