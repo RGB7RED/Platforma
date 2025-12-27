@@ -4,16 +4,14 @@ services:
   backend:
     build: ./backend
     container_name: ai-platform-backend
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     environment:
       - PYTHONUNBUFFERED=1
       - ENVIRONMENT=${ENVIRONMENT:-development}
-      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
-      - WEB_APP_URL=${WEB_APP_URL:-http://localhost:8000/app}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost}
       - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
     volumes:
-      - ./backend:/app
       - ./data/backend:/app/data
       - ./logs/backend:/app/logs
     env_file:
@@ -27,18 +25,15 @@ services:
       start_period: 40s
     networks:
       - ai-platform-network
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: ai-platform-frontend
-    ports:
-      - "3000:80"
-    volumes:
-      - ./frontend:/usr/share/nginx/html
-      - ./logs/frontend:/var/log/nginx
+    expose:
+      - "80"
     depends_on:
       - backend
     restart: unless-stopped
@@ -50,12 +45,9 @@ services:
     container_name: ai-platform-nginx
     ports:
       - "80:80"
-      - "443:443"
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
-      - ./nginx/sites-enabled:/etc/nginx/sites-enabled
-      - ./ssl:/etc/nginx/ssl
-      - ./frontend:/usr/share/nginx/html
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/sites-enabled:/etc/nginx/sites-enabled:ro
       - ./logs/nginx:/var/log/nginx
     depends_on:
       - backend
@@ -63,51 +55,6 @@ services:
     restart: unless-stopped
     networks:
       - ai-platform-network
-
-  # PostgreSQL для production
-  # postgres:
-  #   image: postgres:15-alpine
-  #   container_name: ai-platform-postgres
-  #   environment:
-  #     POSTGRES_DB: aiplatform
-  #     POSTGRES_USER: aiplatform_user
-  #     POSTGRES_PASSWORD: ${DB_PASSWORD:-aiplatform_password}
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #     - ./init.sql:/docker-entrypoint-initdb.d/init.sql
-  #   ports:
-  #     - "5432:5432"
-  #   restart: unless-stopped
-  #   networks:
-  #     - ai-platform-network
-
-  # Redis для кэширования
-  # redis:
-  #   image: redis:7-alpine
-  #   container_name: ai-platform-redis
-  #   ports:
-  #     - "6379:6379"
-  #   volumes:
-  #     - redis_data:/data
-  #   restart: unless-stopped
-  #   networks:
-  #     - ai-platform-network
-
-  # Adminer для управления БД
-  # adminer:
-  #   image: adminer:latest
-  #   container_name: ai-platform-adminer
-  #   ports:
-  #     - "8080:8080"
-  #   restart: unless-stopped
-  #   networks:
-  #     - ai-platform-network
-
-volumes:
-  postgres_data:
-    driver: local
-  redis_data:
-    driver: local
 
 networks:
   ai-platform-network:

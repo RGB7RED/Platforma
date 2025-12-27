@@ -73,12 +73,12 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket, task_id: str):
         await websocket.accept()
         self.active_connections[task_id] = websocket
-        logger.info(f"WebSocket connected for task {task_id}")
+        logger.info("WebSocket connected for task_id=%s", task_id)
     
     def disconnect(self, task_id: str):
         if task_id in self.active_connections:
             del self.active_connections[task_id]
-            logger.info(f"WebSocket disconnected for task {task_id}")
+            logger.info("WebSocket disconnected for task_id=%s", task_id)
     
     async def send_progress(self, task_id: str, data: dict):
         await record_event(task_id, "ProgressUpdate", normalize_payload(data))
@@ -87,7 +87,7 @@ class ConnectionManager:
                 await self.active_connections[task_id].send_json(jsonable_encoder(data))
                 return True
             except Exception as e:
-                logger.error(f"Error sending WebSocket message: {e}")
+                logger.error("Error sending WebSocket message for task_id=%s: %s", task_id, e)
                 self.disconnect(task_id)
         return False
 
@@ -388,14 +388,15 @@ app = FastAPI(
 )
 
 def parse_allowed_origins() -> tuple[list[str], str]:
-    raw_origins = os.getenv("ALLOWED_ORIGINS", "")
-    parsed_origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    raw_origins = os.getenv("ALLOWED_ORIGINS")
+    raw_value = raw_origins or ""
+    parsed_origins = [origin.strip() for origin in raw_value.split(",") if origin.strip()]
     origins = [origin for origin in parsed_origins if origin != "*"]
     if len(origins) != len(parsed_origins):
         logger.warning("Ignoring wildcard '*' entry in ALLOWED_ORIGINS.")
     environment = os.getenv("ENVIRONMENT", "").lower()
     is_production = environment == "production"
-    source = "env"
+    source = "env" if raw_origins is not None else "unset"
 
     if is_production:
         if not origins:
@@ -406,10 +407,10 @@ def parse_allowed_origins() -> tuple[list[str], str]:
     else:
         if not origins:
             origins = [
+                "http://localhost",
+                "http://127.0.0.1",
                 "http://localhost:3000",
                 "http://localhost:8000",
-                "https://web.telegram.org",
-                "https://telegram.org",
             ]
             source = "dev-defaults"
 
@@ -455,7 +456,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -491,7 +492,7 @@ async def create_task(request: TaskRequest, req: Request):
     task_id = str(uuid.uuid4())
     user_id = request.user_id or f"user_{uuid.uuid4().hex[:8]}"
     
-    logger.info(f"Creating new task {task_id} for user {user_id}")
+    logger.info("Creating new task task_id=%s user_id=%s", task_id, user_id)
     
     client_ip = req.client.host if req.client else None
 
@@ -745,16 +746,16 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                 await websocket.send_text("pong")
                 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected for task {task_id}")
+        logger.info("WebSocket disconnected for task_id=%s", task_id)
         manager.disconnect(task_id)
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error("WebSocket error for task_id=%s: %s", task_id, e)
         manager.disconnect(task_id)
 
 async def process_task_background(task_id: str, description: str):
     """Фоновая обработка задачи ИИ-агентами"""
     try:
-        logger.info(f"Starting AI processing for task {task_id}")
+        logger.info("Starting AI processing for task_id=%s", task_id)
 
         async def apply_task_update(fields: Dict[str, Any]) -> None:
             if db.is_enabled():
