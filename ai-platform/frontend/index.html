@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🤖 AI Collaboration Platform</title>
     <meta name="api-base-url" content="https://platforma-production-7bbb.up.railway.app">
+    <meta name="auth-mode" content="apikey">
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <link rel="stylesheet" href="styles.css">
 </head>
@@ -60,7 +61,95 @@
                 <div class="task-form-card">
                     <h2>Create New Task</h2>
 
-                    <div class="form-group">
+                    <div class="form-group auth-panel hidden" id="authPanel">
+                        <label>Account Access</label>
+                        <div class="task-lookup-actions">
+                            <button class="secondary-btn" type="button" data-auth-view="login" id="authShowLoginBtn">
+                                Login
+                            </button>
+                            <button class="secondary-btn" type="button" data-auth-view="register" id="authShowRegisterBtn">
+                                Register
+                            </button>
+                            <button class="secondary-btn" type="button" data-auth-view="forgot" id="authShowForgotBtn">
+                                Forgot Password
+                            </button>
+                            <button class="secondary-btn" type="button" id="authLogoutBtn">
+                                Log out
+                            </button>
+                        </div>
+                        <div class="task-lookup-hint auth-status" id="authStatus">
+                            Not signed in.
+                        </div>
+                        <div class="auth-screens">
+                            <div class="auth-screen" data-auth-view="login" id="authLoginScreen">
+                                <div class="task-lookup-actions">
+                                    <input
+                                        type="email"
+                                        id="authLoginEmail"
+                                        class="task-id-input"
+                                        placeholder="Email"
+                                        autocomplete="email"
+                                        autocapitalize="off"
+                                        autocorrect="off"
+                                        spellcheck="false">
+                                    <input
+                                        type="password"
+                                        id="authLoginPassword"
+                                        class="task-id-input"
+                                        placeholder="Password"
+                                        autocomplete="current-password"
+                                        autocapitalize="off"
+                                        autocorrect="off"
+                                        spellcheck="false">
+                                    <button class="secondary-btn" type="button" id="authLoginBtn">Sign in</button>
+                                </div>
+                                <div class="task-lookup-actions">
+                                    <button class="secondary-btn" type="button" id="googleSignInBtn">
+                                        Sign in with Google
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="auth-screen hidden" data-auth-view="register" id="authRegisterScreen">
+                                <div class="task-lookup-actions">
+                                    <input
+                                        type="email"
+                                        id="authRegisterEmail"
+                                        class="task-id-input"
+                                        placeholder="Email"
+                                        autocomplete="email"
+                                        autocapitalize="off"
+                                        autocorrect="off"
+                                        spellcheck="false">
+                                    <input
+                                        type="password"
+                                        id="authRegisterPassword"
+                                        class="task-id-input"
+                                        placeholder="Password"
+                                        autocomplete="new-password"
+                                        autocapitalize="off"
+                                        autocorrect="off"
+                                        spellcheck="false">
+                                    <button class="secondary-btn" type="button" id="authRegisterBtn">Create account</button>
+                                </div>
+                            </div>
+                            <div class="auth-screen hidden" data-auth-view="forgot" id="authForgotScreen">
+                                <div class="task-lookup-actions">
+                                    <input
+                                        type="email"
+                                        id="authForgotEmail"
+                                        class="task-id-input"
+                                        placeholder="Email"
+                                        autocomplete="email"
+                                        autocapitalize="off"
+                                        autocorrect="off"
+                                        spellcheck="false">
+                                    <button class="secondary-btn" type="button" id="authForgotBtn">Send reset link</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-group" id="accessTokenGroup">
                         <label for="accessTokenInput">Access Token</label>
                         <div class="task-lookup-actions">
                             <input
@@ -75,16 +164,11 @@
                             <button class="secondary-btn" id="saveAccessTokenBtn">Save</button>
                         </div>
                         <div class="task-lookup-hint">
-                            Optional for auth mode. Stored locally on this device (localStorage).
-                        </div>
-                        <div class="task-lookup-actions">
-                            <button class="secondary-btn" id="googleSignInBtn">
-                                Sign in with Google
-                            </button>
+                            Optional in hybrid mode. Stored in memory for this session.
                         </div>
                     </div>
 
-                    <div class="form-group">
+                    <div class="form-group" id="apiKeyGroup">
                         <label for="apiKeyInput">API Key</label>
                         <div class="task-lookup-actions">
                             <input
