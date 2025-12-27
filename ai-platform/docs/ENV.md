@@ -29,3 +29,9 @@ Open `http://localhost` in your browser.
 - **Example:** `ENABLE_FILE_PERSISTENCE=true`
 - **Required in production?:** Optional
 - **Notes:** Defaults to enabled outside production; defaults to disabled in production.
+
+### CODEX_PATH
+- **Purpose:** Override the JSON codex loaded by the orchestrator.
+- **Example:** `CODEX_PATH=ai-platform/backend/app/codex.json`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `backend/app/codex.json` relative to the backend source.

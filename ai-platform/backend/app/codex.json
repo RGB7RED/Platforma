@@ -124,6 +124,8 @@
   
   "workflow": {
     "stages": ["research", "design", "implementation", "review"],
+    "max_iterations": 12,
+    "require_review": true,
     "triggers": {
       "next_stage": "previous_stage_complete",
       "rollback": "review_failed_3_times",

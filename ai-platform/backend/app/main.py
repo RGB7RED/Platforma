@@ -1021,6 +1021,13 @@ async def process_task_background(task_id: str, description: str):
                     }
                 ),
             )
+
+        async def handle_codex_loaded(payload: Dict[str, Any]) -> None:
+            await record_event(
+                task_id,
+                "codex_loaded",
+                normalize_payload(payload),
+            )
         
         # Обрабатываем задачу
         result = await orchestrator.process_task(
@@ -1030,6 +1037,7 @@ async def process_task_background(task_id: str, description: str):
                 "research_complete": handle_research_complete,
                 "design_complete": handle_design_complete,
                 "review_result": handle_review_result,
+                "codex_loaded": handle_codex_loaded,
             },
         )
         
