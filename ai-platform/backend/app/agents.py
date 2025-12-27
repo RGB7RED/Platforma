@@ -5,8 +5,12 @@
 
 import json
 import logging
-from typing import Dict, Any, Optional, List
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional, List
 
 from .models import Container
 
@@ -1122,81 +1126,117 @@ class AIReviewer(AIAgent):
         issues = []
         warnings = []
         passed_checks = []
-        
+
         # Проверяем файлы
         for filepath, content in container.files.items():
             file_issues, file_warnings, file_passed = self._review_file(filepath, content)
             issues.extend(file_issues)
             warnings.extend(file_warnings)
             passed_checks.extend(file_passed)
-        
+
         # Проверяем соответствие архитектуре
         if container.target_architecture:
             arch_issues, arch_warnings = self._check_architecture_compliance(container)
             issues.extend(arch_issues)
             warnings.extend(arch_warnings)
-        
+
         # Проверяем наличие тестов
         test_files = [f for f in container.files.keys() if 'test' in f.lower()]
         if not test_files:
             warnings.append("No test files found")
         else:
             passed_checks.append(f"Found {len(test_files)} test files")
-        
+
         # Проверяем прогресс
         if container.progress < 0.5 and len(container.history) > 10:
             warnings.append(f"Low progress ({container.progress:.0%}) after {len(container.history)} iterations")
-        
+
         # Проверяем наличие документации
         doc_files = [f for f in container.files.keys() if f.endswith('.md')]
         if not doc_files:
             warnings.append("No documentation files found")
         else:
             passed_checks.append(f"Found {len(doc_files)} documentation files")
-        
-        # Определяем статус
-        if issues:
-            status = "rejected"
-            message = f"Found {len(issues)} critical issues"
-        elif warnings:
+
+        ruff_report = {
+            "ran": False,
+            "command": None,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+        }
+        pytest_report = {
+            "ran": False,
+            "command": None,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+        }
+        tool_warnings: List[str] = []
+        tool_errors: List[str] = []
+
+        if container.files:
+            with tempfile.TemporaryDirectory() as workspace:
+                workspace_path = Path(workspace)
+                self._write_container_files(workspace_path, container.files)
+
+                ruff_report, pytest_report, tool_warnings, tool_errors = self._run_quality_checks(
+                    workspace_path,
+                    container.files,
+                )
+        else:
+            tool_warnings.append("No files available for quality checks")
+
+        warnings.extend(tool_warnings)
+        errors = issues + tool_errors
+
+        passed = len(errors) == 0
+        if passed and warnings:
             status = "approved_with_warnings"
             message = f"Approved with {len(warnings)} warnings"
-        else:
+        elif passed:
             status = "approved"
             message = "All checks passed"
-        
+        else:
+            status = "rejected"
+            message = f"Found {len(errors)} critical issues"
+
         review_result = {
             "status": status,
+            "passed": passed,
             "message": message,
             "timestamp": datetime.now().isoformat(),
             "issues": issues,
             "warnings": warnings,
+            "errors": errors,
             "passed_checks": passed_checks,
             "files_reviewed": len(container.files),
             "checklist_used": checklist,
+            "ruff": ruff_report,
+            "pytest": pytest_report,
             "summary": {
                 "total_files": len(container.files),
                 "total_issues": len(issues),
                 "total_warnings": len(warnings),
                 "test_coverage": f"{len(test_files)}/{len(container.files)} files",
-                "progress": container.progress
-            }
+                "progress": container.progress,
+            },
         }
-        
+
         # Добавляем артефакт ревью
         container.add_artifact(
-            "reviews",
+            "review_report",
             review_result,
             self.role_name
         )
-        
+
         self._log_action("review_completed", {
             "status": status,
-            "issues": len(issues),
+            "issues": len(errors),
             "warnings": len(warnings),
             "passed_checks": len(passed_checks)
         })
-        
+
         return review_result
     
     def _review_file(self, filepath: str, content: str):
@@ -1261,6 +1301,81 @@ class AIReviewer(AIAgent):
                 passed.append(f"{filepath}: Has {len(import_lines)} import statements")
         
         return issues, warnings, passed
+
+    def _run_quality_checks(
+        self,
+        workspace_path: Path,
+        files: Dict[str, str],
+    ) -> tuple[Dict[str, Any], Dict[str, Any], List[str], List[str]]:
+        ruff_report = {
+            "ran": False,
+            "command": None,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+        }
+        pytest_report = {
+            "ran": False,
+            "command": None,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+        }
+        warnings: List[str] = []
+        errors: List[str] = []
+
+        python_files = [name for name in files.keys() if name.endswith(".py")]
+        if python_files:
+            if shutil.which("ruff"):
+                ruff_report = self._run_command(["ruff", "check", "."], cwd=workspace_path)
+                if ruff_report["exit_code"] != 0:
+                    errors.append(f"ruff failed with exit code {ruff_report['exit_code']}")
+            else:
+                errors.append("ruff executable not found")
+        else:
+            warnings.append("Ruff skipped: no python files found")
+
+        if self._has_tests(files):
+            if shutil.which("pytest"):
+                pytest_report = self._run_command(["pytest", "-q"], cwd=workspace_path)
+                if pytest_report["exit_code"] != 0:
+                    errors.append(f"pytest failed with exit code {pytest_report['exit_code']}")
+            else:
+                errors.append("pytest executable not found")
+        else:
+            warnings.append("Pytest skipped: no tests found")
+
+        return ruff_report, pytest_report, warnings, errors
+
+    def _has_tests(self, files: Dict[str, str]) -> bool:
+        for filepath in files.keys():
+            path = Path(filepath)
+            if path.suffix != ".py":
+                continue
+            if path.name.startswith("test_") or path.name.endswith("_test.py") or "tests" in path.parts:
+                return True
+        return False
+
+    def _write_container_files(self, workspace_path: Path, files: Dict[str, str]) -> None:
+        for filepath, content in files.items():
+            target_path = workspace_path / filepath
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(content, encoding="utf-8")
+
+    def _run_command(self, command: List[str], cwd: Path) -> Dict[str, Any]:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        return {
+            "ran": True,
+            "command": " ".join(command),
+            "exit_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
     
     def _check_architecture_compliance(self, container: Container):
         """Проверить соответствие архитектуре"""

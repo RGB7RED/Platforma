@@ -66,7 +66,8 @@ class AIOrchestrator:
             "workflow": {
                 "stages": ["research", "design", "implementation", "review"],
                 "max_iterations": 15,
-                "require_review": True
+                "require_review": True,
+                "review_required": True
             }
         }
 
@@ -86,7 +87,10 @@ class AIOrchestrator:
         if max_iterations is not None and (not isinstance(max_iterations, int) or max_iterations <= 0):
             return False
         require_review = workflow.get("require_review")
+        review_required = workflow.get("review_required")
         if require_review is not None and not isinstance(require_review, bool):
+            return False
+        if review_required is not None and not isinstance(review_required, bool):
             return False
         return True
 
@@ -97,10 +101,11 @@ class AIOrchestrator:
     def _codex_summary(self) -> Dict[str, Any]:
         workflow = self.codex.get("workflow", {})
         rules = self.codex.get("rules", {})
+        review_required = workflow.get("review_required", workflow.get("require_review", True))
         return {
             "workflow_stages": workflow.get("stages", []),
             "max_iterations": workflow.get("max_iterations"),
-            "require_review": workflow.get("require_review", True),
+            "review_required": review_required,
             "roles": sorted(rules.keys()),
         }
     
@@ -233,15 +238,23 @@ class AIOrchestrator:
                 
                 # 3.3 Ревьюер проверяет результат
                 self.container.metadata["active_role"] = "reviewer"
+                await self._run_hook(
+                    callbacks.get("review_started") if callbacks else None,
+                    {"kind": "iteration", "iteration": iteration},
+                )
                 review_result = await self.roles["reviewer"].execute(
                     self.container
+                )
+                await self._run_hook(
+                    callbacks.get("review_finished") if callbacks else None,
+                    {"result": review_result, "kind": "iteration", "iteration": iteration},
                 )
                 await self._run_hook(
                     callbacks.get("review_result") if callbacks else None,
                     {"result": review_result, "kind": "iteration", "iteration": iteration},
                 )
                 
-                if review_result["status"] == "approved":
+                if review_result.get("passed"):
                     logger.info(f"Iteration {iteration} approved")
                     self.container.update_progress(iteration / max_iterations)
                 else:
@@ -249,8 +262,11 @@ class AIOrchestrator:
                     # В MVP просто продолжаем, в реальной системе - корректируем
             
             # Фаза 4: Финальное ревью
-            require_review = self.codex.get("workflow", {}).get("require_review", True)
-            if require_review:
+            review_required = self.codex.get("workflow", {}).get(
+                "review_required",
+                self.codex.get("workflow", {}).get("require_review", True),
+            )
+            if review_required:
                 logger.info("Phase 4: Final Review")
                 await self._run_hook(
                     callbacks.get("stage_started") if callbacks else None,
@@ -258,15 +274,23 @@ class AIOrchestrator:
                 )
                 self.container.update_state(ProjectState.REVIEW, "Final quality check")
                 
+                await self._run_hook(
+                    callbacks.get("review_started") if callbacks else None,
+                    {"kind": "final"},
+                )
                 final_review = await self.roles["reviewer"].execute(
                     self.container
+                )
+                await self._run_hook(
+                    callbacks.get("review_finished") if callbacks else None,
+                    {"result": final_review, "kind": "final"},
                 )
                 await self._run_hook(
                     callbacks.get("review_result") if callbacks else None,
                     {"result": final_review, "kind": "final"},
                 )
                 
-                if final_review["status"] in {"approved", "approved_with_warnings"}:
+                if final_review.get("passed"):
                     self.container.update_state(ProjectState.COMPLETE, "Project completed")
                     self.container.update_progress(1.0)
                     logger.info("Project completed successfully")

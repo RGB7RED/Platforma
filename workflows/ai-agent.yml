@@ -3,6 +3,8 @@ name: AI Agent – Issue Listener
 on:
   issues:
     types: [opened]
+  pull_request:
+  push:
 
 jobs:
   acknowledge:
@@ -23,3 +25,27 @@ jobs:
               issue_number: issueNumber,
               body: "🟢 Задача принята. Агент начал обработку."
             });
+
+  quality-gates:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'issues'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: ai-platform/backend
+        run: pip install -r requirements.txt
+
+      - name: Ruff
+        working-directory: ai-platform/backend
+        run: ruff check .
+
+      - name: Pytest
+        working-directory: ai-platform/backend
+        run: pytest -q

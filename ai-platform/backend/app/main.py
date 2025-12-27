@@ -1239,6 +1239,28 @@ async def process_task_background(task_id: str, description: str):
             await persist_all_container_files(task_id, container)
             await persist_container_snapshot(task_id, container)
 
+        async def handle_review_started(payload: Dict[str, Any]) -> None:
+            await record_event(
+                task_id,
+                "review_started",
+                normalize_payload(payload),
+            )
+
+        async def handle_review_finished(payload: Dict[str, Any]) -> None:
+            result = payload.get("result") if isinstance(payload, dict) else None
+            await record_event(
+                task_id,
+                "review_finished",
+                normalize_payload(
+                    {
+                        "kind": payload.get("kind") if isinstance(payload, dict) else None,
+                        "iteration": payload.get("iteration") if isinstance(payload, dict) else None,
+                        "passed": result.get("passed") if isinstance(result, dict) else None,
+                        "status": result.get("status") if isinstance(result, dict) else None,
+                    }
+                ),
+            )
+
         async def handle_review_result(payload: Dict[str, Any]) -> None:
             result = payload.get("result")
             await record_artifact(
@@ -1277,6 +1299,8 @@ async def process_task_background(task_id: str, description: str):
                 "stage_started": handle_stage_started,
                 "research_complete": handle_research_complete,
                 "design_complete": handle_design_complete,
+                "review_started": handle_review_started,
+                "review_finished": handle_review_finished,
                 "review_result": handle_review_result,
                 "codex_loaded": handle_codex_loaded,
             },

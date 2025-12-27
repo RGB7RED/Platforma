@@ -124,12 +124,13 @@ class TestAIAgents:
         
         # Проверяем результат
         assert "status" in result
+        assert "passed" in result
         assert "issues" in result
         assert "warnings" in result
         assert "files_reviewed" in result
         
         # Проверяем, что ревью добавлен в артефакты
-        assert len(container.artifacts["reviews"]) == 1
+        assert len(container.artifacts["review_report"]) == 1
     
     def test_reviewer_file_review(self, codex):
         """Тест проверки файла"""
