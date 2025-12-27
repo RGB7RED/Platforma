@@ -1,10 +1,11 @@
 (() => {
   const API_BASE_URL =
-    window.API_BASE_URL ||
     document.querySelector('meta[name="api-base-url"]')?.content ||
+    window.API_BASE_URL ||
     '';
 
-  const POLL_INTERVAL_MS = 1200;
+  const POLL_INTERVAL_MS = 2000;
+  const POLL_SLOW_INTERVAL_MS = 4000;
   const POLL_TIMEOUT_MS = 3 * 60 * 1000;
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'error']);
 
@@ -33,6 +34,21 @@
     taskStatus: document.getElementById('taskStatus'),
     apiBaseUrl: document.getElementById('apiBaseUrl'),
     taskError: document.getElementById('taskError'),
+    taskIdInput: document.getElementById('taskIdInput'),
+    loadTaskBtn: document.getElementById('loadTaskBtn'),
+    copyTaskIdBtn: document.getElementById('copyTaskIdBtn'),
+    inspectorTabs: document.getElementById('inspectorTabs'),
+    statePanel: document.getElementById('statePanel'),
+    stateTable: document.getElementById('stateTable'),
+    stateError: document.getElementById('stateError'),
+    eventsPanel: document.getElementById('eventsPanel'),
+    eventsList: document.getElementById('eventsList'),
+    eventsError: document.getElementById('eventsError'),
+    artifactsPanel: document.getElementById('artifactsPanel'),
+    artifactsList: document.getElementById('artifactsList'),
+    artifactsError: document.getElementById('artifactsError'),
+    artifactTypeInput: document.getElementById('artifactTypeInput'),
+    artifactFilterBtn: document.getElementById('artifactFilterBtn'),
     resultJson: document.getElementById('resultJson'),
     resultStatus: document.getElementById('resultStatus'),
     loadingOverlay: document.getElementById('loadingOverlay'),
@@ -44,8 +60,17 @@
   };
 
   let currentTaskId = null;
-  let pollingTimer = null;
   let pollStartTime = null;
+  let pollingIntervals = {
+    status: null,
+    state: null,
+    events: null,
+    artifacts: null
+  };
+  let lastEventSignature = '';
+  let lastArtifactSignature = '';
+  let artifactTypeFilter = '';
+  let activeInspectorTab = 'state';
 
   const sections = [
     elements.welcomeScreen,
@@ -103,6 +128,31 @@
       return;
     }
     elements.apiBaseUrl.textContent = API_BASE_URL || '(same origin)';
+  };
+
+  const formatShortDate = (value) => {
+    if (!value) {
+      return '-';
+    }
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return String(value);
+    }
+    return date.toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+
+  const renderPanelError = (element, message) => {
+    if (!element) {
+      return;
+    }
+    element.textContent = message || '';
+    element.classList.toggle('hidden', !message);
   };
 
   const formatProgress = (progress) => {
@@ -166,10 +216,12 @@
   };
 
   const stopPolling = () => {
-    if (pollingTimer) {
-      clearTimeout(pollingTimer);
-      pollingTimer = null;
-    }
+    Object.keys(pollingIntervals).forEach((key) => {
+      if (pollingIntervals[key]) {
+        clearInterval(pollingIntervals[key]);
+        pollingIntervals[key] = null;
+      }
+    });
     pollStartTime = null;
   };
 
@@ -185,7 +237,143 @@
   };
 
   const schedulePoll = (taskId) => {
-    pollingTimer = setTimeout(() => pollTask(taskId), POLL_INTERVAL_MS);
+    pollingIntervals.status = setInterval(() => pollTask(taskId), POLL_INTERVAL_MS);
+    pollingIntervals.state = setInterval(() => pollState(taskId), POLL_INTERVAL_MS);
+    pollingIntervals.events = setInterval(() => pollEvents(taskId), POLL_SLOW_INTERVAL_MS);
+    pollingIntervals.artifacts = setInterval(() => pollArtifacts(taskId), POLL_SLOW_INTERVAL_MS);
+  };
+
+  const fetchJson = async (url) => {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        const message = response.status === 501
+          ? 'DB not enabled on backend'
+          : response.status === 404
+            ? 'Task not found'
+            : `Request failed (${response.status})`;
+        return { error: message, status: response.status };
+      }
+      const data = await response.json();
+      return { data };
+    } catch (error) {
+      return { error: 'Unable to reach the backend. Please try again.' };
+    }
+  };
+
+  const fetchTask = async (taskId) => fetchJson(`${API_BASE_URL}/api/tasks/${taskId}`);
+
+  const fetchState = async (taskId) => fetchJson(`${API_BASE_URL}/api/tasks/${taskId}/state`);
+
+  const fetchEvents = async (taskId, { limit = 200, order = 'desc' } = {}) => {
+    const params = new URLSearchParams({ limit: String(limit), order });
+    return fetchJson(`${API_BASE_URL}/api/tasks/${taskId}/events?${params.toString()}`);
+  };
+
+  const fetchArtifacts = async (
+    taskId,
+    { type = '', limit = 200, order = 'desc' } = {}
+  ) => {
+    const params = new URLSearchParams({ limit: String(limit), order });
+    if (type) {
+      params.set('type', type);
+    }
+    return fetchJson(`${API_BASE_URL}/api/tasks/${taskId}/artifacts?${params.toString()}`);
+  };
+
+  const formatPayloadSummary = (payload) => {
+    if (payload === null || payload === undefined) {
+      return 'No payload';
+    }
+    const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    if (!text) {
+      return 'No payload';
+    }
+    return text.length > 120 ? `${text.slice(0, 120)}…` : text;
+  };
+
+  const getItemKey = (item) =>
+    item?.id || item?._id || item?.event_id || item?.artifact_id || item?.created_at || '';
+
+  const renderStatePanel = (state) => {
+    if (!elements.stateTable) {
+      return;
+    }
+    const entries = [
+      { label: 'status', value: state?.status },
+      { label: 'progress', value: state?.progress },
+      { label: 'current_stage', value: state?.current_stage },
+      { label: 'active_role', value: state?.active_role },
+      { label: 'current_task', value: state?.current_task },
+      { label: 'container_state', value: state?.container_state },
+      { label: 'container_progress', value: state?.container_progress },
+      { label: 'updated_at', value: formatShortDate(state?.updated_at) }
+    ];
+    elements.stateTable.innerHTML = entries
+      .map(
+        (entry) => `
+          <div class="state-item">
+            <span>${entry.label}</span>
+            <strong>${entry.value ?? '-'}</strong>
+          </div>
+        `
+      )
+      .join('');
+  };
+
+  const renderEvents = (events) => {
+    if (!elements.eventsList) {
+      return;
+    }
+    if (!Array.isArray(events) || events.length === 0) {
+      elements.eventsList.innerHTML = '<div class="event-item">No events yet.</div>';
+      return;
+    }
+    elements.eventsList.innerHTML = events
+      .map((event) => {
+        const payload = event?.payload ?? event?.data ?? event?.details ?? event;
+        return `
+          <div class="event-item">
+            <div class="event-header">
+              <span class="event-type">${event?.type || 'event'}</span>
+              <span class="event-meta">${formatShortDate(event?.created_at)}</span>
+            </div>
+            <details class="payload-details">
+              <summary>${formatPayloadSummary(payload)}</summary>
+              <pre>${JSON.stringify(payload, null, 2)}</pre>
+            </details>
+          </div>
+        `;
+      })
+      .join('');
+  };
+
+  const renderArtifacts = (artifacts) => {
+    if (!elements.artifactsList) {
+      return;
+    }
+    if (!Array.isArray(artifacts) || artifacts.length === 0) {
+      elements.artifactsList.innerHTML = '<div class="artifact-item">No artifacts yet.</div>';
+      return;
+    }
+    elements.artifactsList.innerHTML = artifacts
+      .map((artifact) => {
+        const payload = artifact?.payload ?? artifact?.data ?? artifact;
+        return `
+          <div class="artifact-item">
+            <div class="artifact-header">
+              <span class="artifact-badge">${artifact?.type || 'artifact'}</span>
+              <span class="artifact-meta">${formatShortDate(artifact?.created_at)}</span>
+            </div>
+            <div class="artifact-meta">Produced by: ${artifact?.produced_by || '-'}</div>
+            <details class="payload-details">
+              <summary>${formatPayloadSummary(payload)}</summary>
+              <pre>${JSON.stringify(payload, null, 2)}</pre>
+            </details>
+          </div>
+        `;
+      })
+      .join('');
   };
 
   const pollTask = async (taskId) => {
@@ -202,12 +390,23 @@
       return;
     }
 
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/tasks/${taskId}`);
-      if (!response.ok) {
-        throw new Error(`Status request failed (${response.status})`);
+    const { data, error, status } = await fetchTask(taskId);
+    if (error) {
+      renderPanelError(elements.stateError, error);
+      renderPanelError(elements.eventsError, error);
+      renderPanelError(elements.artifactsError, error);
+      if (elements.taskError) {
+        elements.taskError.textContent = error;
+        elements.taskError.classList.remove('hidden');
       }
-      const data = await response.json();
+      showToast(error, '⚠️');
+      if (status === 404) {
+        stopPolling();
+        setSubmitDisabled(false);
+      }
+      return;
+    }
+    if (data) {
       updateStatusPanel(data);
 
       const progressInfo = formatProgress(data.progress);
@@ -223,23 +422,97 @@
         setSubmitDisabled(false);
         return;
       }
-
-      schedulePoll(taskId);
-    } catch (error) {
-      stopPolling();
-      if (elements.taskError) {
-        elements.taskError.textContent = 'Unable to reach the backend. Please try again.';
-        elements.taskError.classList.remove('hidden');
-      }
-      showToast('Unable to reach the backend. Please try again.', '⚠️');
-      setSubmitDisabled(false);
     }
+  };
+
+  const pollState = async (taskId) => {
+    const { data, error } = await fetchState(taskId);
+    if (error) {
+      renderPanelError(elements.stateError, error);
+      return;
+    }
+    renderPanelError(elements.stateError, '');
+    renderStatePanel(data);
+  };
+
+  const pollEvents = async (taskId) => {
+    const { data, error } = await fetchEvents(taskId);
+    if (error) {
+      renderPanelError(elements.eventsError, error);
+      return;
+    }
+    renderPanelError(elements.eventsError, '');
+    const events = Array.isArray(data) ? data : data?.events || data?.items || [];
+    const signature = JSON.stringify(events.slice(0, 20).map(getItemKey));
+    if (signature === lastEventSignature) {
+      return;
+    }
+    lastEventSignature = signature;
+    renderEvents(events);
+  };
+
+  const pollArtifacts = async (taskId) => {
+    const { data, error } = await fetchArtifacts(taskId, { type: artifactTypeFilter });
+    if (error) {
+      renderPanelError(elements.artifactsError, error);
+      return;
+    }
+    renderPanelError(elements.artifactsError, '');
+    const artifacts = Array.isArray(data) ? data : data?.artifacts || data?.items || [];
+    const signature = JSON.stringify(artifacts.slice(0, 20).map(getItemKey));
+    if (signature === lastArtifactSignature) {
+      return;
+    }
+    lastArtifactSignature = signature;
+    renderArtifacts(artifacts);
   };
 
   const startPolling = (taskId) => {
     stopPolling();
     pollStartTime = Date.now();
+    lastEventSignature = '';
+    lastArtifactSignature = '';
+    pollTask(taskId);
+    pollState(taskId);
+    pollEvents(taskId);
+    pollArtifacts(taskId);
     schedulePoll(taskId);
+  };
+
+  const setActiveInspectorTab = (tab) => {
+    activeInspectorTab = tab;
+    if (elements.inspectorTabs) {
+      elements.inspectorTabs.querySelectorAll('.tab-btn').forEach((button) => {
+        button.classList.toggle('active', button.dataset.tab === tab);
+      });
+    }
+    if (elements.statePanel) {
+      elements.statePanel.classList.toggle('hidden', tab !== 'state');
+    }
+    if (elements.eventsPanel) {
+      elements.eventsPanel.classList.toggle('hidden', tab !== 'events');
+    }
+    if (elements.artifactsPanel) {
+      elements.artifactsPanel.classList.toggle('hidden', tab !== 'artifacts');
+    }
+  };
+
+  const activateTask = (taskId, { focusState = false } = {}) => {
+    currentTaskId = taskId;
+    if (elements.currentTaskId) {
+      elements.currentTaskId.textContent = taskId;
+    }
+    if (elements.taskIdInput) {
+      elements.taskIdInput.value = taskId;
+    }
+    renderPanelError(elements.stateError, '');
+    renderPanelError(elements.eventsError, '');
+    renderPanelError(elements.artifactsError, '');
+    if (focusState) {
+      setActiveInspectorTab('state');
+    }
+    showSection(elements.taskProgress);
+    startPolling(taskId);
   };
 
   const submitTask = async () => {
@@ -281,17 +554,12 @@
         throw new Error('Task ID not returned from server');
       }
 
-      currentTaskId = taskId;
-      if (elements.currentTaskId) {
-        elements.currentTaskId.textContent = taskId;
-      }
       if (elements.progressTime) {
         elements.progressTime.textContent = 'Started: Just now';
       }
-      showSection(elements.taskProgress);
+      activateTask(taskId, { focusState: true });
       updateStatusPanel({ status: 'queued', current_stage: 'starting', progress: 0 });
       setLoading(false);
-      startPolling(taskId);
     } catch (error) {
       setLoading(false);
       setSubmitDisabled(false);
@@ -309,6 +577,33 @@
       return;
     }
     pollTask(currentTaskId);
+    pollState(currentTaskId);
+    pollEvents(currentTaskId);
+    pollArtifacts(currentTaskId);
+  };
+
+  const loadTask = () => {
+    const taskId = elements.taskIdInput?.value.trim();
+    if (!taskId) {
+      showToast('Please enter a task_id to load.', '⚠️');
+      return;
+    }
+    resetResultPanel();
+    activateTask(taskId, { focusState: true });
+  };
+
+  const copyTaskId = async () => {
+    const value = elements.taskIdInput?.value || currentTaskId || '';
+    if (!value) {
+      showToast('No task_id to copy.', '⚠️');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(value);
+      showToast('Task ID copied.', '✅');
+    } catch (error) {
+      showToast('Unable to copy task ID.', '⚠️');
+    }
   };
 
   if (elements.startTaskBtn) {
@@ -355,10 +650,59 @@
     elements.submitTaskBtn.addEventListener('click', submitTask);
   }
 
+  if (elements.loadTaskBtn) {
+    elements.loadTaskBtn.addEventListener('click', loadTask);
+  }
+
+  if (elements.taskIdInput) {
+    elements.taskIdInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        loadTask();
+      }
+    });
+  }
+
+  if (elements.copyTaskIdBtn) {
+    elements.copyTaskIdBtn.addEventListener('click', copyTaskId);
+  }
+
+  if (elements.inspectorTabs) {
+    elements.inspectorTabs.addEventListener('click', (event) => {
+      const button = event.target.closest('.tab-btn');
+      if (!button) {
+        return;
+      }
+      setActiveInspectorTab(button.dataset.tab);
+    });
+  }
+
+  if (elements.artifactFilterBtn) {
+    elements.artifactFilterBtn.addEventListener('click', () => {
+      artifactTypeFilter = elements.artifactTypeInput?.value.trim() || '';
+      lastArtifactSignature = '';
+      if (currentTaskId) {
+        pollArtifacts(currentTaskId);
+      }
+    });
+  }
+
+  if (elements.artifactTypeInput) {
+    elements.artifactTypeInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        artifactTypeFilter = elements.artifactTypeInput?.value.trim() || '';
+        lastArtifactSignature = '';
+        if (currentTaskId) {
+          pollArtifacts(currentTaskId);
+        }
+      }
+    });
+  }
+
   if (elements.taskDescription) {
     elements.taskDescription.addEventListener('input', updateCharCount);
   }
 
   updateCharCount();
   updateApiBaseUrl();
+  setActiveInspectorTab(activeInspectorTab);
 })();
