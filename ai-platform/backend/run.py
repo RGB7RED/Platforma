@@ -22,18 +22,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def get_port() -> int:
+    """Return the port the server should bind to."""
+    return int(os.getenv("PORT", "8000"))
+
+
+def log_startup(port: int) -> None:
+    """Log a single startup line for process managers."""
+    auth_mode = os.getenv("AUTH_MODE", "unset")
+    logger.info("Starting on 0.0.0.0:%s (AUTH_MODE=%s)", port, auth_mode)
+
 
 async def run_backend():
     """Запуск FastAPI бекенда"""
     import uvicorn
-    
-    logger.info("Starting AI Platform Backend...")
-    
+
+    port = get_port()
+    log_startup(port)
     config = uvicorn.Config(
         app=app,
         host="0.0.0.0",
-        port=8000,
-        reload=True,
+        port=port,
+        reload=False,
         log_level="info",
         access_log=True
     )
@@ -69,15 +79,14 @@ def run_development():
 
 def run_production():
     """Режим production"""
-    logger.info("Running in production mode...")
-    
-    # Отключаем reload в production
     import uvicorn
-    
+
+    port = get_port()
+    log_startup(port)
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         workers=4,
         log_level="info"
     )
@@ -106,7 +115,7 @@ Usage:
   python run.py [command]
 
 Commands:
-  dev        - Run in development mode (default)
+  dev        - Run in development mode
   prod       - Run in production mode
   test       - Run tests
   backend    - Run only backend
@@ -124,7 +133,7 @@ Examples:
 def main():
     """Основная функция"""
     if len(sys.argv) < 2:
-        mode = "dev"
+        mode = "prod"
     else:
         mode = sys.argv[1].lower()
     
