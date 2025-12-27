@@ -80,6 +80,11 @@
     apiKeyInput: document.getElementById('apiKeyInput'),
     saveApiKeyBtn: document.getElementById('saveApiKeyBtn'),
     taskError: document.getElementById('taskError'),
+    clarificationPanel: document.getElementById('clarificationPanel'),
+    clarificationMessage: document.getElementById('clarificationMessage'),
+    clarificationForm: document.getElementById('clarificationForm'),
+    submitClarificationBtn: document.getElementById('submitClarificationBtn'),
+    resumeTaskBtn: document.getElementById('resumeTaskBtn'),
     taskIdInput: document.getElementById('taskIdInput'),
     loadTaskBtn: document.getElementById('loadTaskBtn'),
     copyTaskIdBtn: document.getElementById('copyTaskIdBtn'),
@@ -130,6 +135,7 @@
   };
   let lastEventSignature = '';
   let lastArtifactSignature = '';
+  let lastQuestionsSignature = '';
   let artifactTypeFilter = '';
   let activeInspectorTab = 'state';
   let latestFilesTotal = null;
@@ -139,6 +145,7 @@
   let activeFileContent = '';
   let activeSocket = null;
   let latestTaskSnapshot = null;
+  let latestQuestionsPayload = null;
 
   const sections = [
     elements.welcomeScreen,
@@ -624,6 +631,11 @@
     }
     updateTimeTakenDisplay(normalized);
     refreshMetricsDisplay();
+    if (String(normalized.status).toLowerCase() === 'needs_input' && currentTaskId) {
+      loadClarificationQuestions(currentTaskId);
+    } else {
+      setClarificationPanelVisible(false);
+    }
   };
   const isTerminalState = (data) => {
     const progressInfo = formatProgress(data?.progress);
@@ -643,6 +655,8 @@
     latestFilesTotal = null;
     latestArtifactsTotal = null;
     latestTaskSnapshot = null;
+    latestQuestionsPayload = null;
+    lastQuestionsSignature = '';
     updateSummaryCounts({ filesTotal: 0, artifactsTotal: 0, iterationsUsed: 0, maxIterations: null });
     setDownloadEnabled(false);
     updateTimeTakenDisplay({});
@@ -664,6 +678,10 @@
     if (elements.latestReviewResult) {
       elements.latestReviewResult.textContent = '—';
     }
+    if (elements.clarificationForm) {
+      elements.clarificationForm.innerHTML = '';
+    }
+    setClarificationPanelVisible(false);
     resetFilePanel();
   };
 
@@ -748,6 +766,9 @@
     }
     return fetchJson(buildApiUrl(`/api/tasks/${taskId}/artifacts?${params.toString()}`));
   };
+
+  const fetchQuestions = async (taskId) =>
+    fetchJson(buildApiUrl(`/api/tasks/${taskId}/questions`));
 
   const formatPayloadSummary = (payload) => {
     if (payload === null || payload === undefined) {
@@ -861,6 +882,123 @@
         `
       )
       .join('');
+  };
+
+  const setClarificationPanelVisible = (isVisible) => {
+    if (!elements.clarificationPanel) {
+      return;
+    }
+    elements.clarificationPanel.classList.toggle('hidden', !isVisible);
+  };
+
+  const buildQuestionInput = (question, answerValue) => {
+    const questionId = question.id;
+    const labelText = question.required ? `${question.text} *` : question.text;
+    const rationale = question.rationale ? `<div class="task-lookup-hint">${question.rationale}</div>` : '';
+    if (question.type === 'choice' && Array.isArray(question.choices)) {
+      const options = question.choices
+        .map((choice) => {
+          const selected = choice === answerValue ? 'selected' : '';
+          return `<option value="${choice}" ${selected}>${choice}</option>`;
+        })
+        .join('');
+      return `
+        <div class="form-group">
+          <label>${labelText}</label>
+          <select class="task-priority-select" data-question-id="${questionId}">
+            <option value="">Select...</option>
+            ${options}
+          </select>
+          ${rationale}
+        </div>
+      `;
+    }
+    if (question.type === 'multi' && Array.isArray(question.choices)) {
+      const selectedValues = Array.isArray(answerValue) ? answerValue : [];
+      const options = question.choices
+        .map((choice) => {
+          const checked = selectedValues.includes(choice) ? 'checked' : '';
+          return `
+            <label class="task-lookup-hint">
+              <input type="checkbox" data-question-id="${questionId}" value="${choice}" ${checked} />
+              ${choice}
+            </label>
+          `;
+        })
+        .join('');
+      return `
+        <div class="form-group">
+          <label>${labelText}</label>
+          <div>${options}</div>
+          ${rationale}
+        </div>
+      `;
+    }
+    const safeValue = answerValue ? String(answerValue) : '';
+    return `
+      <div class="form-group">
+        <label>${labelText}</label>
+        <textarea
+          class="task-description-input"
+          rows="3"
+          data-question-id="${questionId}"
+        >${safeValue}</textarea>
+        ${rationale}
+      </div>
+    `;
+  };
+
+  const renderClarificationPanel = (payload) => {
+    if (!elements.clarificationForm || !elements.clarificationMessage) {
+      return;
+    }
+    latestQuestionsPayload = payload;
+    const questions = Array.isArray(payload?.pending_questions) ? payload.pending_questions : [];
+    if (!questions.length) {
+      elements.clarificationForm.innerHTML = '<div class="task-lookup-hint">No clarification questions available.</div>';
+      return;
+    }
+    const providedAnswers = payload?.provided_answers || {};
+    elements.clarificationForm.innerHTML = questions
+      .map((question) => buildQuestionInput(question, providedAnswers[question.id]))
+      .join('');
+    const requestedAt = payload?.requested_at ? `Requested at: ${formatShortDate(payload.requested_at)}` : '';
+    elements.clarificationMessage.textContent = requestedAt
+      ? `Please answer the questions below. ${requestedAt}`
+      : 'Please answer the questions below so the task can continue.';
+  };
+
+  const collectClarificationAnswers = () => {
+    if (!elements.clarificationForm || !latestQuestionsPayload) {
+      return {};
+    }
+    const questions = Array.isArray(latestQuestionsPayload.pending_questions)
+      ? latestQuestionsPayload.pending_questions
+      : [];
+    const answers = {};
+    questions.forEach((question) => {
+      if (!question?.id) {
+        return;
+      }
+      if (question.type === 'multi') {
+        const checked = [
+          ...elements.clarificationForm.querySelectorAll(`input[data-question-id="${question.id}"]:checked`)
+        ].map((item) => item.value);
+        if (checked.length) {
+          answers[question.id] = checked;
+        }
+        return;
+      }
+      const field = elements.clarificationForm.querySelector(`[data-question-id="${question.id}"]`);
+      if (!field) {
+        return;
+      }
+      const value = field.value?.trim() || '';
+      if (value) {
+        answers[question.id] = value;
+      }
+    });
+    return answers;
   };
 
   const resetFilePanel = () => {
@@ -1088,6 +1226,26 @@
       .join('');
   };
 
+  const loadClarificationQuestions = async (taskId) => {
+    if (!taskId || !elements.clarificationPanel) {
+      return;
+    }
+    const { data, error } = await fetchQuestions(taskId);
+    if (error) {
+      setClarificationPanelVisible(false);
+      return;
+    }
+    const questions = data?.pending_questions || [];
+    const signature = JSON.stringify(questions) + JSON.stringify(data?.provided_answers || {});
+    if (signature === lastQuestionsSignature) {
+      setClarificationPanelVisible(true);
+      return;
+    }
+    lastQuestionsSignature = signature;
+    setClarificationPanelVisible(true);
+    renderClarificationPanel(data);
+  };
+
   const pollTask = async (taskId) => {
     if (!pollStartTime) {
       pollStartTime = Date.now();
@@ -1209,6 +1367,7 @@
     pollStartTime = Date.now();
     lastEventSignature = '';
     lastArtifactSignature = '';
+    lastQuestionsSignature = '';
     pollTask(taskId);
     pollState(taskId);
     pollEvents(taskId);
@@ -1262,6 +1421,51 @@
     activeSocket.addEventListener('close', () => {
       activeSocket = null;
     });
+  };
+
+  const postClarificationInput = async (taskId, answers, { autoResume = false } = {}) => {
+    try {
+      const response = await fetch(buildApiUrl(`/api/tasks/${taskId}/input`), {
+        method: 'POST',
+        headers: buildAuthHeaders({
+          'Content-Type': 'application/json'
+        }),
+        body: JSON.stringify({ answers, auto_resume: autoResume })
+      });
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'Invalid API Key or no access to this task.'
+          : response.status === 400
+            ? 'Please answer all required questions before resuming.'
+            : `Request failed (${response.status})`;
+        throw new Error(message);
+      }
+      return { data: await response.json() };
+    } catch (error) {
+      return { error: error?.message || 'Unable to submit clarification answers.' };
+    }
+  };
+
+  const resumeClarificationTask = async (taskId) => {
+    try {
+      const response = await fetch(buildApiUrl(`/api/tasks/${taskId}/resume`), {
+        method: 'POST',
+        headers: buildAuthHeaders({
+          'Content-Type': 'application/json'
+        })
+      });
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'Invalid API Key or no access to this task.'
+          : response.status === 400
+            ? 'Please answer all required questions before resuming.'
+            : `Request failed (${response.status})`;
+        throw new Error(message);
+      }
+      return { data: await response.json() };
+    } catch (error) {
+      return { error: error?.message || 'Unable to resume task.' };
+    }
   };
 
   const setActiveInspectorTab = (tab) => {
@@ -1379,6 +1583,59 @@
     pollEvents(currentTaskId);
     pollArtifacts(currentTaskId);
     pollFiles(currentTaskId);
+    if (latestTaskSnapshot?.status === 'needs_input') {
+      loadClarificationQuestions(currentTaskId);
+    }
+  };
+
+  const submitClarificationAnswers = async () => {
+    if (!currentTaskId) {
+      showToast('No active task to update.', 'ℹ️');
+      return;
+    }
+    if (!getStoredApiKey()) {
+      showToast('Please save your API key before submitting answers.', '⚠️');
+      return;
+    }
+    const answers = collectClarificationAnswers();
+    setLoading(true, 'Saving answers...', 'Submitting clarification responses');
+    const { error } = await postClarificationInput(currentTaskId, answers);
+    setLoading(false);
+    if (error) {
+      showToast(error, '⚠️');
+      return;
+    }
+    showToast('Answers saved.', '✅');
+    await loadClarificationQuestions(currentTaskId);
+  };
+
+  const resumeClarification = async () => {
+    if (!currentTaskId) {
+      showToast('No active task to resume.', 'ℹ️');
+      return;
+    }
+    if (!getStoredApiKey()) {
+      showToast('Please save your API key before resuming.', '⚠️');
+      return;
+    }
+    const answers = collectClarificationAnswers();
+    setLoading(true, 'Resuming task...', 'Submitting answers and restarting processing');
+    const inputResult = await postClarificationInput(currentTaskId, answers);
+    if (inputResult.error) {
+      setLoading(false);
+      showToast(inputResult.error, '⚠️');
+      return;
+    }
+    const resumeResult = await resumeClarificationTask(currentTaskId);
+    setLoading(false);
+    if (resumeResult.error) {
+      showToast(resumeResult.error, '⚠️');
+      return;
+    }
+    showToast('Task resumed.', '✅');
+    lastQuestionsSignature = '';
+    setClarificationPanelVisible(false);
+    startPolling(currentTaskId);
   };
 
   const rerunReview = async () => {
@@ -1492,6 +1749,14 @@
 
   if (elements.refreshProgressBtn) {
     elements.refreshProgressBtn.addEventListener('click', refreshStatus);
+  }
+
+  if (elements.submitClarificationBtn) {
+    elements.submitClarificationBtn.addEventListener('click', submitClarificationAnswers);
+  }
+
+  if (elements.resumeTaskBtn) {
+    elements.resumeTaskBtn.addEventListener('click', resumeClarification);
   }
 
   if (elements.submitTaskBtn) {

@@ -35,10 +35,14 @@ from .agents import AIReviewer, SafeCommandRunner
 from .schemas import (
     ArtifactsResponse,
     ArtifactItem,
+    ClarificationQuestion,
     ContainerStateResponse,
     ContainerStateSnapshot,
     EventsResponse,
     EventItem,
+    TaskInputRequest,
+    TaskQuestionsResponse,
+    TaskResumeResponse,
 )
 from . import db
 from .logging_utils import (
@@ -408,6 +412,45 @@ def store_in_memory_state(task_id: str, state: Dict[str, Any]) -> None:
         "state": normalize_payload(state),
         "updated_at": db.now_utc(),
     }
+
+
+def normalize_questions(questions: Any) -> List[Dict[str, Any]]:
+    if not questions:
+        return []
+    if isinstance(questions, list):
+        return [q for q in questions if isinstance(q, dict)]
+    return []
+
+
+def merge_answer_payload(
+    existing: Optional[Dict[str, Any]],
+    incoming: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    if isinstance(existing, dict):
+        merged.update(existing)
+    if isinstance(incoming, dict):
+        merged.update(incoming)
+    return merged
+
+
+def validate_required_answers(
+    questions: List[Dict[str, Any]],
+    answers: Dict[str, Any],
+) -> List[str]:
+    missing: List[str] = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        if not question.get("required", True):
+            continue
+        question_id = question.get("id")
+        if not question_id:
+            continue
+        value = answers.get(question_id)
+        if value is None or value == "" or value == []:
+            missing.append(question_id)
+    return missing
 
 
 async def record_event(task_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
@@ -822,6 +865,7 @@ class QueueItem:
     description: str
     template_id: Optional[str] = None
     request_id: Optional[str] = None
+    resume_from_stage: Optional[str] = None
 
 
 class RateLimiter:
@@ -1126,6 +1170,7 @@ class TemplateInfo:
     description: str
     hash: str
     files: Dict[str, Any]
+    manifest: Dict[str, Any]
 
 
 def load_template_manifest(template_path: Path) -> Dict[str, Any]:
@@ -1187,6 +1232,7 @@ def resolve_template(template_id: str) -> Optional[TemplateInfo]:
         description=description,
         hash=template_hash,
         files=files,
+        manifest=manifest,
     )
 
 
@@ -1969,6 +2015,9 @@ async def create_task(request: TaskRequest, req: Request):
                 "owner_key_hash": owner_key_hash,
                 "request_id": request_id,
                 "failure_reason": None,
+                "pending_questions": [],
+                "provided_answers": {},
+                "resume_from_stage": None,
             }
             
             # Сохраняем связь пользователь -> задача
@@ -2027,6 +2076,133 @@ async def get_task_status(task_id: str, request: Request):
         if db.is_enabled():
             await resolve_container_with_db(task_id)
         return enrich_task_data(task_id, task_data)
+    finally:
+        reset_task_id(task_token)
+
+
+@app.get("/api/tasks/{task_id}/questions", response_model=TaskQuestionsResponse)
+async def get_task_questions(task_id: str, request: Request):
+    """Получение уточняющих вопросов для задачи"""
+    task_token = set_task_id(task_id)
+    try:
+        task_data = await ensure_task_owner(task_id, request)
+        pending_questions = normalize_questions(task_data.get("pending_questions"))
+        provided_answers = task_data.get("provided_answers") or {}
+        requested_at = None
+        if pending_questions:
+            if db.is_enabled():
+                artifacts = await db.get_artifacts(task_id, type="clarification_questions", limit=1, order="desc")
+            else:
+                artifacts = get_in_memory_artifacts(task_id, "clarification_questions", 1, "desc")
+            if artifacts:
+                payload = artifacts[0].get("payload") or {}
+                requested_at = payload.get("requested_at")
+        return {
+            "task_id": task_id,
+            "pending_questions": pending_questions,
+            "provided_answers": provided_answers,
+            "resume_from_stage": task_data.get("resume_from_stage"),
+            "requested_at": requested_at,
+        }
+    finally:
+        reset_task_id(task_token)
+
+
+@app.post("/api/tasks/{task_id}/input")
+async def submit_task_input(task_id: str, payload: TaskInputRequest, request: Request):
+    """Submit clarification answers for a task."""
+    task_token = set_task_id(task_id)
+    try:
+        task_data = await ensure_task_owner(task_id, request)
+        existing_answers = task_data.get("provided_answers")
+        merged_answers = merge_answer_payload(existing_answers, payload.answers)
+        if db.is_enabled():
+            await db.update_task_row(
+                task_id,
+                {
+                    "provided_answers": merged_answers,
+                },
+            )
+        else:
+            task_data["provided_answers"] = merged_answers
+            task_data["updated_at"] = db.now_utc()
+        await record_event(
+            task_id,
+            "clarification_received",
+            normalize_payload({"answers": merged_answers, "received_at": db.now_utc().isoformat()}),
+        )
+        if payload.auto_resume:
+            return await resume_task(task_id, request)
+        return {"task_id": task_id, "status": "input_saved"}
+    finally:
+        reset_task_id(task_token)
+
+
+@app.post("/api/tasks/{task_id}/resume", response_model=TaskResumeResponse)
+async def resume_task(task_id: str, request: Request):
+    """Resume a task that is waiting for clarification."""
+    task_token = set_task_id(task_id)
+    try:
+        task_data = await ensure_task_owner(task_id, request)
+        pending_questions = normalize_questions(task_data.get("pending_questions"))
+        provided_answers = task_data.get("provided_answers") or {}
+        missing = validate_required_answers(pending_questions, provided_answers)
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "missing_answers", "missing": missing},
+            )
+        resume_stage = task_data.get("resume_from_stage") or "implementation"
+        await record_event(
+            task_id,
+            "task_resumed",
+            normalize_payload({"resume_from_stage": resume_stage, "resumed_at": db.now_utc().isoformat()}),
+        )
+        if db.is_enabled():
+            await db.update_task_row(
+                task_id,
+                {
+                    "status": "queued",
+                    "progress": task_data.get("progress", 0.0),
+                    "current_stage": "clarification_resume",
+                    "pending_questions": [],
+                    "resume_from_stage": resume_stage,
+                    "provided_answers": provided_answers,
+                },
+            )
+        else:
+            task_data.update(
+                {
+                    "status": "queued",
+                    "current_stage": "clarification_resume",
+                    "pending_questions": [],
+                    "resume_from_stage": resume_stage,
+                    "provided_answers": provided_answers,
+                    "updated_at": db.now_utc(),
+                }
+            )
+        await record_state(
+            task_id,
+            build_container_state(
+                status="queued",
+                progress=task_data.get("progress", 0.0) or 0.0,
+                current_stage="clarification_resume",
+            ),
+        )
+        await task_governor.enqueue(
+            QueueItem(
+                task_id=task_id,
+                description=task_data.get("description"),
+                template_id=task_data.get("template_id"),
+                request_id=task_data.get("request_id"),
+                resume_from_stage=resume_stage,
+            )
+        )
+        return {
+            "task_id": task_id,
+            "status": "queued",
+            "resume_from_stage": resume_stage,
+        }
     finally:
         reset_task_id(task_token)
 
@@ -2310,6 +2486,7 @@ async def process_task_background(
     description: str,
     template_id: Optional[str] = None,
     request_id: Optional[str] = None,
+    resume_from_stage: Optional[str] = None,
 ):
     """Фоновая обработка задачи ИИ-агентами"""
     request_token = set_request_id(request_id)
@@ -2328,12 +2505,17 @@ async def process_task_background(
                 storage.active_tasks[task_id].update(fields)
                 await manager.send_progress(task_id, storage.active_tasks[task_id])
 
-        owner_key_hash = await get_task_owner_hash(task_id)
+        task_data = await db.get_task_row(task_id) if db.is_enabled() else storage.active_tasks.get(task_id)
+        if not task_data:
+            raise RuntimeError(f"Task {task_id} not found")
+        owner_key_hash = task_data.get("owner_key_hash") or await get_task_owner_hash(task_id)
         template_info: Optional[TemplateInfo] = None
         if template_id:
             template_info = resolve_template(template_id)
             if not template_info:
                 raise RuntimeError(f"Template '{template_id}' not found")
+        resume_stage = resume_from_stage or task_data.get("resume_from_stage")
+        provided_answers = task_data.get("provided_answers") if isinstance(task_data, dict) else None
 
         async def fail_quota_exceeded() -> None:
             completed_at = db.now_utc()
@@ -2400,14 +2582,24 @@ async def process_task_background(
         
         # Создаем оркестратор и контейнер
         orchestrator = AIOrchestrator()
-        container = orchestrator.initialize_project(f"Task-{task_id[:8]}")
-        if template_info:
-            for path, content in template_info.files.items():
-                container.add_file(path, content)
-            container.metadata["template_id"] = template_info.template_id
-            container.metadata["template_hash"] = template_info.hash
-        baseline_files = capture_baseline_files(container)
-        container.metadata["baseline_files"] = baseline_files
+        container = None
+        if resume_stage:
+            container = await resolve_container_with_db(task_id)
+        if not container:
+            container = orchestrator.initialize_project(f"Task-{task_id[:8]}")
+            if template_info:
+                for path, content in template_info.files.items():
+                    container.add_file(path, content)
+                container.metadata["template_id"] = template_info.template_id
+                container.metadata["template_hash"] = template_info.hash
+                container.metadata["template_manifest"] = template_info.manifest
+            baseline_files = capture_baseline_files(container)
+            container.metadata["baseline_files"] = baseline_files
+        else:
+            if template_info and not container.metadata.get("template_manifest"):
+                container.metadata["template_manifest"] = template_info.manifest
+            orchestrator.attach_container(container)
+
         workspace = TaskWorkspace(task_id, WORKSPACE_ROOT)
         workspace.materialize(container)
         container.metadata["workspace_path"] = str(workspace.path)
@@ -2616,6 +2808,33 @@ async def process_task_background(
                     }
                 ),
             )
+
+        async def handle_clarification_requested(payload: Dict[str, Any]) -> None:
+            questions = normalize_questions(payload.get("questions"))
+            requested_at = payload.get("requested_at") or db.now_utc().isoformat()
+            resume_stage_payload = payload.get("resume_from_stage")
+            artifact_payload = {
+                "questions": questions,
+                "requested_at": requested_at,
+            }
+            await record_artifact(
+                task_id,
+                "clarification_questions",
+                normalize_payload(artifact_payload),
+                produced_by="planner",
+            )
+            await record_event(
+                task_id,
+                "clarification_requested",
+                normalize_payload(
+                    {
+                        "questions": questions,
+                        "requested_at": requested_at,
+                        "resume_from_stage": resume_stage_payload,
+                    }
+                ),
+            )
+            await persist_container_snapshot(task_id, container)
         
         # Обрабатываем задачу
         result = await orchestrator.process_task(
@@ -2632,10 +2851,40 @@ async def process_task_background(
                 "llm_usage": handle_llm_usage,
                 "llm_error": handle_llm_error,
                 "stage_failed": handle_stage_failed,
+                "clarification_requested": handle_clarification_requested,
             },
             workspace_path=workspace.path,
             command_runner=command_runner,
+            provided_answers=provided_answers if isinstance(provided_answers, dict) else None,
+            resume_from_stage=resume_stage,
         )
+
+        if result.get("status") == "needs_input":
+            questions = normalize_questions(result.get("questions"))
+            resume_stage_payload = result.get("resume_from_stage") or resume_stage
+            await apply_task_update(
+                {
+                    "status": "needs_input",
+                    "progress": container.progress,
+                    "current_stage": "needs_input",
+                    "pending_questions": questions,
+                    "resume_from_stage": resume_stage_payload,
+                    "provided_answers": provided_answers or {},
+                }
+            )
+            await record_state(
+                task_id,
+                build_container_state(
+                    status="needs_input",
+                    progress=container.progress,
+                    current_stage="needs_input",
+                    container=container,
+                    active_role=container.metadata.get("active_role"),
+                    current_task=container.current_task,
+                ),
+            )
+            logger.info("Task %s paused for clarification input", task_id)
+            return
 
         review_summary = resolve_latest_review_summary(container)
         patch_payload = build_patch_diff_payload(
@@ -2806,6 +3055,7 @@ async def process_task_background_item(item: QueueItem) -> None:
         item.description,
         item.template_id,
         item.request_id,
+        item.resume_from_stage,
     )
 
 def save_container_to_file(task_id: str, container: Container):

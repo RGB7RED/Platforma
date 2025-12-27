@@ -48,6 +48,9 @@ async def init_db(database_url: str) -> None:
                 template_hash TEXT NULL,
                 client_ip TEXT NULL,
                 owner_key_hash TEXT NULL,
+                pending_questions JSONB NULL,
+                provided_answers JSONB NULL,
+                resume_from_stage TEXT NULL,
                 result JSONB NULL,
                 container_state JSONB NULL,
                 error TEXT NULL,
@@ -70,8 +73,19 @@ async def init_db(database_url: str) -> None:
         await conn.execute(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS template_hash TEXT;"
         )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pending_questions JSONB;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS provided_answers JSONB;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_from_stage TEXT;"
+        )
         await _ensure_jsonb_column(conn, table="tasks", column="result")
         await _ensure_jsonb_column(conn, table="tasks", column="container_state")
+        await _ensure_jsonb_column(conn, table="tasks", column="pending_questions")
+        await _ensure_jsonb_column(conn, table="tasks", column="provided_answers")
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS api_rate_limits (
@@ -712,6 +726,9 @@ async def update_task_row(task_id: str, fields: Dict[str, Any]) -> Optional[Dict
         "client_ip",
         "result",
         "container_state",
+        "pending_questions",
+        "provided_answers",
+        "resume_from_stage",
         "error",
         "failure_reason",
         "completed_at",
@@ -723,7 +740,7 @@ async def update_task_row(task_id: str, fields: Dict[str, Any]) -> Optional[Dict
 
     set_clauses = []
     values: List[Any] = []
-    json_fields = {"result", "container_state"}
+    json_fields = {"result", "container_state", "pending_questions", "provided_answers"}
     for idx, (key, value) in enumerate(updates.items(), start=1):
         if key in json_fields:
             set_clauses.append(f"{key} = ${idx}::jsonb")
@@ -756,6 +773,8 @@ async def get_task_row(task_id: str) -> Optional[Dict[str, Any]]:
     if data:
         data["result"] = _coerce_json_value(data.get("result"))
         data["container_state"] = _coerce_json_value(data.get("container_state"))
+        data["pending_questions"] = _coerce_json_value(data.get("pending_questions"))
+        data["provided_answers"] = _coerce_json_value(data.get("provided_answers"))
     return data
 
 

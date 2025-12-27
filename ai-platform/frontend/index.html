@@ -192,6 +192,22 @@
                     <div class="status-row error-message hidden" id="taskError"></div>
                 </div>
 
+                <div class="task-form-card clarification-panel hidden" id="clarificationPanel">
+                    <h3>Clarification needed</h3>
+                    <p class="task-lookup-hint" id="clarificationMessage">
+                        Please answer the questions below so the task can continue.
+                    </p>
+                    <form id="clarificationForm"></form>
+                    <div class="form-actions">
+                        <button class="secondary-btn" id="submitClarificationBtn" type="button">
+                            Save Answers
+                        </button>
+                        <button class="primary-btn" id="resumeTaskBtn" type="button">
+                            Resume Task
+                        </button>
+                    </div>
+                </div>
+
                 <div class="container-inspector">
                     <div class="inspector-header">
                         <h3>Container Inspector</h3>

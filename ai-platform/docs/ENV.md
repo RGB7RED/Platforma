@@ -168,3 +168,9 @@ Open `http://localhost` in your browser.
 - **Example:** `APP_API_KEY=super-secret-token`
 - **Required in production?:** Recommended
 - **Notes:** Clients must send `X-API-Key` with the configured value.
+
+### Clarification loop endpoints
+- **Purpose:** `/api/tasks/{task_id}/questions`, `/input`, and `/resume` use the same API key enforcement.
+- **Example:** No additional environment variables.
+- **Required in production?:** No
+- **Notes:** Uses `APP_API_KEY` when set.
