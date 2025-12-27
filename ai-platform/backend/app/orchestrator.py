@@ -116,6 +116,9 @@ class AIOrchestrator:
         self.container.metadata["started_at"] = datetime.now().isoformat()
         self.container.metadata["codex_version"] = self.codex.get("version")
         self.container.metadata["codex_hash"] = self.codex_hash
+        max_iterations = self.codex.get("workflow", {}).get("max_iterations")
+        if isinstance(max_iterations, int):
+            self.container.metadata["max_iterations"] = max_iterations
         
         # Инициализация ролей
         self.roles = {
@@ -318,6 +321,7 @@ class AIOrchestrator:
                 "files_count": len(self.container.files),
                 "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
                 "iterations": iteration,
+                "max_iterations": max_iterations,
                 "history": self.task_history[-5:]  # Последние 5 задач
             }
             
