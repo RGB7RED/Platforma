@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🤖 AI Collaboration Platform</title>
     <meta name="api-base-url" content="https://platforma-production-7bbb.up.railway.app">
-    <meta name="auth-mode" content="api_key">
+    <meta name="auth-mode" content="auth">
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <link rel="stylesheet" href="styles.css">
 </head>
@@ -63,88 +63,48 @@
 
                     <div class="form-group auth-panel hidden" id="authPanel">
                         <label>Account Access</label>
+                        <div class="task-lookup-actions auth-login-actions" id="authLoginFields">
+                            <input
+                                type="email"
+                                id="authEmailInput"
+                                class="task-id-input"
+                                placeholder="Email"
+                                autocomplete="email"
+                                autocapitalize="off"
+                                autocorrect="off"
+                                spellcheck="false">
+                            <input
+                                type="password"
+                                id="authPasswordInput"
+                                class="task-id-input"
+                                placeholder="Password"
+                                autocomplete="current-password"
+                                autocapitalize="off"
+                                autocorrect="off"
+                                spellcheck="false">
+                            <button class="secondary-btn" type="button" id="authLoginBtn">Sign in</button>
+                        </div>
                         <div class="task-lookup-actions">
-                            <button class="secondary-btn" type="button" data-auth-view="login" id="authShowLoginBtn">
-                                Login
-                            </button>
-                            <button class="secondary-btn" type="button" data-auth-view="register" id="authShowRegisterBtn">
-                                Register
-                            </button>
-                            <button class="secondary-btn" type="button" data-auth-view="forgot" id="authShowForgotBtn">
-                                Forgot Password
-                            </button>
-                            <button class="secondary-btn" type="button" id="authLogoutBtn">
+                            <button class="secondary-btn hidden" type="button" id="authLogoutBtn">
                                 Log out
                             </button>
                         </div>
                         <div class="task-lookup-hint auth-status" id="authStatus">
                             Not signed in.
                         </div>
-                        <div class="auth-screens">
-                            <div class="auth-screen" data-auth-view="login" id="authLoginScreen">
-                                <div class="task-lookup-actions">
-                                    <input
-                                        type="email"
-                                        id="authLoginEmail"
-                                        class="task-id-input"
-                                        placeholder="Email"
-                                        autocomplete="email"
-                                        autocapitalize="off"
-                                        autocorrect="off"
-                                        spellcheck="false">
-                                    <input
-                                        type="password"
-                                        id="authLoginPassword"
-                                        class="task-id-input"
-                                        placeholder="Password"
-                                        autocomplete="current-password"
-                                        autocapitalize="off"
-                                        autocorrect="off"
-                                        spellcheck="false">
-                                    <button class="secondary-btn" type="button" id="authLoginBtn">Sign in</button>
-                                </div>
-                                <div class="task-lookup-actions">
-                                    <button class="secondary-btn" type="button" id="googleSignInBtn">
-                                        Sign in with Google
-                                    </button>
-                                </div>
+                        <div class="task-lookup-hint error-message hidden" id="authError"></div>
+                        <div class="auth-diagnostics">
+                            <div class="task-lookup-hint">
+                                <strong>AUTH_MODE:</strong> <span id="authModeIndicator">-</span>
                             </div>
-                            <div class="auth-screen hidden" data-auth-view="register" id="authRegisterScreen">
-                                <div class="task-lookup-actions">
-                                    <input
-                                        type="email"
-                                        id="authRegisterEmail"
-                                        class="task-id-input"
-                                        placeholder="Email"
-                                        autocomplete="email"
-                                        autocapitalize="off"
-                                        autocorrect="off"
-                                        spellcheck="false">
-                                    <input
-                                        type="password"
-                                        id="authRegisterPassword"
-                                        class="task-id-input"
-                                        placeholder="Password"
-                                        autocomplete="new-password"
-                                        autocapitalize="off"
-                                        autocorrect="off"
-                                        spellcheck="false">
-                                    <button class="secondary-btn" type="button" id="authRegisterBtn">Create account</button>
-                                </div>
+                            <div class="task-lookup-hint">
+                                <strong>API_BASE_URL:</strong> <span id="apiBaseUrl">-</span>
                             </div>
-                            <div class="auth-screen hidden" data-auth-view="forgot" id="authForgotScreen">
-                                <div class="task-lookup-actions">
-                                    <input
-                                        type="email"
-                                        id="authForgotEmail"
-                                        class="task-id-input"
-                                        placeholder="Email"
-                                        autocomplete="email"
-                                        autocapitalize="off"
-                                        autocorrect="off"
-                                        spellcheck="false">
-                                    <button class="secondary-btn" type="button" id="authForgotBtn">Send reset link</button>
-                                </div>
+                            <div class="task-lookup-hint">
+                                <strong>Token:</strong> <span id="authTokenStatus">absent</span>
+                            </div>
+                            <div class="task-lookup-hint">
+                                <strong>Last auth error:</strong> <span id="authLastError"></span>
                             </div>
                         </div>
                     </div>
@@ -295,10 +255,7 @@
                         <strong>Stage:</strong> <span id="currentStage">-</span>
                     </div>
                     <div class="status-row">
-                        <strong>API:</strong> <span id="apiBaseUrl">-</span>
-                    </div>
-                    <div class="status-row">
-                        <strong>Auth mode:</strong> <span id="authModeIndicator">-</span>
+                        <strong>API_BASE_URL:</strong> <span id="apiBaseUrlStatus">-</span>
                     </div>
                     <div class="status-row error-message hidden" id="taskError"></div>
                 </div>
