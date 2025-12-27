@@ -302,6 +302,20 @@ body {
     gap: 12px;
 }
 
+.auth-login-actions {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+}
+
+.auth-diagnostics {
+    margin-top: 12px;
+    display: grid;
+    gap: 4px;
+}
+
+.error-message {
+    color: #dc2626;
+}
+
 .task-id-input {
     padding: 12px 16px;
     border-radius: var(--radius-md);
