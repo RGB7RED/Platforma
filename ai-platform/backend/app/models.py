@@ -80,7 +80,7 @@ class Container:
                 "models": {},
             },
         }
-        self.file_update_hook: Optional[Callable[[str, Any], None]] = None
+        self.file_update_hook: Optional[Callable[[str, Optional[Any]], None]] = None
         
         # Логируем создание контейнера
         self._add_history_entry("container_created", 
@@ -94,6 +94,16 @@ class Container:
                                {"filepath": filepath, "size": len(content)})
         if self.file_update_hook:
             self.file_update_hook(filepath, content)
+
+    def remove_file(self, filepath: str) -> None:
+        """Удалить файл из контейнера"""
+        if filepath not in self.files:
+            return
+        self.files.pop(filepath, None)
+        self.updated_at = datetime.now()
+        self._add_history_entry("file_removed", {"filepath": filepath})
+        if self.file_update_hook:
+            self.file_update_hook(filepath, None)
     
     def add_artifact(self, artifact_type: str, content: Any, 
                     created_by: str = "system") -> str:
