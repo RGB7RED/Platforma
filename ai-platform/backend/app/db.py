@@ -540,6 +540,28 @@ async def upsert_task_file(
         raise
 
 
+async def delete_task_file(task_id: str, path: str) -> None:
+    if _pool is None:
+        logger.debug("Database not enabled; skipping delete_task_file for task %s", task_id)
+        return
+
+    try:
+        await _pool.execute(
+            """
+            DELETE FROM task_files
+            WHERE task_id = $1 AND path = $2;
+            """,
+            _coerce_task_id(task_id),
+            path,
+        )
+    except Exception:
+        _log_db_error(
+            "delete_task_file",
+            {"task_id": task_id, "path": path},
+        )
+        raise
+
+
 async def list_task_files(task_id: str) -> List[Dict[str, Any]]:
     if _pool is None:
         logger.debug("Database not enabled; returning empty task files for task %s", task_id)

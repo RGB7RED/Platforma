@@ -26,10 +26,11 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 
 from .models import Container, ProjectState
 from .orchestrator import AIOrchestrator
-from .agents import AIReviewer
+from .agents import AIReviewer, SafeCommandRunner
 from .schemas import (
     ArtifactsResponse,
     ArtifactItem,
@@ -81,6 +82,11 @@ storage = Storage()
 database_url = os.getenv("DATABASE_URL")
 TASK_TTL_DAYS = os.getenv("TASK_TTL_DAYS")
 APP_API_KEY = os.getenv("APP_API_KEY")
+WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "data/workspaces"))
+WORKSPACE_TTL_DAYS = os.getenv("WORKSPACE_TTL_DAYS")
+COMMAND_TIMEOUT_SECONDS = os.getenv("COMMAND_TIMEOUT_SECONDS")
+COMMAND_MAX_OUTPUT_BYTES = os.getenv("COMMAND_MAX_OUTPUT_BYTES")
+ALLOWED_COMMANDS = os.getenv("ALLOWED_COMMANDS")
 
 # WebSocket менеджер
 class ConnectionManager:
@@ -426,6 +432,43 @@ async def record_state(task_id: str, state: Dict[str, Any]) -> None:
         store_in_memory_state(task_id, state)
 
 
+def parse_allowed_commands(value: Optional[str]) -> Optional[List[str]]:
+    if not value:
+        return None
+    commands = [item.strip() for item in value.split(",") if item.strip()]
+    return commands or None
+
+
+def build_command_runner(task_id: str, workspace_path: Path) -> SafeCommandRunner:
+    timeout_seconds = parse_int_env(COMMAND_TIMEOUT_SECONDS, 60)
+    max_output_bytes = parse_int_env(COMMAND_MAX_OUTPUT_BYTES, 20000)
+    allowed_commands = parse_allowed_commands(ALLOWED_COMMANDS)
+
+    async def handle_event(event_type: str, payload: Dict[str, Any]) -> None:
+        await record_event(task_id, event_type, normalize_payload(payload))
+
+    async def handle_artifact(
+        artifact_type: str,
+        payload: Dict[str, Any],
+        produced_by: Optional[str],
+    ) -> None:
+        await record_artifact(
+            task_id,
+            artifact_type,
+            normalize_payload(payload),
+            produced_by=produced_by,
+        )
+
+    return SafeCommandRunner(
+        workspace_path,
+        allowed_commands=allowed_commands,
+        timeout_seconds=timeout_seconds,
+        max_output_bytes=max_output_bytes,
+        event_handler=handle_event,
+        artifact_handler=handle_artifact,
+    )
+
+
 async def run_review_for_task(task_id: str, container: Container) -> Dict[str, Any]:
     run_id = str(uuid.uuid4())
     started_at = db.now_utc().isoformat()
@@ -435,7 +478,14 @@ async def run_review_for_task(task_id: str, container: Container) -> Dict[str, A
         normalize_payload({"run_id": run_id, "started_at": started_at}),
     )
     reviewer = AIReviewer(AIOrchestrator().codex)
-    review_result = await reviewer.execute(container)
+    workspace = TaskWorkspace(task_id, WORKSPACE_ROOT)
+    workspace.materialize(container)
+    runner = build_command_runner(task_id, workspace.path)
+    review_result = await reviewer.execute(
+        container,
+        workspace_path=workspace.path,
+        command_runner=runner,
+    )
     finished_at = db.now_utc().isoformat()
     review_result["run_id"] = run_id
     review_result["started_at"] = started_at
@@ -531,6 +581,8 @@ async def lifespan(app: FastAPI):
     # Создаем директории если их нет
     os.makedirs("data/tasks", exist_ok=True)
     os.makedirs("data/logs", exist_ok=True)
+    WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+    cleanup_workspaces(WORKSPACE_ROOT, WORKSPACE_TTL_DAYS)
 
     global FILE_PERSISTENCE_ENABLED, FILE_PERSISTENCE_REASON
     FILE_PERSISTENCE_ENABLED, FILE_PERSISTENCE_REASON = resolve_file_persistence_setting()
@@ -628,6 +680,23 @@ def parse_int_env(value: Optional[str], default: int) -> int:
     except ValueError:
         logger.warning("Invalid integer env value '%s', using default=%s", value, default)
         return default
+
+
+def cleanup_workspaces(root: Path, ttl_days: Optional[str]) -> None:
+    ttl_value = parse_int_env(ttl_days, 0) if ttl_days else 0
+    if ttl_value <= 0:
+        return
+    cutoff = time.time() - ttl_value * 86400
+    if not root.exists():
+        return
+    for path in root.iterdir():
+        if not path.is_dir():
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            logger.warning("Failed to inspect workspace path: %s", path)
 
 def resolve_file_persistence_setting() -> tuple[bool, str]:
     env_value = os.getenv("ENABLE_FILE_PERSISTENCE")
@@ -841,6 +910,112 @@ def build_file_record(content: Any) -> Dict[str, Any]:
 
 def capture_baseline_files(container: Container) -> Dict[str, Dict[str, Any]]:
     return {path: build_file_record(content) for path, content in container.files.items()}
+
+
+class TaskWorkspace:
+    """Workspace for materializing and syncing task files."""
+
+    ignored_dirs = {
+        ".git",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".venv",
+    }
+
+    ignored_suffixes = {".pyc"}
+
+    def __init__(self, task_id: str, root: Path):
+        self.task_id = task_id
+        self.root = root
+        self.path = (root / task_id).resolve()
+
+    def ensure(self) -> None:
+        self.path.mkdir(parents=True, exist_ok=True)
+
+    def _safe_relative_path(self, relative_path: str) -> PurePosixPath:
+        pure_path = PurePosixPath(relative_path)
+        if pure_path.is_absolute() or ".." in pure_path.parts:
+            raise ValueError(f"Unsafe path rejected: {relative_path}")
+        return pure_path
+
+    def _resolve_target_path(self, relative_path: str) -> Path:
+        pure_path = self._safe_relative_path(relative_path)
+        target_path = (self.path / pure_path).resolve()
+        if target_path == self.path:
+            return target_path
+        if not target_path.is_relative_to(self.path):
+            raise ValueError(f"Path traversal rejected: {relative_path}")
+        return target_path
+
+    def _should_ignore(self, relative_path: Path) -> bool:
+        if any(part in self.ignored_dirs for part in relative_path.parts):
+            return True
+        if relative_path.suffix in self.ignored_suffixes:
+            return True
+        return False
+
+    def write_file(self, relative_path: str, content: Optional[Any]) -> None:
+        target_path = self._resolve_target_path(relative_path)
+        if content is None:
+            if target_path.exists():
+                target_path.unlink()
+            return
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, (bytes, bytearray)):
+            target_path.write_bytes(bytes(content))
+        else:
+            target_path.write_text(str(content), encoding="utf-8")
+
+    def materialize(self, container: Container) -> None:
+        self.ensure()
+        for filepath, content in container.files.items():
+            self.write_file(filepath, content)
+
+    def collect_files(self) -> Dict[str, Any]:
+        files: Dict[str, Any] = {}
+        if not self.path.exists():
+            return files
+        for path in self.path.rglob("*"):
+            if not path.is_file():
+                continue
+            relative_path = path.relative_to(self.path)
+            if self._should_ignore(relative_path):
+                continue
+            data = path.read_bytes()
+            try:
+                content: Any = data.decode("utf-8")
+            except UnicodeDecodeError:
+                content = data
+            files[str(relative_path.as_posix())] = content
+        return files
+
+    def sync_to_container(self, container: Container) -> Dict[str, List[str]]:
+        workspace_files = self.collect_files()
+        existing_records = capture_baseline_files(container)
+        changed: List[str] = []
+        removed: List[str] = []
+
+        hook = container.file_update_hook
+        container.file_update_hook = None
+        try:
+            for path, content in workspace_files.items():
+                current_record = existing_records.get(path)
+                next_record = build_file_record(content)
+                if current_record and current_record["sha256"] == next_record["sha256"]:
+                    continue
+                container.add_file(path, content)
+                changed.append(path)
+
+            for path in list(container.files.keys()):
+                if path not in workspace_files:
+                    container.remove_file(path)
+                    removed.append(path)
+        finally:
+            container.file_update_hook = hook
+
+        return {"changed": changed, "removed": removed}
 
 
 def build_patch_diff_payload(
@@ -1603,6 +1778,11 @@ async def process_task_background(task_id: str, description: str, request_id: Op
         container = orchestrator.initialize_project(f"Task-{task_id[:8]}")
         baseline_files = capture_baseline_files(container)
         container.metadata["baseline_files"] = baseline_files
+        workspace = TaskWorkspace(task_id, WORKSPACE_ROOT)
+        workspace.materialize(container)
+        container.metadata["workspace_path"] = str(workspace.path)
+        container.file_update_hook = workspace.write_file
+        command_runner = build_command_runner(task_id, workspace.path)
         await persist_container_snapshot(task_id, container)
         storage.containers[task_id] = container
 
@@ -1683,6 +1863,19 @@ async def process_task_background(task_id: str, description: str, request_id: Op
                 "review_started",
                 normalize_payload(payload),
             )
+
+        async def handle_coder_finished(payload: Dict[str, Any]) -> None:
+            sync_result = workspace.sync_to_container(container)
+            changed_files = sync_result.get("changed", [])
+            removed_files = sync_result.get("removed", [])
+            for path in changed_files:
+                content = container.files.get(path)
+                if content is not None:
+                    await persist_container_file(task_id, path, content)
+            if db.is_enabled():
+                for path in removed_files:
+                    await db.delete_task_file(task_id, path)
+            await persist_container_snapshot(task_id, container)
 
         async def handle_review_finished(payload: Dict[str, Any]) -> None:
             result = payload.get("result") if isinstance(payload, dict) else None
@@ -1796,6 +1989,7 @@ async def process_task_background(task_id: str, description: str, request_id: Op
                 "stage_started": handle_stage_started,
                 "research_complete": handle_research_complete,
                 "design_complete": handle_design_complete,
+                "coder_finished": handle_coder_finished,
                 "review_started": handle_review_started,
                 "review_finished": handle_review_finished,
                 "review_result": handle_review_result,
@@ -1804,6 +1998,8 @@ async def process_task_background(task_id: str, description: str, request_id: Op
                 "llm_error": handle_llm_error,
                 "stage_failed": handle_stage_failed,
             },
+            workspace_path=workspace.path,
+            command_runner=command_runner,
         )
 
         review_summary = resolve_latest_review_summary(container)

@@ -144,6 +144,9 @@ class AIOrchestrator:
         self,
         user_task: str,
         callbacks: Optional[Dict[str, Callable[[Dict[str, Any]], Any]]] = None,
+        *,
+        workspace_path: Optional[Path] = None,
+        command_runner: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Основной метод обработки задачи пользователя"""
         if not self.container:
@@ -217,13 +220,17 @@ class AIOrchestrator:
             iteration = 0
             max_iterations = self.codex.get("workflow", {}).get("max_iterations", 15)
             logger.info("Codex max_iterations=%s", max_iterations)
+            failure_reason: Optional[str] = None
+            failure_stage: Optional[str] = None
+            next_task_override: Optional[Dict[str, Any]] = None
             
             while not self.container.is_complete() and iteration < max_iterations:
                 iteration += 1
                 logger.info(f"Implementation iteration {iteration}")
                 
                 # 3.1 Получаем следующую задачу от планировщика
-                next_task = self._get_next_task()
+                next_task = next_task_override or self._get_next_task()
+                next_task_override = None
                 if not next_task:
                     logger.warning("No tasks to execute")
                     break
@@ -264,6 +271,10 @@ class AIOrchestrator:
                             "usage_report": coder_result.get("usage_report"),
                         },
                     )
+                await self._run_hook(
+                    callbacks.get("coder_finished") if callbacks else None,
+                    {"task": next_task, "result": coder_result, "iteration": iteration},
+                )
                 
                 # 3.3 Ревьюер проверяет результат
                 self.container.metadata["active_role"] = "reviewer"
@@ -272,7 +283,9 @@ class AIOrchestrator:
                     {"kind": "iteration", "iteration": iteration},
                 )
                 review_result = await self.roles["reviewer"].execute(
-                    self.container
+                    self.container,
+                    workspace_path=workspace_path,
+                    command_runner=command_runner,
                 )
                 await self._run_hook(
                     callbacks.get("review_finished") if callbacks else None,
@@ -283,12 +296,82 @@ class AIOrchestrator:
                     {"result": review_result, "kind": "iteration", "iteration": iteration},
                 )
                 
+                if review_result.get("command_timeout"):
+                    failure_reason = "command_timeout"
+                    failure_stage = "implementation"
+                    logger.warning("Iteration %s halted due to command timeout", iteration)
+                    break
                 if review_result.get("passed"):
                     logger.info(f"Iteration {iteration} approved")
                     self.container.update_progress(iteration / max_iterations)
                 else:
                     logger.warning(f"Iteration {iteration} rejected: {review_result.get('issues', [])}")
-                    # В MVP просто продолжаем, в реальной системе - корректируем
+                    next_task_override = self._build_fix_task(next_task, review_result)
+
+            if failure_reason:
+                await self._run_hook(
+                    callbacks.get("stage_failed") if callbacks else None,
+                    {
+                        "stage": failure_stage or "implementation",
+                        "reason": failure_reason,
+                        "issues": [],
+                    },
+                )
+                self.container.update_state(ProjectState.ERROR, failure_reason)
+                self.task_history.append(
+                    {
+                        "task": user_task,
+                        "status": self.container.state.value,
+                        "iterations": iteration,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
+                status = "failed"
+                return {
+                    "status": status,
+                    "container_id": self.container.project_id,
+                    "state": self.container.state.value,
+                    "progress": self.container.progress,
+                    "files_count": len(self.container.files),
+                    "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
+                    "iterations": iteration,
+                    "max_iterations": max_iterations,
+                    "history": self.task_history[-5:],
+                    "failure_reason": failure_reason,
+                }
+
+            if iteration >= max_iterations and not self.container.is_complete():
+                failure_reason = "max_iterations_exhausted"
+                await self._run_hook(
+                    callbacks.get("stage_failed") if callbacks else None,
+                    {
+                        "stage": "implementation",
+                        "reason": failure_reason,
+                        "issues": [],
+                    },
+                )
+                self.container.update_state(ProjectState.ERROR, failure_reason)
+                self.task_history.append(
+                    {
+                        "task": user_task,
+                        "status": self.container.state.value,
+                        "iterations": iteration,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
+                status = "failed"
+                return {
+                    "status": status,
+                    "container_id": self.container.project_id,
+                    "state": self.container.state.value,
+                    "progress": self.container.progress,
+                    "files_count": len(self.container.files),
+                    "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
+                    "iterations": iteration,
+                    "max_iterations": max_iterations,
+                    "history": self.task_history[-5:],
+                    "failure_reason": failure_reason,
+                }
             
             # Фаза 4: Финальное ревью
             review_required = self.codex.get("workflow", {}).get(
@@ -308,7 +391,9 @@ class AIOrchestrator:
                     {"kind": "final"},
                 )
                 final_review = await self.roles["reviewer"].execute(
-                    self.container
+                    self.container,
+                    workspace_path=workspace_path,
+                    command_runner=command_runner,
                 )
                 await self._run_hook(
                     callbacks.get("review_finished") if callbacks else None,
@@ -432,6 +517,20 @@ class AIOrchestrator:
         
         # Всё сделано
         return None
+
+    @staticmethod
+    def _build_fix_task(previous_task: Dict[str, Any], review_result: Dict[str, Any]) -> Dict[str, Any]:
+        errors = review_result.get("errors") if isinstance(review_result, dict) else None
+        warnings = review_result.get("warnings") if isinstance(review_result, dict) else None
+        summary = review_result.get("message") if isinstance(review_result, dict) else None
+        return {
+            "type": "fix_review_issues",
+            "description": f"Fix review findings: {summary}" if summary else "Fix review findings",
+            "previous_task": previous_task,
+            "review_report": review_result,
+            "review_errors": errors,
+            "review_warnings": warnings,
+        }
     
     def save_container(self, filepath: str) -> None:
         """Сохранить контейнер в файл"""

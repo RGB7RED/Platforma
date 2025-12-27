@@ -49,6 +49,36 @@ Open `http://localhost` in your browser.
 - **Notes:** No automatic cleanup is scheduled. Use this value when running a manual cleanup
   script (e.g., delete tasks older than `TASK_TTL_DAYS` along with related rows).
 
+### WORKSPACE_ROOT
+- **Purpose:** Base directory for per-task workspaces on disk.
+- **Example:** `WORKSPACE_ROOT=data/workspaces`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `data/workspaces` when unset.
+
+### WORKSPACE_TTL_DAYS
+- **Purpose:** Cleanup threshold (days) for removing old task workspaces on startup.
+- **Example:** `WORKSPACE_TTL_DAYS=7`
+- **Required in production?:** Optional
+- **Notes:** When unset or `0`, workspaces are retained.
+
+### ALLOWED_COMMANDS
+- **Purpose:** Allowlist for safe command runner executables.
+- **Example:** `ALLOWED_COMMANDS=ruff,pytest,python`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `ruff,pytest,python,python3` when unset.
+
+### COMMAND_TIMEOUT_SECONDS
+- **Purpose:** Timeout (seconds) for safe command execution.
+- **Example:** `COMMAND_TIMEOUT_SECONDS=60`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 60 seconds.
+
+### COMMAND_MAX_OUTPUT_BYTES
+- **Purpose:** Max output bytes captured per stdout/stderr stream.
+- **Example:** `COMMAND_MAX_OUTPUT_BYTES=20000`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 20KB.
+
 ### CODEX_PATH
 - **Purpose:** Override the JSON codex loaded by the orchestrator.
 - **Example:** `CODEX_PATH=ai-platform/backend/app/codex.json`

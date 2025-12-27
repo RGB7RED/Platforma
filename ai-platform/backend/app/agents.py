@@ -3,14 +3,19 @@
 В реальной системе здесь будет интеграция с LLM API.
 """
 
+import asyncio
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
+import time
+import uuid
+import sys
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable, Sequence
 
 from .models import Container
 from .llm import (
@@ -22,6 +27,179 @@ from .llm import (
 
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_ALLOWED_COMMANDS = {"ruff", "pytest", "python", "python3"}
+
+
+class SafeCommandRunner:
+    """Run allowlisted commands inside a workspace with timeouts and output limits."""
+
+    def __init__(
+        self,
+        workspace_path: Path,
+        *,
+        allowed_commands: Optional[Sequence[str]] = None,
+        timeout_seconds: Optional[int] = None,
+        max_output_bytes: Optional[int] = None,
+        event_handler: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+        artifact_handler: Optional[Callable[[str, Dict[str, Any], Optional[str]], Any]] = None,
+    ) -> None:
+        self.workspace_path = workspace_path.resolve()
+        self.allowed_commands = self._resolve_allowed_commands(allowed_commands)
+        self.timeout_seconds = timeout_seconds or int(os.getenv("COMMAND_TIMEOUT_SECONDS", "60"))
+        self.max_output_bytes = max_output_bytes or int(os.getenv("COMMAND_MAX_OUTPUT_BYTES", "20000"))
+        self.event_handler = event_handler
+        self.artifact_handler = artifact_handler
+
+    @staticmethod
+    def _resolve_allowed_commands(
+        allowed_commands: Optional[Sequence[str]],
+    ) -> set[str]:
+        if allowed_commands:
+            return {str(cmd).strip() for cmd in allowed_commands if str(cmd).strip()}
+        env_value = os.getenv("ALLOWED_COMMANDS", "")
+        if env_value.strip():
+            return {cmd.strip() for cmd in env_value.split(",") if cmd.strip()}
+        return set(DEFAULT_ALLOWED_COMMANDS)
+
+    @staticmethod
+    def _truncate_output(text: str, max_bytes: int) -> tuple[str, bool]:
+        data = text.encode("utf-8", errors="replace")
+        if len(data) <= max_bytes:
+            return text, False
+        truncated = data[:max_bytes]
+        return truncated.decode("utf-8", errors="replace"), True
+
+    async def _emit_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        if not self.event_handler:
+            return
+        result = self.event_handler(event_type, payload)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def _emit_artifact(
+        self,
+        artifact_type: str,
+        payload: Dict[str, Any],
+        produced_by: Optional[str] = None,
+    ) -> None:
+        if not self.artifact_handler:
+            return
+        result = self.artifact_handler(artifact_type, payload, produced_by)
+        if asyncio.iscoroutine(result):
+            await result
+
+    def _is_allowed(self, command: List[str]) -> bool:
+        if not command:
+            return False
+        executable = Path(command[0]).name
+        return executable in self.allowed_commands
+
+    def _ensure_workspace(self, cwd: Path) -> None:
+        resolved = cwd.resolve()
+        if resolved == self.workspace_path:
+            return
+        if not resolved.is_relative_to(self.workspace_path):
+            raise ValueError("Command cwd must stay within workspace")
+
+    async def run(
+        self,
+        command: List[str],
+        *,
+        cwd: Optional[Path] = None,
+        purpose: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        run_id = str(uuid.uuid4())
+        cwd = (cwd or self.workspace_path).resolve()
+        self._ensure_workspace(cwd)
+
+        command_line = " ".join(command)
+        started_at = datetime.now().isoformat()
+        await self._emit_event(
+            "command_started",
+            {
+                "run_id": run_id,
+                "command": command_line,
+                "cwd": str(cwd),
+                "purpose": purpose,
+                "started_at": started_at,
+            },
+        )
+
+        if not self._is_allowed(command):
+            finished_at = datetime.now().isoformat()
+            result = {
+                "ran": False,
+                "command": command_line,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "duration_seconds": 0.0,
+                "timed_out": False,
+                "blocked": True,
+                "error": "command_not_allowed",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "run_id": run_id,
+                "started_at": started_at,
+                "finished_at": finished_at,
+            }
+            await self._emit_event("command_finished", result)
+            await self._emit_artifact("command_log", result, produced_by="runner")
+            return result
+
+        started_monotonic = time.monotonic()
+        stdout = ""
+        stderr = ""
+        timed_out = False
+        exit_code: Optional[int] = None
+        error: Optional[str] = None
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+            )
+            exit_code = completed.returncode
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            error = "timeout"
+        except FileNotFoundError:
+            error = "command_not_found"
+        except Exception as exc:
+            error = str(exc)
+
+        duration = time.monotonic() - started_monotonic
+        stdout, stdout_truncated = self._truncate_output(stdout, self.max_output_bytes)
+        stderr, stderr_truncated = self._truncate_output(stderr, self.max_output_bytes)
+        finished_at = datetime.now().isoformat()
+
+        result = {
+            "ran": error is None and not timed_out,
+            "command": command_line,
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "duration_seconds": duration,
+            "timed_out": timed_out,
+            "blocked": False,
+            "error": error,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "run_id": run_id,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "purpose": purpose,
+        }
+        await self._emit_event("command_finished", result)
+        await self._emit_artifact("command_log", result, produced_by="runner")
+        return result
 
 
 class AIAgent:
@@ -554,6 +732,9 @@ class AICoder(AIAgent):
         context = container.get_relevant_context("coder")
         task_description = task.get("description", "")
         target_file = task.get("file", "")
+        review_report = task.get("review_report")
+        review_errors = task.get("review_errors") or task.get("errors")
+        review_warnings = task.get("review_warnings") or task.get("warnings")
         constraints = rules.get("constraints", [])
         system_prompt = (
             "You are the Coder agent. Follow the codex rules strictly.\n"
@@ -570,6 +751,9 @@ class AICoder(AIAgent):
             "Existing files": context.get("files", []),
             "Architecture": context.get("architecture"),
             "Recent changes": context.get("recent_changes"),
+            "Review report": review_report,
+            "Review errors": review_errors,
+            "Review warnings": review_warnings,
             "Constraints": constraints,
         }
         user_prompt = f"{json.dumps(user_payload, ensure_ascii=False, indent=2)}"
@@ -1262,7 +1446,13 @@ class AIReviewer(AIAgent):
     def __init__(self, codex: Dict[str, Any]):
         super().__init__(codex, "reviewer")
     
-    async def execute(self, container: Container) -> Dict[str, Any]:
+    async def execute(
+        self,
+        container: Container,
+        *,
+        workspace_path: Optional[Path] = None,
+        command_runner: Optional[SafeCommandRunner] = None,
+    ) -> Dict[str, Any]:
         """Проверяет текущее состояние контейнера"""
         self._log_action("start_review", {})
         
@@ -1327,14 +1517,43 @@ class AIReviewer(AIAgent):
         tool_warnings: List[str] = []
         tool_errors: List[str] = []
 
+        compileall_report = {
+            "ran": False,
+            "command": None,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+        }
         if container.files:
-            with tempfile.TemporaryDirectory() as workspace:
-                workspace_path = Path(workspace)
+            if workspace_path is None:
+                with tempfile.TemporaryDirectory() as workspace:
+                    workspace_path = Path(workspace)
+                    self._write_container_files(workspace_path, container.files)
+                    runner = command_runner or SafeCommandRunner(workspace_path)
+                    (
+                        ruff_report,
+                        pytest_report,
+                        compileall_report,
+                        tool_warnings,
+                        tool_errors,
+                    ) = await self._run_quality_checks(
+                        workspace_path,
+                        container.files,
+                        runner,
+                    )
+            else:
                 self._write_container_files(workspace_path, container.files)
-
-                ruff_report, pytest_report, tool_warnings, tool_errors = self._run_quality_checks(
+                runner = command_runner or SafeCommandRunner(workspace_path)
+                (
+                    ruff_report,
+                    pytest_report,
+                    compileall_report,
+                    tool_warnings,
+                    tool_errors,
+                ) = await self._run_quality_checks(
                     workspace_path,
                     container.files,
+                    runner,
                 )
         else:
             tool_warnings.append("No files available for quality checks")
@@ -1342,7 +1561,12 @@ class AIReviewer(AIAgent):
         warnings.extend(tool_warnings)
         errors = issues + tool_errors
 
-        passed = len(errors) == 0
+        timed_out = any(
+            report.get("timed_out")
+            for report in (ruff_report, pytest_report, compileall_report)
+            if isinstance(report, dict)
+        )
+        passed = len(errors) == 0 and not timed_out
         if passed and warnings:
             status = "approved_with_warnings"
             message = f"Approved with {len(warnings)} warnings"
@@ -1366,6 +1590,8 @@ class AIReviewer(AIAgent):
             "checklist_used": checklist,
             "ruff": ruff_report,
             "pytest": pytest_report,
+            "compileall": compileall_report,
+            "command_timeout": timed_out,
             "summary": {
                 "total_files": len(container.files),
                 "total_issues": len(issues),
@@ -1454,11 +1680,12 @@ class AIReviewer(AIAgent):
         
         return issues, warnings, passed
 
-    def _run_quality_checks(
+    async def _run_quality_checks(
         self,
         workspace_path: Path,
         files: Dict[str, str],
-    ) -> tuple[Dict[str, Any], Dict[str, Any], List[str], List[str]]:
+        command_runner: SafeCommandRunner,
+    ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], List[str], List[str]]:
         ruff_report = {
             "ran": False,
             "command": None,
@@ -1473,31 +1700,63 @@ class AIReviewer(AIAgent):
             "stdout": "",
             "stderr": "",
         }
+        compileall_report = {
+            "ran": False,
+            "command": None,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+        }
         warnings: List[str] = []
         errors: List[str] = []
 
         python_files = [name for name in files.keys() if name.endswith(".py")]
         if python_files:
             if shutil.which("ruff"):
-                ruff_report = self._run_command(["ruff", "check", "."], cwd=workspace_path)
-                if ruff_report["exit_code"] != 0:
+                self._write_container_files(workspace_path, files)
+                ruff_report = await command_runner.run(
+                    ["ruff", "check", "."],
+                    cwd=workspace_path,
+                    purpose="ruff",
+                )
+                if ruff_report.get("error"):
+                    errors.append(f"ruff error: {ruff_report['error']}")
+                elif ruff_report["exit_code"] != 0:
                     errors.append(f"ruff failed with exit code {ruff_report['exit_code']}")
             else:
                 errors.append("ruff executable not found")
+            self._write_container_files(workspace_path, files)
+            compileall_report = await command_runner.run(
+                [sys.executable, "-m", "compileall", "."],
+                cwd=workspace_path,
+                purpose="compileall",
+            )
+            if compileall_report.get("error"):
+                errors.append(f"compileall error: {compileall_report['error']}")
+            elif compileall_report["exit_code"] not in (0, None):
+                errors.append(f"compileall failed with exit code {compileall_report['exit_code']}")
         else:
             warnings.append("Ruff skipped: no python files found")
+            warnings.append("Compileall skipped: no python files found")
 
         if self._has_tests(files):
             if shutil.which("pytest"):
-                pytest_report = self._run_command(["pytest", "-q"], cwd=workspace_path)
-                if pytest_report["exit_code"] != 0:
+                self._write_container_files(workspace_path, files)
+                pytest_report = await command_runner.run(
+                    ["pytest", "-q"],
+                    cwd=workspace_path,
+                    purpose="pytest",
+                )
+                if pytest_report.get("error"):
+                    errors.append(f"pytest error: {pytest_report['error']}")
+                elif pytest_report["exit_code"] != 0:
                     errors.append(f"pytest failed with exit code {pytest_report['exit_code']}")
             else:
                 errors.append("pytest executable not found")
         else:
             warnings.append("Pytest skipped: no tests found")
 
-        return ruff_report, pytest_report, warnings, errors
+        return ruff_report, pytest_report, compileall_report, warnings, errors
 
     def _has_tests(self, files: Dict[str, str]) -> bool:
         for filepath in files.keys():
@@ -1510,24 +1769,18 @@ class AIReviewer(AIAgent):
 
     def _write_container_files(self, workspace_path: Path, files: Dict[str, str]) -> None:
         for filepath, content in files.items():
-            target_path = workspace_path / filepath
+            target_path = self._resolve_workspace_path(workspace_path, filepath)
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(content, encoding="utf-8")
+            if isinstance(content, (bytes, bytearray)):
+                target_path.write_bytes(bytes(content))
+            else:
+                target_path.write_text(str(content), encoding="utf-8")
 
-    def _run_command(self, command: List[str], cwd: Path) -> Dict[str, Any]:
-        result = subprocess.run(
-            command,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-        )
-        return {
-            "ran": True,
-            "command": " ".join(command),
-            "exit_code": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
+    def _resolve_workspace_path(self, workspace_path: Path, filepath: str) -> Path:
+        pure_path = PurePosixPath(filepath)
+        if pure_path.is_absolute() or ".." in pure_path.parts:
+            raise ValueError(f"Unsafe path rejected: {filepath}")
+        return workspace_path / pure_path
     
     def _check_architecture_compliance(self, container: Container):
         """Проверить соответствие архитектуре"""
