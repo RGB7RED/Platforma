@@ -197,7 +197,7 @@ class AIOrchestrator:
                 }
             )
 
-        if len(user_task.split()) < 5:
+        if len(user_task.split()) < 3:
             question_id = "task_details"
             if not answers.get(question_id):
                 questions.append(
