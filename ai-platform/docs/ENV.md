@@ -137,7 +137,8 @@ Open `http://localhost` in your browser.
 - **Purpose:** Selects the LLM backend implementation.
 - **Example:** `LLM_PROVIDER=mock` or `LLM_PROVIDER=openai`
 - **Required in production?:** Yes (set to `openai` for real calls, `mock` for offline)
-- **Notes:** Defaults to `mock` when unset.
+- **Notes:** Defaults to `mock` when unset. The OpenAI provider enforces JSON mode and a strict
+  system instruction to return JSON-only output for reliable parsing.
 
 ### LLM_MODEL
 - **Purpose:** Model identifier passed to the provider.

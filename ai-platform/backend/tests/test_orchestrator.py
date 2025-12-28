@@ -149,7 +149,7 @@ class TestAIOrchestrator:
         result = await orchestrator.process_task("Create a test API")
 
         assert result["status"] == "failed"
-        assert result["failure_reason"] == "llm_invalid_json"
+        assert result["failure_reason"].startswith("llm_invalid_json:")
         assert mock_agents["coder"].execute.call_count == 2
 
     @pytest.mark.asyncio
