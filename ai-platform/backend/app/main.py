@@ -863,6 +863,18 @@ def parse_int_env(value: Optional[str], default: int) -> int:
 
 def build_base_urls(request: Request) -> tuple[str, str]:
     base_url = str(request.base_url).rstrip("/")
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host")
+    if forwarded_proto:
+        scheme = forwarded_proto.split(",")[0].strip().lower()
+        if scheme in {"http", "https"}:
+            parsed = urlparse(base_url)
+            netloc = (
+                forwarded_host.split(",")[0].strip()
+                if forwarded_host
+                else parsed.netloc
+            )
+            base_url = parsed._replace(scheme=scheme, netloc=netloc).geturl().rstrip("/")
     parsed = urlparse(base_url)
     ws_scheme = "wss" if parsed.scheme == "https" else "ws"
     ws_base_url = parsed._replace(scheme=ws_scheme).geturl()
