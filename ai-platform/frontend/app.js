@@ -158,6 +158,7 @@
     charCount: document.getElementById('charCount'),
     codexVersion: document.getElementById('codexVersion'),
     templateSelect: document.getElementById('templateSelect'),
+    templateWarning: document.getElementById('templateWarning'),
     projectSelect: document.getElementById('projectSelect'),
     currentTaskId: document.getElementById('currentTaskId'),
     progressBarFill: document.getElementById('progressBarFill'),
@@ -231,6 +232,7 @@
     toastMessage: document.getElementById('toastMessage'),
     projectNameInput: document.getElementById('projectNameInput'),
     projectTemplateSelect: document.getElementById('projectTemplateSelect'),
+    projectTemplateWarning: document.getElementById('projectTemplateWarning'),
     createProjectBtn: document.getElementById('createProjectBtn'),
     githubProjectSelect: document.getElementById('githubProjectSelect'),
     githubRepoInput: document.getElementById('githubRepoInput'),
@@ -577,6 +579,15 @@
     });
   };
 
+  const setTemplateWarning = (message) => {
+    const warnings = [elements.templateWarning, elements.projectTemplateWarning].filter(Boolean);
+    const text = message ? String(message) : '';
+    warnings.forEach((warning) => {
+      warning.textContent = text;
+      warning.classList.toggle('hidden', !text);
+    });
+  };
+
   const setProjectOptions = (projects) => {
     if (!elements.projectSelect && !elements.githubProjectSelect) {
       return;
@@ -621,10 +632,13 @@
     if (!elements.templateSelect && !elements.projectTemplateSelect) {
       return;
     }
+    const warningMessage = 'Templates unavailable (check backend templates deployment)';
+    setTemplateWarning('');
     try {
       const response = await apiFetch(buildApiUrl('/api/templates'));
       if (response.status === 401) {
         setTemplateOptions([]);
+        setTemplateWarning(warningMessage);
         if (isAuthEnabled()) {
           updateAuthStatus();
           setAuthError('Sign in to load templates.');
@@ -637,8 +651,14 @@
       const data = await response.json();
       const templates = Array.isArray(data.templates) ? data.templates : [];
       setTemplateOptions(templates);
+      if (templates.length === 0) {
+        setTemplateWarning(warningMessage);
+      } else {
+        setTemplateWarning('');
+      }
     } catch (error) {
       setTemplateOptions([]);
+      setTemplateWarning(warningMessage);
     }
   };
 
