@@ -568,17 +568,20 @@ class AIOrchestrator:
                                 "failure_reason": "quota_exceeded",
                             }
                         except LLMOutputTruncatedError as exc:
+                            reason = str(exc) or "llm_output_truncated"
+                            if not reason.startswith("llm_output_"):
+                                reason = "llm_output_truncated"
                             await self._run_hook(
                                 callbacks.get("stage_failed") if callbacks else None,
                                 {
                                     "stage": "implementation",
-                                    "reason": "llm_output_truncated",
+                                    "reason": reason,
                                     "error": str(exc),
                                 },
                             )
                             self.container.update_state(
                                 ProjectState.ERROR,
-                                "llm_output_truncated",
+                                reason,
                             )
                             return {
                                 "status": "failed",
@@ -592,7 +595,7 @@ class AIOrchestrator:
                                 "iterations": iteration,
                                 "max_iterations": max_iterations,
                                 "history": self.task_history[-5:],
-                                "failure_reason": "llm_output_truncated",
+                                "failure_reason": reason,
                             }
                         except LLMProviderError as exc:
                             await self._run_hook(
