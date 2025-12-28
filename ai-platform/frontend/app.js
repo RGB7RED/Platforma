@@ -173,6 +173,7 @@
     authEmailInput: document.getElementById('authEmailInput'),
     authPasswordInput: document.getElementById('authPasswordInput'),
     authLoginBtn: document.getElementById('authLoginBtn'),
+    authRegisterBtn: document.getElementById('authRegisterBtn'),
     authLogoutBtn: document.getElementById('authLogoutBtn'),
     authError: document.getElementById('authError'),
     authTokenStatus: document.getElementById('authTokenStatus'),
@@ -684,9 +685,11 @@
     let hasDetail = false;
     try {
       const data = await response.json();
-      const detail = data?.detail || data?.error || data?.message;
-      if (detail) {
-        message = `http_error (${response.status}): ${detail}`;
+      const detail = data?.message || data?.detail;
+      const errorCode = data?.error;
+      if (detail || errorCode) {
+        const suffix = detail || errorCode;
+        message = `http_error (${response.status}): ${suffix}`;
         hasDetail = true;
       }
     } catch (error) {
@@ -738,6 +741,26 @@
       loadTemplates();
     } catch (error) {
       setAuthError(error?.message || 'Unable to sign in.');
+    }
+  };
+
+  const registerWithEmail = async () => {
+    const email = elements.authEmailInput?.value.trim();
+    const password = elements.authPasswordInput?.value || '';
+    if (!email || !password) {
+      setAuthError('Please enter your email and password.');
+      return;
+    }
+    try {
+      const response = await apiFetch(buildApiUrl('/auth/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password })
+      }, { includeAuth: false, retryOnUnauthorized: false });
+      await handleAuthResponse(response, 'Registered successfully.');
+      loadTemplates();
+    } catch (error) {
+      setAuthError(error?.message || 'Unable to register.');
     }
   };
 
@@ -2312,6 +2335,10 @@
 
   if (elements.authLoginBtn) {
     elements.authLoginBtn.addEventListener('click', loginWithEmail);
+  }
+
+  if (elements.authRegisterBtn) {
+    elements.authRegisterBtn.addEventListener('click', registerWithEmail);
   }
 
   if (elements.authLogoutBtn) {

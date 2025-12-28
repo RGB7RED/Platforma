@@ -47,6 +47,13 @@ Required environment variables are documented in
 - Template: [`backend/.env.example`](backend/.env.example)
 - Reference: [`docs/ENV.md`](docs/ENV.md)
 
+## Auth bootstrap & registration
+
+- To create the first admin user automatically, set `BOOTSTRAP_ADMIN_ENABLED=true` along with
+  `BOOTSTRAP_ADMIN_EMAIL` and `BOOTSTRAP_ADMIN_PASSWORD` (requires `DATABASE_URL` and
+  `AUTH_MODE=auth` or `AUTH_MODE=hybrid`).
+- To allow public sign-ups, set `PUBLIC_REGISTRATION_ENABLED=true` and use `/auth/register`.
+
 ## Container persistence v1 (read-only)
 
 When `DATABASE_URL` is configured, the backend stores container events, artifacts, and state in

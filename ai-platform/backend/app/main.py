@@ -2,7 +2,9 @@
 Основной FastAPI сервер для Telegram Mini App
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, status
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -45,7 +47,12 @@ from .schemas import (
     TaskQuestionsResponse,
     TaskResumeResponse,
 )
-from .auth import get_auth_settings, get_user_from_access_token, router as auth_router
+from .auth import (
+    bootstrap_admin_user,
+    get_auth_settings,
+    get_user_from_access_token,
+    router as auth_router,
+)
 from .auth.settings import get_google_oauth_settings
 from . import db
 from .logging_utils import (
@@ -766,6 +773,8 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("DATABASE_URL not set, using in-memory task storage")
 
+    await bootstrap_admin_user()
+
     queued = await task_governor.bootstrap()
     if queued:
         logger.info("Loaded %s queued tasks on startup", queued)
@@ -784,6 +793,38 @@ app = FastAPI(
     version="1.0.0-mvp",
     lifespan=lifespan
 )
+
+
+def _is_auth_request(request: Request) -> bool:
+    return request.url.path.startswith("/auth")
+
+
+@app.exception_handler(HTTPException)
+async def auth_http_exception_handler(request: Request, exc: HTTPException):
+    if _is_auth_request(request):
+        detail = exc.detail
+        if isinstance(detail, dict) and "error" in detail:
+            return JSONResponse(status_code=exc.status_code, content=detail)
+        message = detail if isinstance(detail, str) else "Auth error"
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": "auth_error", "message": message},
+        )
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def auth_validation_exception_handler(request: Request, exc: RequestValidationError):
+    if _is_auth_request(request):
+        message = "Invalid input"
+        errors = exc.errors()
+        if errors:
+            message = errors[0].get("msg", message)
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": "invalid_input", "message": message},
+        )
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.middleware("http")

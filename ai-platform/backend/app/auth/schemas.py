@@ -8,6 +8,7 @@ from pydantic import BaseModel, EmailStr, Field
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8)
+    invite_token: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -18,11 +19,13 @@ class LoginRequest(BaseModel):
 class UserResponse(BaseModel):
     id: str
     email: EmailStr
+    role: str
     email_verified: bool
 
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: Optional[str] = None
     token_type: str = "bearer"
     expires_in: int
     user: UserResponse
@@ -30,6 +33,7 @@ class TokenResponse(BaseModel):
 
 class RefreshResponse(BaseModel):
     access_token: str
+    refresh_token: Optional[str] = None
     token_type: str = "bearer"
     expires_in: int
     user: UserResponse

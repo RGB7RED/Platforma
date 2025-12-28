@@ -9,6 +9,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import RedirectResponse
+from jose import JWTError, jwt
 
 from .email import build_public_link, get_email_settings, send_email
 from .schemas import (
@@ -39,6 +40,10 @@ from .. import db
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 _bearer = HTTPBearer(auto_error=False)
+
+
+def _raise_auth_error(status_code: int, error: str, message: str) -> None:
+    raise HTTPException(status_code=status_code, detail={"error": error, "message": message})
 
 
 def _ensure_auth_enabled() -> None:
@@ -105,6 +110,7 @@ def _normalize_user(user: Dict[str, object]) -> UserResponse:
     return UserResponse(
         id=str(user["id"]),
         email=user["email"],
+        role=user.get("role") or "user",
         email_verified=user.get("email_verified_at") is not None,
     )
 
@@ -158,12 +164,17 @@ def _build_oauth_redirect(return_to: str, token: TokenResponse) -> str:
     return urlunparse(updated)
 
 
-def _access_token_response(user: Dict[str, object]) -> TokenResponse:
+def _access_token_response(
+    user: Dict[str, object],
+    *,
+    refresh_token: Optional[str] = None,
+) -> TokenResponse:
     settings = get_auth_settings()
     access_token = create_access_token(user_id=str(user["id"]), email=user["email"])
     expires_in = int(timedelta(minutes=settings.access_ttl_minutes).total_seconds())
     return TokenResponse(
         access_token=access_token,
+        refresh_token=refresh_token,
         expires_in=expires_in,
         user=_normalize_user(user),
     )
@@ -186,7 +197,40 @@ async def _issue_refresh_session(
         ip_address=request.client.host if request.client else None,
     )
     _set_refresh_cookie(response, refresh_token, expires_at)
-    return _access_token_response(user)
+    return _access_token_response(user, refresh_token=refresh_token)
+
+
+def _ensure_invite_configured(settings: object) -> None:
+    if not getattr(settings, "invite_token_secret", ""):
+        _raise_auth_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "invite_config_missing",
+            "INVITE_TOKEN_SECRET is not configured",
+        )
+
+
+def _validate_invite_token(token: str, email: str) -> None:
+    settings = get_auth_settings()
+    _ensure_invite_configured(settings)
+    try:
+        payload = jwt.decode(
+            token,
+            settings.invite_token_secret,
+            algorithms=[settings.jwt_algorithm],
+            options={"verify_aud": False},
+        )
+    except JWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_invite_token", "message": "Invite token is invalid"},
+        ) from exc
+    invite_email = payload.get("email")
+    if invite_email and invite_email.strip().lower() != email:
+        _raise_auth_error(
+            status.HTTP_400_BAD_REQUEST,
+            "invalid_invite_token",
+            "Invite token does not match the provided email",
+        )
 
 
 async def get_current_user(
@@ -194,12 +238,12 @@ async def get_current_user(
 ) -> Dict[str, object]:
     settings = get_auth_settings()
     if settings.mode == "api_key":
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth mode disabled")
+        _raise_auth_error(status.HTTP_401_UNAUTHORIZED, "auth_disabled", "Auth mode disabled")
     if credentials is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token")
+        _raise_auth_error(status.HTTP_401_UNAUTHORIZED, "missing_token", "Missing access token")
     user = await get_user_from_access_token(credentials.credentials)
     if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token")
+        _raise_auth_error(status.HTTP_401_UNAUTHORIZED, "invalid_token", "Invalid access token")
     return user
 
 
@@ -207,12 +251,37 @@ async def get_current_user(
 async def register(payload: RegisterRequest, request: Request, response: Response) -> TokenResponse:
     _ensure_auth_enabled()
     _ensure_db_ready()
+    settings = get_auth_settings()
     email = payload.email.strip().lower()
+    invite_token = payload.invite_token.strip() if payload.invite_token else ""
+    public_enabled = settings.public_registration_enabled
+    invite_enabled = settings.invite_registration_enabled
+    if public_enabled:
+        if invite_enabled and invite_token:
+            _validate_invite_token(invite_token, email)
+    else:
+        if not invite_enabled:
+            _raise_auth_error(
+                status.HTTP_403_FORBIDDEN,
+                "registration_disabled",
+                "Public registration is disabled",
+            )
+        if not invite_token:
+            _raise_auth_error(
+                status.HTTP_400_BAD_REQUEST,
+                "invite_token_required",
+                "Invite token is required",
+            )
+        _validate_invite_token(invite_token, email)
     existing = await db.get_auth_user_by_email(email)
     if existing:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+        _raise_auth_error(
+            status.HTTP_409_CONFLICT,
+            "user_exists",
+            "User with this email already exists",
+        )
     password_hash = hash_password(payload.password)
-    user = await db.create_auth_user(email=email, password_hash=password_hash)
+    user = await db.create_auth_user(email=email, password_hash=password_hash, role="user")
 
     return await _issue_refresh_session(user=user, request=request, response=response)
 
@@ -224,7 +293,11 @@ async def login(payload: LoginRequest, request: Request, response: Response) -> 
     email = payload.email.strip().lower()
     user = await db.get_auth_user_by_email(email)
     if not user or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        _raise_auth_error(
+            status.HTTP_401_UNAUTHORIZED,
+            "invalid_credentials",
+            "Invalid credentials",
+        )
 
     return await _issue_refresh_session(user=user, request=request, response=response)
 
@@ -269,6 +342,7 @@ async def refresh(request: Request, response: Response) -> RefreshResponse:
         token_type=token_response.token_type,
         expires_in=token_response.expires_in,
         user=token_response.user,
+        refresh_token=new_refresh_token,
     )
 
 
@@ -410,7 +484,11 @@ async def google_callback(
         if not user:
             random_password = secrets.token_urlsafe(32)
             password_hash = hash_password(random_password)
-            user = await db.create_auth_user(email=normalized_email, password_hash=password_hash)
+            user = await db.create_auth_user(
+                email=normalized_email,
+                password_hash=password_hash,
+                role="user",
+            )
         if user.get("email_verified_at") is None:
             verified_user = await db.mark_auth_user_email_verified(user_id=str(user["id"]))
             if verified_user:

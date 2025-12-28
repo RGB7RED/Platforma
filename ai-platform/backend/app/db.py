@@ -121,6 +121,7 @@ async def init_db(database_url: str) -> None:
                 id UUID PRIMARY KEY,
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
                 email_verified_at TIMESTAMPTZ NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -129,6 +130,9 @@ async def init_db(database_url: str) -> None:
         )
         await conn.execute(
             "ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;"
+        )
+        await conn.execute(
+            "ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';"
         )
         await conn.execute(
             """
@@ -1332,19 +1336,25 @@ async def list_active_task_ids(limit: int = 5) -> List[str]:
     return [str(row["id"]) for row in rows]
 
 
-async def create_auth_user(*, email: str, password_hash: str) -> Dict[str, Any]:
+async def create_auth_user(
+    *,
+    email: str,
+    password_hash: str,
+    role: str = "user",
+) -> Dict[str, Any]:
     if _pool is None:
         raise RuntimeError("Database pool is not initialized")
     try:
         row = await _pool.fetchrow(
             """
-            INSERT INTO auth_users (id, email, password_hash)
-            VALUES ($1, $2, $3)
-            RETURNING id, email, password_hash, email_verified_at, created_at, updated_at;
+            INSERT INTO auth_users (id, email, password_hash, role)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, email, password_hash, role, email_verified_at, created_at, updated_at;
             """,
             uuid.uuid4(),
             email,
             password_hash,
+            role,
         )
     except Exception:
         _log_db_error("create_auth_user", {"email": email})
@@ -1357,7 +1367,7 @@ async def get_auth_user_by_email(email: str) -> Optional[Dict[str, Any]]:
         raise RuntimeError("Database pool is not initialized")
     row = await _pool.fetchrow(
         """
-        SELECT id, email, password_hash, email_verified_at, created_at, updated_at
+        SELECT id, email, password_hash, role, email_verified_at, created_at, updated_at
         FROM auth_users
         WHERE email = $1;
         """,
@@ -1371,7 +1381,7 @@ async def get_auth_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
         raise RuntimeError("Database pool is not initialized")
     row = await _pool.fetchrow(
         """
-        SELECT id, email, password_hash, email_verified_at, created_at, updated_at
+        SELECT id, email, password_hash, role, email_verified_at, created_at, updated_at
         FROM auth_users
         WHERE id = $1;
         """,
@@ -1389,7 +1399,7 @@ async def mark_auth_user_email_verified(*, user_id: str) -> Optional[Dict[str, A
         SET email_verified_at = NOW(),
             updated_at = NOW()
         WHERE id = $1
-        RETURNING id, email, password_hash, email_verified_at, created_at, updated_at;
+        RETURNING id, email, password_hash, role, email_verified_at, created_at, updated_at;
         """,
         _coerce_user_id(user_id),
     )
@@ -1405,7 +1415,7 @@ async def update_auth_user_password(*, user_id: str, password_hash: str) -> Opti
         SET password_hash = $2,
             updated_at = NOW()
         WHERE id = $1
-        RETURNING id, email, password_hash, email_verified_at, created_at, updated_at;
+        RETURNING id, email, password_hash, role, email_verified_at, created_at, updated_at;
         """,
         _coerce_user_id(user_id),
         password_hash,

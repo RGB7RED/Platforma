@@ -183,6 +183,44 @@ Open `http://localhost` in your browser.
   `hybrid` allows either. In `auth`/`hybrid` mode, tasks created with access tokens are bound to the
   authenticated user ID (`owner_user_id`) and cannot be accessed via API keys.
 
+### BOOTSTRAP_ADMIN_ENABLED
+- **Purpose:** Automatically creates the first admin user on startup.
+- **Example:** `BOOTSTRAP_ADMIN_ENABLED=true`
+- **Required in production?:** Optional
+- **Notes:** Requires `DATABASE_URL` and `AUTH_MODE=auth` or `AUTH_MODE=hybrid`. When enabled,
+  `BOOTSTRAP_ADMIN_EMAIL` and `BOOTSTRAP_ADMIN_PASSWORD` must be provided.
+
+### BOOTSTRAP_ADMIN_EMAIL
+- **Purpose:** Email address for the bootstrap admin user.
+- **Example:** `BOOTSTRAP_ADMIN_EMAIL=admin@example.com`
+- **Required in production?:** Required if `BOOTSTRAP_ADMIN_ENABLED=true`
+- **Notes:** The email is normalized to lowercase before insertion.
+
+### BOOTSTRAP_ADMIN_PASSWORD
+- **Purpose:** Password for the bootstrap admin user.
+- **Example:** `BOOTSTRAP_ADMIN_PASSWORD=ChangeMe123!`
+- **Required in production?:** Required if `BOOTSTRAP_ADMIN_ENABLED=true`
+- **Notes:** Stored as a bcrypt hash in Postgres.
+
+### PUBLIC_REGISTRATION_ENABLED
+- **Purpose:** Allows anyone to register with `/auth/register`.
+- **Example:** `PUBLIC_REGISTRATION_ENABLED=true`
+- **Required in production?:** Optional
+- **Notes:** When disabled, registration requires valid invite tokens (see `INVITE_REGISTRATION_ENABLED`).
+
+### INVITE_REGISTRATION_ENABLED
+- **Purpose:** Allows registration with invite tokens instead of open sign-ups.
+- **Example:** `INVITE_REGISTRATION_ENABLED=true`
+- **Required in production?:** Optional
+- **Notes:** Requires `INVITE_TOKEN_SECRET` when enabled.
+
+### INVITE_TOKEN_SECRET
+- **Purpose:** HMAC/JWT signing secret for invite tokens.
+- **Example:** `INVITE_TOKEN_SECRET=super-long-random-string`
+- **Required in production?:** Required if `INVITE_REGISTRATION_ENABLED=true`
+- **Notes:** Invite tokens are validated as JWTs; include an `email` claim to bind a token to a
+  specific recipient.
+
 ### AUTH_JWT_SECRET
 - **Purpose:** Secret key used to sign access tokens.
 - **Example:** `AUTH_JWT_SECRET=super-long-random-string`
