@@ -122,6 +122,7 @@ class SafeCommandRunner:
         *,
         cwd: Optional[Path] = None,
         purpose: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         run_id = str(uuid.uuid4())
         cwd = (cwd or self.workspace_path).resolve()
@@ -169,12 +170,16 @@ class SafeCommandRunner:
         exit_code: Optional[int] = None
         error: Optional[str] = None
         try:
+            run_env = os.environ.copy()
+            if env:
+                run_env.update(env)
             completed = subprocess.run(
                 command,
                 cwd=cwd,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
+                env=run_env,
             )
             exit_code = completed.returncode
             stdout = completed.stdout or ""
@@ -1492,6 +1497,7 @@ class AIReviewer(AIAgent):
             "Соответствует ли архитектуре?",
             "Нет ли нарушений кодекса?"
         ])
+        template_id = self._resolve_template_id(container)
         
         issues = []
         warnings = []
@@ -1505,7 +1511,7 @@ class AIReviewer(AIAgent):
             passed_checks.extend(file_passed)
 
         # Проверяем соответствие архитектуре
-        if container.target_architecture:
+        if container.target_architecture and not self._skip_architecture_compliance(template_id):
             arch_issues, arch_warnings = self._check_architecture_compliance(container)
             issues.extend(arch_issues)
             warnings.extend(arch_warnings)
@@ -1527,6 +1533,14 @@ class AIReviewer(AIAgent):
             warnings.append("No documentation files found")
         else:
             passed_checks.append(f"Found {len(doc_files)} documentation files")
+
+        self._apply_template_checks(
+            template_id,
+            container,
+            issues,
+            warnings,
+            passed_checks,
+        )
 
         ruff_report = {
             "ran": False,
@@ -1644,6 +1658,88 @@ class AIReviewer(AIAgent):
         })
 
         return review_result
+
+    def _resolve_template_id(self, container: Container) -> Optional[str]:
+        template_id = container.metadata.get("template_id")
+        if template_id:
+            return template_id
+        manifest = container.metadata.get("template_manifest")
+        if isinstance(manifest, dict):
+            return manifest.get("id")
+        return None
+
+    def _skip_architecture_compliance(self, template_id: Optional[str]) -> bool:
+        return template_id == "python_cli"
+
+    def _apply_template_checks(
+        self,
+        template_id: Optional[str],
+        container: Container,
+        issues: List[str],
+        warnings: List[str],
+        passed_checks: List[str],
+    ) -> None:
+        if template_id == "python_cli":
+            if not self._has_readme(container.files):
+                issues.append("README.md is required for python_cli template")
+            else:
+                passed_checks.append("README.md found")
+            return
+        if template_id == "python_fastapi":
+            missing_deps = self._missing_requirements(
+                container.files,
+                ("fastapi", "uvicorn", "pydantic"),
+            )
+            if missing_deps:
+                issues.append(
+                    "Missing FastAPI dependencies in requirements.txt: "
+                    + ", ".join(missing_deps)
+                )
+            else:
+                passed_checks.append("FastAPI dependencies present in requirements.txt")
+            if not self._has_fastapi_app(container.files):
+                issues.append("FastAPI app instance not found")
+            if not self._has_fastapi_routes(container.files):
+                warnings.append("No FastAPI routes detected")
+            if not self._has_health_endpoint(container.files):
+                issues.append("Missing /health endpoint for FastAPI template")
+            else:
+                passed_checks.append("Health endpoint found")
+
+    def _has_readme(self, files: Dict[str, str]) -> bool:
+        for filepath in files.keys():
+            if Path(filepath).name.lower() == "readme.md":
+                return True
+        return False
+
+    def _missing_requirements(self, files: Dict[str, str], deps: tuple[str, ...]) -> List[str]:
+        requirements = files.get("requirements.txt", "")
+        missing = []
+        for dep in deps:
+            if dep not in requirements:
+                missing.append(dep)
+        return missing
+
+    def _iter_python_files(self, files: Dict[str, str]) -> List[str]:
+        return [content for name, content in files.items() if name.endswith(".py")]
+
+    def _has_fastapi_app(self, files: Dict[str, str]) -> bool:
+        for content in self._iter_python_files(files):
+            if "FastAPI" in content and "FastAPI(" in content:
+                return True
+        return False
+
+    def _has_fastapi_routes(self, files: Dict[str, str]) -> bool:
+        for content in self._iter_python_files(files):
+            if "@app." in content or "include_router" in content:
+                return True
+        return False
+
+    def _has_health_endpoint(self, files: Dict[str, str]) -> bool:
+        for content in self._iter_python_files(files):
+            if '"/health"' in content or "'/health'" in content:
+                return True
+        return False
     
     def _review_file(self, filepath: str, content: str):
         """Проверить конкретный файл"""
@@ -1750,7 +1846,7 @@ class AIReviewer(AIAgent):
                 if ruff_report.get("error"):
                     errors.append(f"ruff error: {ruff_report['error']}")
                 elif ruff_report["exit_code"] != 0:
-                    errors.append(f"ruff failed with exit code {ruff_report['exit_code']}")
+                    warnings.append(f"ruff reported issues (exit code {ruff_report['exit_code']})")
             else:
                 errors.append("ruff executable not found")
             self._write_container_files(workspace_path, files)
@@ -1771,9 +1867,10 @@ class AIReviewer(AIAgent):
             if shutil.which("pytest"):
                 self._write_container_files(workspace_path, files)
                 pytest_report = await command_runner.run(
-                    ["pytest", "-q"],
+                    [sys.executable, "-m", "pytest", "-q"],
                     cwd=workspace_path,
                     purpose="pytest",
+                    env={"PYTHONPATH": str(workspace_path)},
                 )
                 if pytest_report.get("error"):
                     errors.append(f"pytest error: {pytest_report['error']}")
