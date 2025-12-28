@@ -200,7 +200,8 @@ Open `http://localhost` in your browser.
 - **Purpose:** Password for the bootstrap admin user.
 - **Example:** `BOOTSTRAP_ADMIN_PASSWORD=ChangeMe123!`
 - **Required in production?:** Required if `BOOTSTRAP_ADMIN_ENABLED=true`
-- **Notes:** Stored as a bcrypt hash in Postgres.
+- **Notes:** Stored as a bcrypt hash in Postgres. Bcrypt only uses the first 72 bytes of the
+  password, so keep this value under 72 bytes and prefer ASCII to avoid multi-byte surprises.
 
 ### PUBLIC_REGISTRATION_ENABLED
 - **Purpose:** Allows anyone to register with `/auth/register`.

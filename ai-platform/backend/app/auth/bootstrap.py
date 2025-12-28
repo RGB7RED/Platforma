@@ -27,6 +27,15 @@ async def bootstrap_admin_user() -> None:
     existing = await db.get_auth_user_by_email(email)
     if existing:
         return
-    password_hash = hash_password(settings.bootstrap_admin_password)
+    password = settings.bootstrap_admin_password
+    pw_bytes = password.encode("utf-8")
+    if len(pw_bytes) > 72:
+        message = (
+            "BOOTSTRAP_ADMIN_PASSWORD is too long for bcrypt (>72 bytes). "
+            "Use ASCII and keep it under 72 bytes."
+        )
+        logger.error(message)
+        raise RuntimeError(message)
+    password_hash = hash_password(password)
     await db.create_auth_user(email=email, password_hash=password_hash, role="admin")
     logger.info("Bootstrap admin user created for %s", email)
