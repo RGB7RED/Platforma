@@ -457,6 +457,7 @@
                         <p>The ZIP file contains all generated files with proper structure.</p>
                         <p class="muted">Downloads are available once the task is complete.</p>
                     </div>
+                    <div class="task-lookup-hint error-message hidden" id="prCreateStatus"></div>
                 </div>
 
                 <!-- New Task Button -->
@@ -521,8 +522,12 @@
                     <button class="secondary-btn" id="connectGithubBtn">
                         Connect GitHub
                     </button>
+                    <button class="secondary-btn" id="testGithubBtn">
+                        Test GitHub Connection
+                    </button>
                 </div>
                 <div class="task-lookup-hint hidden" id="githubConnectStatus"></div>
+                <div class="task-lookup-hint hidden" id="githubTestStatus"></div>
 
                 <div class="tasks-list" id="projectsList">
                     <!-- Projects will be added here -->

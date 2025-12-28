@@ -239,14 +239,17 @@
     githubDefaultBranchInput: document.getElementById('githubDefaultBranchInput'),
     githubTokenInput: document.getElementById('githubTokenInput'),
     connectGithubBtn: document.getElementById('connectGithubBtn'),
+    testGithubBtn: document.getElementById('testGithubBtn'),
     githubConnectStatus: document.getElementById('githubConnectStatus'),
+    githubTestStatus: document.getElementById('githubTestStatus'),
     refreshDashboardBtn: document.getElementById('refreshDashboardBtn'),
     projectsList: document.getElementById('projectsList'),
     projectsEmpty: document.getElementById('projectsEmpty'),
     projectError: document.getElementById('projectError'),
     tasksList: document.getElementById('tasksList'),
     tasksEmpty: document.getElementById('tasksEmpty'),
-    createPrBtn: document.getElementById('createPrBtn')
+    createPrBtn: document.getElementById('createPrBtn'),
+    prCreateStatus: document.getElementById('prCreateStatus')
   };
 
   let currentTaskId = null;
@@ -683,6 +686,26 @@
     elements.githubConnectStatus.classList.toggle('error-message', tone === 'error');
   };
 
+  const setGithubTestStatus = (message, tone = '') => {
+    if (!elements.githubTestStatus) {
+      return;
+    }
+    const text = message ? String(message) : '';
+    elements.githubTestStatus.textContent = text;
+    elements.githubTestStatus.classList.toggle('hidden', !text);
+    elements.githubTestStatus.classList.toggle('error-message', tone === 'error');
+  };
+
+  const setPrCreateStatus = (message, tone = '') => {
+    if (!elements.prCreateStatus) {
+      return;
+    }
+    const text = message ? String(message) : '';
+    elements.prCreateStatus.textContent = text;
+    elements.prCreateStatus.classList.toggle('hidden', !text);
+    elements.prCreateStatus.classList.toggle('error-message', tone === 'error');
+  };
+
   const fetchProjects = async () => {
     const userId = getAuthUserId();
     if (!userId) {
@@ -948,6 +971,63 @@
     } catch (error) {
       const message = error?.message || 'Unable to connect GitHub.';
       setGithubConnectStatus(message, 'error');
+      showToast(message, '⚠️');
+    }
+  };
+
+  const testGithubConnection = async () => {
+    const userId = getAuthUserId();
+    if (!userId) {
+      showToast('Please sign in to test GitHub.', '⚠️');
+      return;
+    }
+    const projectId = elements.githubProjectSelect?.value?.trim();
+    if (!projectId) {
+      showToast('Select a project to test.', '⚠️');
+      return;
+    }
+    const repoFullName = elements.githubRepoInput?.value?.trim();
+    if (!repoFullName) {
+      showToast('Enter a GitHub repository (owner/name).', '⚠️');
+      return;
+    }
+    const accessToken = elements.githubTokenInput?.value?.trim();
+    if (!accessToken) {
+      showToast('Provide a GitHub access token.', '⚠️');
+      return;
+    }
+    const payload = {
+      repo_full_name: repoFullName,
+      access_token: accessToken
+    };
+    const defaultBranch = elements.githubDefaultBranchInput?.value?.trim();
+    if (defaultBranch) {
+      payload.default_branch = defaultBranch;
+    }
+    setGithubTestStatus('');
+    try {
+      const response = await apiFetch(buildApiUrl(`/api/projects/${projectId}/test-github`), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) {
+        const errorPayload = await readResponseJson(response);
+        const message = response.status === 401 || response.status === 403
+          ? 'Sign in to test GitHub.'
+          : formatPrErrorMessage(errorPayload, response.status);
+        throw new Error(message);
+      }
+      const data = await response.json();
+      const branchInfo = data?.default_branch ? `Default branch: ${data.default_branch}` : 'Default branch resolved.';
+      const message = `GitHub connection ok. ${branchInfo}`;
+      setGithubTestStatus(message);
+      showToast('GitHub connection verified.', '✅');
+    } catch (error) {
+      const message = error?.message || 'Unable to test GitHub.';
+      setGithubTestStatus(message, 'error');
       showToast(message, '⚠️');
     }
   };
@@ -2734,6 +2814,10 @@
     elements.connectGithubBtn.addEventListener('click', connectGithubProject);
   }
 
+  if (elements.testGithubBtn) {
+    elements.testGithubBtn.addEventListener('click', testGithubConnection);
+  }
+
   if (elements.refreshProgressBtn) {
     elements.refreshProgressBtn.addEventListener('click', refreshStatus);
   }
@@ -2960,6 +3044,46 @@
     }
   };
 
+  const readResponseJson = async (response) => {
+    try {
+      return await response.json();
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const formatApiDetail = (detail) => {
+    if (!detail) {
+      return '';
+    }
+    if (typeof detail === 'string') {
+      return detail;
+    }
+    try {
+      return JSON.stringify(detail);
+    } catch (error) {
+      return String(detail);
+    }
+  };
+
+  const formatPrErrorMessage = (payload, status) => {
+    if (!payload || typeof payload !== 'object') {
+      return `PR creation failed (${status})`;
+    }
+    const rawMessage = payload.github_error_message
+      || payload.message
+      || payload.detail
+      || payload.error;
+    const baseMessage = formatApiDetail(rawMessage) || `PR creation failed (${status})`;
+    const githubStatus = payload.status_code ? `GitHub ${payload.status_code}` : '';
+    const responseDetail = payload.github_error_response
+      ? formatApiDetail(payload.github_error_response)
+      : '';
+    const requestId = payload.request_id ? `request_id: ${payload.request_id}` : '';
+    const parts = [githubStatus, baseMessage, responseDetail, requestId].filter(Boolean);
+    return parts.join(' — ');
+  };
+
   const createPullRequest = async (taskId) => {
     if (!taskId) {
       showToast('No task available for PR.', '⚠️');
@@ -2969,6 +3093,7 @@
       showToast('Connect GitHub and complete the task to create a PR.', 'ℹ️');
       return;
     }
+    setPrCreateStatus('');
     try {
       const response = await apiFetch(buildApiUrl(`/api/tasks/${taskId}/create-pr`), {
         method: 'POST',
@@ -2978,18 +3103,24 @@
         body: JSON.stringify({})
       });
       if (!response.ok) {
+        const errorPayload = await readResponseJson(response);
         const message = response.status === 401 || response.status === 403
           ? 'Sign in to create a PR.'
-          : `PR creation failed (${response.status})`;
-        throw new Error(message);
+          : formatPrErrorMessage(errorPayload, response.status);
+        setPrCreateStatus(message, 'error');
+        showToast(message, '⚠️');
+        return;
       }
       const data = await response.json();
       showToast('Pull request created.', '✅');
+      setPrCreateStatus('Pull request created.');
       if (data.pull_request_url) {
         window.open(data.pull_request_url, '_blank', 'noopener');
       }
     } catch (error) {
-      showToast(error?.message || 'Unable to create PR.', '⚠️');
+      const message = error?.message || 'Unable to create PR.';
+      setPrCreateStatus(message, 'error');
+      showToast(message, '⚠️');
     }
   };
 
