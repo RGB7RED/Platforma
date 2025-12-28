@@ -2,8 +2,8 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from api.models import Todo, TodoCreate, TodoUpdate
 from api.dependencies import get_todo_service
+from api.models import Todo, TodoCreate, TodoUpdate
 from services.todo_service import TodoService
 
 router = APIRouter()
