@@ -938,6 +938,8 @@ class AICoder(AIAgent):
         review_report = task.get("review_report")
         review_errors = task.get("review_errors") or task.get("errors")
         review_warnings = task.get("review_warnings") or task.get("warnings")
+        review_report = self._compress_review_report(review_report)
+        review_warnings = self._limit_list(review_warnings, 20)
         constraints = list(rules.get("constraints", []))
         template_id = self._resolve_template_id(container)
         if template_id == "python_fastapi":
@@ -953,13 +955,14 @@ class AICoder(AIAgent):
             "artifacts (object with implementation_plan or code_summary).\n"
             "Do not include secrets or API keys in outputs."
         )
+        existing_files = self._select_existing_files(review_report, context.get("files", []))
         user_payload = {
             "Task": task_description,
             "Type": task.get("type"),
             "Component": task.get("component"),
             "Target file": target_file,
             "Allowed paths": allowed_paths,
-            "Existing files": context.get("files", []),
+            "Existing files": existing_files,
             "Architecture": context.get("architecture"),
             "Recent changes": context.get("recent_changes"),
             "Review report": review_report,
@@ -990,6 +993,8 @@ class AICoder(AIAgent):
         review_report = task.get("review_report")
         review_errors = task.get("review_errors") or task.get("errors")
         review_warnings = task.get("review_warnings") or task.get("warnings")
+        review_report = self._compress_review_report(review_report)
+        review_warnings = self._limit_list(review_warnings, 20)
         constraints = list(rules.get("constraints", []))
         template_id = self._resolve_template_id(container)
         if template_id == "python_fastapi":
@@ -1009,7 +1014,7 @@ class AICoder(AIAgent):
             "Component": task.get("component"),
             "Target file": target_file,
             "Allowed paths": allowed_paths,
-            "Existing files": context.get("files", []),
+            "Existing files": self._select_existing_files(review_report, context.get("files", [])),
             "Architecture": context.get("architecture"),
             "Recent changes": context.get("recent_changes"),
             "Review report": review_report,
@@ -1027,6 +1032,39 @@ class AICoder(AIAgent):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+
+    @staticmethod
+    def _limit_list(values: Optional[List[Any]], limit: int) -> Optional[List[Any]]:
+        if not isinstance(values, list):
+            return values
+        return values[:limit]
+
+    @staticmethod
+    def _compress_review_report(review_report: Any) -> Any:
+        if not isinstance(review_report, dict):
+            return review_report
+        report = dict(review_report)
+        warnings = report.get("warnings")
+        if isinstance(warnings, list):
+            report["warnings"] = warnings[:20]
+        ruff_report = report.get("ruff")
+        if isinstance(ruff_report, dict):
+            ruff_copy = dict(ruff_report)
+            stdout = ruff_copy.get("stdout")
+            if isinstance(stdout, str) and len(stdout) > 2000:
+                ruff_copy["stdout"] = stdout[:2000]
+            report["ruff"] = ruff_copy
+        return report
+
+    @staticmethod
+    def _select_existing_files(review_report: Any, files: Any, limit: int = 50) -> Any:
+        if isinstance(review_report, dict):
+            missing_files = review_report.get("missing_files")
+            if isinstance(missing_files, list) and missing_files:
+                return missing_files
+        if isinstance(files, list):
+            return files[:limit]
+        return files
 
     def _resolve_template_id(self, container: Container) -> Optional[str]:
         template_id = container.metadata.get("template_id")

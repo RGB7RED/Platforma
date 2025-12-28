@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class LLMProviderError(RuntimeError):
@@ -234,13 +237,25 @@ class OpenAIProvider:
         text = choice.get("message", {}).get("content", "")
         finish_reason = choice.get("finish_reason")
         usage = data.get("usage", {}) or {}
+        prompt_chars = sum(len(str(message.get("content", ""))) for message in messages)
+        response_chars = len(text or "")
+        usage_metrics = {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        }
+        logger.info(
+            "OpenAI completion metrics prompt_chars=%s max_tokens=%s finish_reason=%s "
+            "response_chars=%s usage=%s",
+            prompt_chars,
+            max_tokens,
+            finish_reason,
+            response_chars,
+            usage_metrics,
+        )
         return {
             "text": text,
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
+            "usage": usage_metrics,
             "finish_reason": finish_reason,
         }
 
@@ -355,11 +370,19 @@ async def generate_with_retry(
     max_tokens = max_tokens_override or settings.max_tokens
     truncation_retries = 0
     max_truncation_retries = 1
+    continuation_attempts = 0
+    max_continuations = 3
     total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    continuation_messages = prepared_messages
+    combined_chunks: List[str] = []
+    continuation_prompt = (
+        "Continue EXACTLY from where you stopped. Do not repeat. "
+        "Output only the remaining content."
+    )
     while True:
         try:
             response = await provider.generate_text(
-                messages=prepared_messages,
+                messages=continuation_messages,
                 model=settings.model,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -376,19 +399,35 @@ async def generate_with_retry(
                 )
 
             finish_reason = response.get("finish_reason")
-            response["finish_reason"] = finish_reason
-            response["usage"] = total_usage
+            text = response.get("text", "") or ""
 
             if finish_reason == "length":
                 if truncation_retries < max_truncation_retries:
                     truncation_retries += 1
                     max_tokens = min(max_tokens * 2, 2000)
+                    combined_chunks = []
+                    continuation_messages = prepared_messages
+                    continue
+                combined_chunks.append(text)
+                if continuation_attempts < max_continuations:
+                    continuation_attempts += 1
+                    aggregated_text = "".join(combined_chunks)
+                    continuation_messages = prepared_messages + [
+                        {"role": "assistant", "content": aggregated_text},
+                        {"role": "user", "content": continuation_prompt},
+                    ]
                     continue
                 raise LLMOutputTruncatedError(
                     "llm_output_truncated",
                     usage=total_usage,
                     finish_reason=finish_reason,
                 )
+            if combined_chunks:
+                combined_chunks.append(text)
+                text = "".join(combined_chunks)
+            response["finish_reason"] = finish_reason
+            response["usage"] = total_usage
+            response["text"] = text
             return response
         except LLMProviderError as exc:
             if attempt >= max_retries or not exc.retryable:
