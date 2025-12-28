@@ -47,6 +47,7 @@ async def init_db(database_url: str) -> None:
                 codex_version TEXT NULL,
                 template_id TEXT NULL,
                 template_hash TEXT NULL,
+                project_id UUID NULL,
                 client_ip TEXT NULL,
                 owner_key_hash TEXT NULL,
                 pending_questions JSONB NULL,
@@ -76,6 +77,9 @@ async def init_db(database_url: str) -> None:
         )
         await conn.execute(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS template_hash TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS project_id UUID;"
         )
         await conn.execute(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pending_questions JSONB;"
@@ -133,6 +137,30 @@ async def init_db(database_url: str) -> None:
         )
         await conn.execute(
             "ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';"
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+                id UUID PRIMARY KEY,
+                owner_user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                template_id TEXT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS projects_owner_user_id_idx
+            ON projects (owner_user_id);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS tasks_project_id_idx
+            ON tasks (project_id);
+            """
         )
         await conn.execute(
             """
@@ -232,6 +260,10 @@ def _coerce_task_id(task_id: str) -> uuid.UUID:
 
 def _coerce_user_id(user_id: str) -> uuid.UUID:
     return user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(user_id)
+
+
+def _coerce_project_id(project_id: str) -> uuid.UUID:
+    return project_id if isinstance(project_id, uuid.UUID) else uuid.UUID(project_id)
 
 
 def _row_to_dict(row: Optional[asyncpg.Record]) -> Optional[Dict[str, Any]]:
@@ -414,6 +446,7 @@ async def create_task_row(
     codex_version: Optional[str],
     template_id: Optional[str],
     template_hash: Optional[str],
+    project_id: Optional[str],
     client_ip: Optional[str],
     owner_key_hash: str,
 ) -> Dict[str, Any]:
@@ -434,10 +467,11 @@ async def create_task_row(
                 codex_version,
                 template_id,
                 template_hash,
+                project_id,
                 client_ip,
                 owner_key_hash
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING *;
             """,
             _coerce_task_id(task_id),
@@ -450,6 +484,7 @@ async def create_task_row(
             codex_version,
             template_id,
             template_hash,
+            _coerce_project_id(project_id) if project_id else None,
             client_ip,
             owner_key_hash,
         )
@@ -461,6 +496,45 @@ async def create_task_row(
                 "user_id": user_id,
                 "status": status,
                 "progress": progress,
+            },
+        )
+        raise
+    return _row_to_dict(row) or {}
+
+
+async def create_project_row(
+    *,
+    project_id: str,
+    owner_user_id: str,
+    name: str,
+    template_id: Optional[str],
+) -> Dict[str, Any]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+
+    try:
+        row = await _pool.fetchrow(
+            """
+            INSERT INTO projects (
+                id,
+                owner_user_id,
+                name,
+                template_id
+            )
+            VALUES ($1, $2, $3, $4)
+            RETURNING *;
+            """,
+            _coerce_project_id(project_id),
+            owner_user_id,
+            name,
+            template_id,
+        )
+    except Exception:
+        _log_db_error(
+            "create_project_row",
+            {
+                "project_id": project_id,
+                "owner_user_id": owner_user_id,
             },
         )
         raise
@@ -884,6 +958,59 @@ async def get_task_row(task_id: str) -> Optional[Dict[str, Any]]:
         data["pending_questions"] = _coerce_json_value(data.get("pending_questions"))
         data["provided_answers"] = _coerce_json_value(data.get("provided_answers"))
     return data
+
+
+async def list_projects_for_owner_user(owner_user_id: str) -> List[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+
+    rows = await _pool.fetch(
+        """
+        SELECT *
+        FROM projects
+        WHERE owner_user_id = $1
+        ORDER BY created_at DESC;
+        """,
+        owner_user_id,
+    )
+    return [dict(row) for row in rows]
+
+
+async def get_project_row(project_id: str, owner_user_id: str) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+
+    row = await _pool.fetchrow(
+        """
+        SELECT *
+        FROM projects
+        WHERE id = $1 AND owner_user_id = $2;
+        """,
+        _coerce_project_id(project_id),
+        owner_user_id,
+    )
+    return _row_to_dict(row) or None
+
+
+async def list_tasks_for_project(project_id: str, owner_user_id: str) -> List[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+
+    rows = await _pool.fetch(
+        """
+        SELECT *
+        FROM tasks
+        WHERE project_id = $1 AND owner_user_id = $2
+        ORDER BY created_at DESC;
+        """,
+        _coerce_project_id(project_id),
+        owner_user_id,
+    )
+    tasks = [dict(row) for row in rows]
+    for task in tasks:
+        task["result"] = _coerce_json_value(task.get("result"))
+        task["container_state"] = _coerce_json_value(task.get("container_state"))
+    return tasks
 
 
 async def list_tasks_for_owner_user(

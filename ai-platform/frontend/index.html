@@ -162,6 +162,13 @@
                     </div>
 
                     <div class="form-group">
+                        <label for="projectSelect">Project</label>
+                        <select id="projectSelect" class="task-priority-select">
+                            <option value="">No project</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
                         <label for="templateSelect">Template</label>
                         <select id="templateSelect" class="task-priority-select">
                             <option value="">None</option>
@@ -459,10 +466,48 @@
             <!-- Previous Tasks -->
             <section class="previous-tasks hidden" id="previousTasks">
                 <div class="tasks-header">
-                    <h2>Previous Tasks</h2>
+                    <h2>Dashboard</h2>
                     <button class="secondary-btn back-to-main-btn" id="backToMainBtn">
                         ← Back to Main
                     </button>
+                </div>
+
+                <div class="tasks-header">
+                    <h3>My Projects</h3>
+                    <button class="secondary-btn" id="refreshDashboardBtn">
+                        Refresh
+                    </button>
+                </div>
+
+                <div class="task-lookup-actions">
+                    <input
+                        type="text"
+                        id="projectNameInput"
+                        class="task-id-input"
+                        placeholder="New project name">
+                    <select id="projectTemplateSelect" class="task-priority-select">
+                        <option value="">No template</option>
+                    </select>
+                    <button class="secondary-btn" id="createProjectBtn">
+                        Create Project
+                    </button>
+                </div>
+                <div class="task-lookup-hint error-message hidden" id="projectError"></div>
+
+                <div class="tasks-list" id="projectsList">
+                    <!-- Projects will be added here -->
+                </div>
+
+                <div class="tasks-empty" id="projectsEmpty">
+                    <div class="empty-state">
+                        <div class="empty-icon">🗂️</div>
+                        <h3>No Projects Yet</h3>
+                        <p>Create your first project to organize tasks.</p>
+                    </div>
+                </div>
+
+                <div class="tasks-header">
+                    <h3>My Tasks</h3>
                 </div>
 
                 <div class="tasks-list" id="tasksList">
