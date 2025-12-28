@@ -3,7 +3,6 @@
 """
 
 import pytest
-import json
 from datetime import datetime
 from app.models import Container, Artifact, ProjectState
 

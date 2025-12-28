@@ -15,7 +15,14 @@ from datetime import datetime
 
 from .models import Container, ProjectState
 from .logging_utils import configure_logging
-from .agents import AIResearcher, AIDesigner, AICoder, AIReviewer, BudgetExceededError
+from .agents import (
+    AIResearcher,
+    AIDesigner,
+    AICoder,
+    AIReviewer,
+    BudgetExceededError,
+    LLMResponseParseError,
+)
 from .llm import LLMProviderError
 
 
@@ -391,50 +398,87 @@ class AIOrchestrator:
                     self.container.metadata["active_role"] = "coder"
 
                     # 3.2 Кодер выполняет задачу
-                    try:
-                        coder_result = await self.roles["coder"].execute(
-                            next_task,
-                            self.container
-                        )
-                    except BudgetExceededError:
-                        await self._run_hook(
-                            callbacks.get("stage_failed") if callbacks else None,
-                            {
-                                "stage": "implementation",
-                                "reason": "quota_exceeded",
-                                "error": "quota_exceeded",
-                            },
-                        )
-                        self.container.update_state(ProjectState.ERROR, "quota_exceeded")
-                        return {
-                            "status": "failed",
-                            "container_id": self.container.project_id,
-                            "state": self.container.state.value,
-                            "progress": self.container.progress,
-                            "files_count": len(self.container.files),
-                            "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
-                            "iterations": iteration,
-                            "max_iterations": max_iterations,
-                            "history": self.task_history[-5:],
-                            "failure_reason": "quota_exceeded",
-                        }
-                    except LLMProviderError as exc:
-                        await self._run_hook(
-                            callbacks.get("stage_failed") if callbacks else None,
-                            {
-                                "stage": "implementation",
-                                "reason": "llm_provider_error",
-                                "error": str(exc),
-                            },
-                        )
-                        await self._run_hook(
-                            callbacks.get("llm_error") if callbacks else None,
-                            {
-                                "stage": "implementation",
-                                "error": str(exc),
-                            },
-                        )
-                        raise
+                    coder_result = None
+                    correction_prompt = None
+                    for attempt in range(2):
+                        try:
+                            coder_result = await self.roles["coder"].execute(
+                                next_task,
+                                self.container,
+                                correction_prompt=correction_prompt,
+                            )
+                            break
+                        except LLMResponseParseError as exc:
+                            if attempt == 0:
+                                correction_prompt = (
+                                    "Return ONLY valid JSON matching schema. "
+                                    "No markdown, no commentary."
+                                )
+                                continue
+                            await self._run_hook(
+                                callbacks.get("stage_failed") if callbacks else None,
+                                {
+                                    "stage": "implementation",
+                                    "reason": "llm_invalid_json",
+                                    "error": exc.error or str(exc),
+                                },
+                            )
+                            self.container.update_state(ProjectState.ERROR, "llm_invalid_json")
+                            return {
+                                "status": "failed",
+                                "container_id": self.container.project_id,
+                                "state": self.container.state.value,
+                                "progress": self.container.progress,
+                                "files_count": len(self.container.files),
+                                "artifacts_count": sum(
+                                    len(a) for a in self.container.artifacts.values()
+                                ),
+                                "iterations": iteration,
+                                "max_iterations": max_iterations,
+                                "history": self.task_history[-5:],
+                                "failure_reason": "llm_invalid_json",
+                            }
+                        except BudgetExceededError:
+                            await self._run_hook(
+                                callbacks.get("stage_failed") if callbacks else None,
+                                {
+                                    "stage": "implementation",
+                                    "reason": "quota_exceeded",
+                                    "error": "quota_exceeded",
+                                },
+                            )
+                            self.container.update_state(ProjectState.ERROR, "quota_exceeded")
+                            return {
+                                "status": "failed",
+                                "container_id": self.container.project_id,
+                                "state": self.container.state.value,
+                                "progress": self.container.progress,
+                                "files_count": len(self.container.files),
+                                "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
+                                "iterations": iteration,
+                                "max_iterations": max_iterations,
+                                "history": self.task_history[-5:],
+                                "failure_reason": "quota_exceeded",
+                            }
+                        except LLMProviderError as exc:
+                            await self._run_hook(
+                                callbacks.get("stage_failed") if callbacks else None,
+                                {
+                                    "stage": "implementation",
+                                    "reason": "llm_provider_error",
+                                    "error": str(exc),
+                                },
+                            )
+                            await self._run_hook(
+                                callbacks.get("llm_error") if callbacks else None,
+                                {
+                                    "stage": "implementation",
+                                    "error": str(exc),
+                                },
+                            )
+                            raise
+                    if coder_result is None:
+                        raise RuntimeError("Coder result missing after LLM retry attempts.")
 
                     if isinstance(coder_result, dict) and coder_result.get("llm_usage"):
                         await self._run_hook(

@@ -3,7 +3,6 @@
 Содержит 4 уровня данных: файлы, артефакты, история и метаданные.
 """
 
-import json
 import uuid
 from datetime import datetime
 from enum import Enum

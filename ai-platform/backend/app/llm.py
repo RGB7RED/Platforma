@@ -28,6 +28,7 @@ class LLMProvider(Protocol):
         model: str,
         temperature: float,
         max_tokens: int,
+        response_format: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Generate text from provider. Returns dict with text and usage."""
 
@@ -68,6 +69,7 @@ class MockProvider:
         model: str,
         temperature: float,
         max_tokens: int,
+        response_format: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         prompt = messages[-1]["content"] if messages else ""
         path = "generated.py"
@@ -125,6 +127,7 @@ class OpenAIProvider:
         model: str,
         temperature: float,
         max_tokens: int,
+        response_format: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         url = "https://api.openai.com/v1/chat/completions"
         headers = {
@@ -137,16 +140,46 @@ class OpenAIProvider:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if response_format:
+            payload["response_format"] = response_format
         timeout = httpx.Timeout(self.timeout_seconds)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            try:
-                response = await client.post(url, headers=headers, json=payload)
+            async def _post(request_payload: Dict[str, Any]) -> httpx.Response:
+                response = await client.post(url, headers=headers, json=request_payload)
                 response.raise_for_status()
+                return response
+
+            try:
+                response = await _post(payload)
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code if exc.response else None
-                retryable = status in {408, 429} or (status is not None and status >= 500)
-                message = f"OpenAI API error ({status}): {exc.response.text if exc.response else exc}"
-                raise LLMProviderError(message, retryable=retryable) from exc
+                if response_format and status in {400, 404} and exc.response is not None:
+                    body = exc.response.text or ""
+                    if "response_format" in body or "json_object" in body:
+                        payload.pop("response_format", None)
+                        try:
+                            response = await _post(payload)
+                        except httpx.HTTPStatusError as fallback_exc:
+                            fallback_status = (
+                                fallback_exc.response.status_code if fallback_exc.response else None
+                            )
+                            retryable = fallback_status in {408, 429} or (
+                                fallback_status is not None and fallback_status >= 500
+                            )
+                            message = (
+                                "OpenAI API error "
+                                f"({fallback_status}): "
+                                f"{fallback_exc.response.text if fallback_exc.response else fallback_exc}"
+                            )
+                            raise LLMProviderError(message, retryable=retryable) from fallback_exc
+                    else:
+                        retryable = status in {408, 429} or (status is not None and status >= 500)
+                        message = f"OpenAI API error ({status}): {exc.response.text}"
+                        raise LLMProviderError(message, retryable=retryable) from exc
+                else:
+                    retryable = status in {408, 429} or (status is not None and status >= 500)
+                    message = f"OpenAI API error ({status}): {exc.response.text if exc.response else exc}"
+                    raise LLMProviderError(message, retryable=retryable) from exc
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 raise LLMProviderError(f"OpenAI request failed: {exc}", retryable=True) from exc
 
@@ -177,16 +210,20 @@ async def generate_with_retry(
     settings: LLMSettings,
     *,
     max_retries: int = 2,
+    require_json: bool = False,
 ) -> Dict[str, Any]:
     attempt = 0
     delay = 1.0
+    response_format = {"type": "json_object"} if require_json else None
+    temperature = 0.0 if require_json else settings.temperature
     while True:
         try:
             return await provider.generate_text(
                 messages=messages,
                 model=settings.model,
-                temperature=settings.temperature,
+                temperature=temperature,
                 max_tokens=settings.max_tokens,
+                response_format=response_format,
             )
         except LLMProviderError as exc:
             if attempt >= max_retries or not exc.retryable:

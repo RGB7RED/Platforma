@@ -17,7 +17,7 @@ from telegram.ext import (
     filters
 )
 
-from .main import create_task, get_task_status, manager
+from .main import create_task, get_task_status
 
 # Настройка логирования
 logging.basicConfig(
@@ -246,7 +246,6 @@ async def my_tasks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    user_id = update.effective_user.id
     user_tasks = context.user_data.get("user_tasks", [])
     
     if not user_tasks:
@@ -264,7 +263,7 @@ async def my_tasks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_data = await get_task_status(task_id)
             status_emoji = "🟢" if status_data.get("status") == "completed" else "🟡"
             tasks_text += f"{i}. {status_emoji} `{task_id[:8]}...` - {status_data.get('status', 'unknown')}\n"
-        except:
+        except Exception:
             tasks_text += f"{i}. ⚪ `{task_id[:8]}...` - неизвестно\n"
     
     tasks_text += "\nНажмите на ID задачи для просмотра деталей."
