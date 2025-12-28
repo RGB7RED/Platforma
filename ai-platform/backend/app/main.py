@@ -42,7 +42,6 @@ from .agents import AIReviewer, SafeCommandRunner
 from .schemas import (
     ArtifactsResponse,
     ArtifactItem,
-    ClarificationQuestion,
     ContainerStateResponse,
     ContainerStateSnapshot,
     EventsResponse,

@@ -9,10 +9,10 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
-import sys
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Dict, Any, Optional, List, Callable, Sequence
@@ -34,6 +34,19 @@ DEFAULT_ALLOWED_COMMANDS = {"ruff", "pytest", "python", "python3"}
 
 class BudgetExceededError(RuntimeError):
     """Raised when an API key exceeds daily usage caps."""
+
+
+class LLMResponseParseError(ValueError):
+    """Raised when parsing an LLM response fails."""
+
+    def __init__(self, message: str, *, raw_text: str, error: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+        self.error = error
+
+    @property
+    def truncated_text(self) -> str:
+        return self.raw_text[:2000]
 
 
 def _parse_int_env(value: Optional[str]) -> int:
@@ -380,8 +393,6 @@ class AIDesigner(AIAgent):
         if not requirements_artifacts:
             raise ValueError("No requirements found for design")
         
-        requirements = requirements_artifacts[-1].content
-        
         # Создаем архитектуру (фиктивную для MVP)
         architecture = {
             "name": "Todo REST API",
@@ -621,12 +632,17 @@ class AICoder(AIAgent):
         super().__init__(codex, "coder")
         self.files_created = 0
     
-    async def execute(self, task: Dict[str, Any], container: Container) -> Dict[str, Any]:
+    async def execute(
+        self,
+        task: Dict[str, Any],
+        container: Container,
+        *,
+        correction_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Реализует конкретную задачу кодирования"""
         self._log_action("start_coding", {"task": task})
         
         task_type = task.get("type", "")
-        component = task.get("component", "")
         filepath = task.get("file", "")
 
         settings = load_llm_settings()
@@ -642,6 +658,7 @@ class AICoder(AIAgent):
             container=container,
             rules=rules,
             allowed_paths=allowed_paths,
+            correction_prompt=correction_prompt,
         )
 
         owner_key_hash = container.metadata.get("owner_key_hash")
@@ -660,14 +677,31 @@ class AICoder(AIAgent):
 
         request_started_at = datetime.now().isoformat()
         try:
-            response = await generate_with_retry(provider, messages, settings)
+            response = await generate_with_retry(
+                provider,
+                messages,
+                settings,
+                require_json=True,
+            )
         except LLMProviderError as exc:
             self._log_action("llm_failed", {"error": str(exc)})
             raise
         request_finished_at = datetime.now().isoformat()
 
         response_text = response.get("text", "")
-        parsed = self._parse_llm_response(response_text)
+        try:
+            parsed = self._parse_llm_response(response_text)
+        except LLMResponseParseError as exc:
+            container.add_artifact(
+                "llm_invalid_json",
+                {
+                    "reason": "llm_invalid_json",
+                    "error": exc.error or str(exc),
+                    "response_preview": exc.truncated_text,
+                },
+                self.role_name,
+            )
+            raise
 
         files = parsed.get("files", [])
         if isinstance(parsed.get("file"), dict):
@@ -777,6 +811,7 @@ class AICoder(AIAgent):
         container: Container,
         rules: Dict[str, Any],
         allowed_paths: List[str],
+        correction_prompt: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         context = container.get_relevant_context("coder")
         task_description = task.get("description", "")
@@ -814,10 +849,13 @@ class AICoder(AIAgent):
             "Constraints": constraints,
         }
         user_prompt = f"{json.dumps(user_payload, ensure_ascii=False, indent=2)}"
-        return [
+        messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+        if correction_prompt:
+            messages.append({"role": "user", "content": correction_prompt})
+        return messages
 
     def _resolve_template_id(self, container: Container) -> Optional[str]:
         template_id = container.metadata.get("template_id")
@@ -867,18 +905,70 @@ class AICoder(AIAgent):
     def _parse_llm_response(self, text: str) -> Dict[str, Any]:
         """Parse JSON response, handling optional code fences."""
         cleaned = text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`")
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:]
         try:
             return json.loads(cleaned)
-        except json.JSONDecodeError:
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(cleaned[start : end + 1])
-            raise
+        except json.JSONDecodeError as exc:
+            stripped = self._strip_markdown_fences(cleaned)
+            if stripped != cleaned:
+                try:
+                    return json.loads(stripped)
+                except json.JSONDecodeError:
+                    pass
+            candidate = self._extract_first_json_payload(stripped)
+            if candidate:
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError as nested_exc:
+                    raise LLMResponseParseError(
+                        "llm_invalid_json",
+                        raw_text=text,
+                        error=str(nested_exc),
+                    ) from nested_exc
+            raise LLMResponseParseError("llm_invalid_json", raw_text=text, error=str(exc)) from exc
+
+    @staticmethod
+    def _strip_markdown_fences(text: str) -> str:
+        stripped = text.strip()
+        if not stripped.startswith("```"):
+            return stripped
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _extract_first_json_payload(text: str) -> Optional[str]:
+        in_string = False
+        escape = False
+        start_index: Optional[int] = None
+        stack: List[str] = []
+        for index, char in enumerate(text):
+            if escape:
+                escape = False
+                continue
+            if in_string and char == "\\":
+                escape = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char in "{[":
+                if start_index is None:
+                    start_index = index
+                stack.append(char)
+            elif char in "]}":
+                if not stack:
+                    continue
+                opener = stack.pop()
+                if (opener == "{" and char != "}") or (opener == "[" and char != "]"):
+                    continue
+                if not stack and start_index is not None:
+                    return text[start_index : index + 1]
+        return None
 
     def _assert_safe_path(self, path: str, allowed_paths: List[str]) -> None:
         pure_path = PurePosixPath(path)
@@ -1867,7 +1957,9 @@ class AIReviewer(AIAgent):
                 long_lines.append((i, len(line)))
         
         if long_lines:
-            line_info = ", ".join(f"line {i}({l} chars)" for i, l in long_lines[:3])
+            line_info = ", ".join(
+                f"line {index}({length} chars)" for index, length in long_lines[:3]
+            )
             if len(long_lines) > 3:
                 line_info += f" and {len(long_lines)-3} more"
             warnings.append(f"{filepath}: Lines too long: {line_info}")

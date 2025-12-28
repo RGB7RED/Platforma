@@ -3,10 +3,9 @@
 """
 
 import pytest
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from app.orchestrator import AIOrchestrator
-from app.models import Container, ProjectState
+from app.models import ProjectState
 
 
 class TestAIOrchestrator:
