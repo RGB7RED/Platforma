@@ -36,17 +36,27 @@ class BudgetExceededError(RuntimeError):
     """Raised when an API key exceeds daily usage caps."""
 
 
-class LLMResponseParseError(ValueError):
+class ParseError(ValueError):
     """Raised when parsing an LLM response fails."""
 
-    def __init__(self, message: str, *, raw_text: str, error: Optional[str] = None) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        reason: str,
+        *,
+        raw_text: str,
+        error: Optional[str] = None,
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
         self.raw_text = raw_text
         self.error = error
 
     @property
-    def truncated_text(self) -> str:
+    def truncated_raw(self) -> str:
         return self.raw_text[:2000]
+
+
+LLMResponseParseError = ParseError
 
 
 def _parse_int_env(value: Optional[str]) -> int:
@@ -695,9 +705,9 @@ class AICoder(AIAgent):
             container.add_artifact(
                 "llm_invalid_json",
                 {
-                    "reason": "llm_invalid_json",
+                    "reason": exc.reason,
                     "error": exc.error or str(exc),
-                    "response_preview": exc.truncated_text,
+                    "truncated_raw": exc.truncated_raw,
                 },
                 self.role_name,
             )

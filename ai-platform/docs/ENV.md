@@ -169,6 +169,18 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Optional
 - **Notes:** Defaults to 0.2.
 
+### LLM_MAX_CALLS_PER_TASK
+- **Purpose:** Hard cap on total LLM calls per task execution.
+- **Example:** `LLM_MAX_CALLS_PER_TASK=10`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 10. When exceeded, tasks fail fast with `llm_budget_exhausted`.
+
+### LLM_MAX_RETRIES_PER_STEP
+- **Purpose:** Cap on corrective retries per step when an LLM response is invalid.
+- **Example:** `LLM_MAX_RETRIES_PER_STEP=1`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 1. Applies to JSON parsing retries.
+
 ### APP_API_KEY
 - **Purpose:** Require an API key for all task endpoints (including rerun review).
 - **Example:** `APP_API_KEY=super-secret-token`
