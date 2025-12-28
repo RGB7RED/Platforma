@@ -170,6 +170,36 @@ class TestAIOrchestrator:
         assert mock_agents["coder"].execute.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_llm_token_budget_exceeded(self, orchestrator, mock_agents, monkeypatch):
+        """Проверка остановки по лимиту токенов на задачу"""
+        orchestrator.initialize_project("Test")
+        monkeypatch.setenv("LLM_MAX_TOTAL_TOKENS_PER_TASK", "1")
+        monkeypatch.setenv("LLM_MAX_RETRIES_PER_STEP", "0")
+
+        mock_agents["designer"].execute.return_value = {
+            "components": [{"name": "Test", "files": ["test.py"]}]
+        }
+        task_description = "Implement test.py for Test"
+        orchestrator.container.metadata["llm_usage"] = [
+            {
+                "stage": "implementation",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "tokens_in": 1,
+                "tokens_out": 0,
+                "total_tokens": 1,
+                "created_at": "now",
+                "metadata": {"task_description": task_description},
+            }
+        ]
+
+        result = await orchestrator.process_task("Create a test API")
+
+        assert result["status"] == "failed"
+        assert result["failure_reason"] == "llm_budget_exceeded"
+        assert mock_agents["coder"].execute.call_count == 0
+
+    @pytest.mark.asyncio
     async def test_max_iterations_enforced(self, orchestrator, mock_agents, monkeypatch):
         """Проверка соблюдения лимита итераций"""
         orchestrator.codex["workflow"]["max_iterations"] = 2

@@ -19,6 +19,21 @@ class LLMProviderError(RuntimeError):
         self.retryable = retryable
 
 
+class LLMOutputTruncatedError(RuntimeError):
+    """Error raised when LLM output is truncated."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        usage: Optional[Dict[str, int]] = None,
+        finish_reason: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.usage = usage or {}
+        self.finish_reason = finish_reason
+
+
 class LLMProvider(Protocol):
     name: str
 
@@ -28,7 +43,7 @@ class LLMProvider(Protocol):
         model: str,
         temperature: float,
         max_tokens: int,
-        response_format: Optional[Dict[str, str]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Generate text from provider. Returns dict with text and usage."""
 
@@ -41,6 +56,7 @@ class LLMSettings:
     max_tokens: int
     timeout_seconds: float
     temperature: float
+    response_format: str
 
 
 def load_llm_settings() -> LLMSettings:
@@ -50,6 +66,7 @@ def load_llm_settings() -> LLMSettings:
     max_tokens = int(os.getenv("LLM_MAX_TOKENS", "1024"))
     timeout_seconds = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+    response_format = os.getenv("LLM_RESPONSE_FORMAT", "json_object").strip().lower()
     return LLMSettings(
         provider=provider,
         model=model,
@@ -57,6 +74,7 @@ def load_llm_settings() -> LLMSettings:
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
         temperature=temperature,
+        response_format=response_format,
     )
 
 
@@ -69,7 +87,7 @@ class MockProvider:
         model: str,
         temperature: float,
         max_tokens: int,
-        response_format: Optional[Dict[str, str]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         prompt = messages[-1]["content"] if messages else ""
         path = "generated.py"
@@ -111,6 +129,7 @@ def placeholder():
                 "output_tokens": tokens_out,
                 "total_tokens": tokens_in + tokens_out,
             },
+            "finish_reason": "stop",
         }
 
 
@@ -127,7 +146,7 @@ class OpenAIProvider:
         model: str,
         temperature: float,
         max_tokens: int,
-        response_format: Optional[Dict[str, str]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         url = "https://api.openai.com/v1/chat/completions"
         headers = {
@@ -184,7 +203,9 @@ class OpenAIProvider:
                 raise LLMProviderError(f"OpenAI request failed: {exc}", retryable=True) from exc
 
         data = response.json()
-        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        choice = data.get("choices", [{}])[0]
+        text = choice.get("message", {}).get("content", "")
+        finish_reason = choice.get("finish_reason")
         usage = data.get("usage", {}) or {}
         return {
             "text": text,
@@ -193,6 +214,7 @@ class OpenAIProvider:
                 "output_tokens": usage.get("completion_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             },
+            "finish_reason": finish_reason,
         }
 
 
@@ -214,24 +236,71 @@ async def generate_with_retry(
 ) -> Dict[str, Any]:
     attempt = 0
     delay = 1.0
-    response_format = {"type": "json_object"} if require_json else None
+    response_format = _resolve_response_format(settings.response_format, require_json)
     temperature = 0.0 if require_json else settings.temperature
     prepared_messages = _inject_json_system_instruction(messages, provider, require_json)
+    max_tokens = settings.max_tokens
+    truncation_retries = 0
+    max_truncation_retries = 1
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     while True:
         try:
-            return await provider.generate_text(
+            response = await provider.generate_text(
                 messages=prepared_messages,
                 model=settings.model,
                 temperature=temperature,
-                max_tokens=settings.max_tokens,
+                max_tokens=max_tokens,
                 response_format=response_format,
             )
+            usage = response.get("usage", {}) or {}
+            total_usage["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
+            total_usage["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+            if usage.get("total_tokens") is not None:
+                total_usage["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+            else:
+                total_usage["total_tokens"] += int(usage.get("input_tokens", 0) or 0) + int(
+                    usage.get("output_tokens", 0) or 0
+                )
+
+            finish_reason = response.get("finish_reason")
+            response["finish_reason"] = finish_reason
+            response["usage"] = total_usage
+
+            if finish_reason == "length":
+                if truncation_retries < max_truncation_retries:
+                    truncation_retries += 1
+                    max_tokens = min(max_tokens * 2, 2000)
+                    continue
+                raise LLMOutputTruncatedError(
+                    "llm_output_truncated",
+                    usage=total_usage,
+                    finish_reason=finish_reason,
+                )
+            return response
         except LLMProviderError as exc:
             if attempt >= max_retries or not exc.retryable:
                 raise
             await asyncio.sleep(delay)
             delay *= 2
             attempt += 1
+
+
+def _resolve_response_format(
+    response_format: str,
+    require_json: bool,
+) -> Optional[Dict[str, Any]]:
+    if not require_json:
+        return None
+    normalized = response_format.strip().lower()
+    if normalized == "json_schema":
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response",
+                "schema": {"type": "object", "additionalProperties": True},
+            },
+        }
+    return {"type": "json_object"}
 
 
 def _inject_json_system_instruction(
