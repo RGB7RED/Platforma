@@ -21,3 +21,4 @@ def root() -> dict[str, str]:
 
 
 app.include_router(api_router, prefix="/api")
+app.include_router(api_router)

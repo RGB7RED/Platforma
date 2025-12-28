@@ -120,6 +120,9 @@ class MockProvider:
         response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         prompt = messages[-1]["content"] if messages else ""
+        expects_chunk = all(
+            token in prompt for token in ("content_chunk", "chunk_index", "status")
+        )
         path = "generated.py"
         task_line = "Implement requested changes."
         try:
@@ -149,6 +152,12 @@ def placeholder():
                 )
             },
         }
+        if expects_chunk:
+            response = {
+                "status": "complete",
+                "chunk_index": 1,
+                "content_chunk": content,
+            }
         text = json.dumps(response, ensure_ascii=False)
         tokens_in = max(1, len(prompt.split()))
         tokens_out = max(1, len(text.split()))
