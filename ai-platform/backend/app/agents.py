@@ -520,6 +520,8 @@ class AIDesigner(AIAgent):
             "implementation_plan.md",
             self._generate_plan_md(architecture)
         )
+
+        container.target_architecture = architecture
         
         self._log_action("design_completed", {
             "components": len(architecture["components"]),
@@ -680,6 +682,7 @@ class AICoder(AIAgent):
             files = files[:max_files]
 
         written_files = []
+        file_sizes = {}
         for file_entry in files:
             path = str(file_entry.get("path") or file_entry.get("file") or "").strip()
             content = str(file_entry.get("content") or "")
@@ -688,6 +691,7 @@ class AICoder(AIAgent):
             self._assert_safe_path(path, allowed_paths)
             container.add_file(path, content)
             written_files.append(path)
+            file_sizes[path] = len(content)
 
             container.add_artifact(
                 "code",
@@ -747,8 +751,11 @@ class AICoder(AIAgent):
             "files_created": self.files_created
         })
         
+        primary_file = written_files[0] if written_files else None
         return {
+            "file": primary_file,
             "files": written_files,
+            "size": file_sizes.get(primary_file, 0),
             "artifact_type": artifact_type,
             "llm_usage": usage_report,
             "usage_report": usage_report,
@@ -841,8 +848,14 @@ class AICoder(AIAgent):
             return self._generate_service_code(component, filepath)
         elif "repository" in filepath:
             return self._generate_repository_code()
+        elif filepath == "api/routes.py":
+            return self._generate_api_routes_code()
+        elif filepath == "api/dependencies.py":
+            return self._generate_api_dependencies_code()
+        elif filepath == "api/models.py":
+            return self._generate_api_models_code()
         elif "api" in filepath or "routes" in filepath:
-            return self._generate_api_code()
+            return self._generate_api_routes_code()
         else:
             return f"# Component: {component}\n# File: {filepath}\n\n# Implementation goes here\n"
     
@@ -1078,23 +1091,23 @@ class TodoRepository:
 '''
     
     def _generate_api_code(self) -> str:
+        return self._generate_api_routes_code()
+
+    def _generate_api_routes_code(self) -> str:
         return '''"""
 API routes for todo management
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from models.todo import Todo, TodoCreate, TodoUpdate
 from services.todo_service import TodoService
-from repositories.todo_repository import TodoRepository
+
+from api.dependencies import get_todo_service
 
 router = APIRouter()
-
-# Dependency injection
-def get_todo_service():
-    """Dependency for getting todo service instance"""
-    repository = TodoRepository()
-    return TodoService(repository)
 
 
 @router.get("/todos", response_model=List[Todo])
@@ -1162,6 +1175,42 @@ async def search_todos(
 ):
     """Search todos by title or description"""
     return await service.search_todos(query)
+'''
+
+    def _generate_api_dependencies_code(self) -> str:
+        return '''"""
+API dependencies for todo management
+"""
+
+from fastapi import Depends, HTTPException
+
+from repositories.todo_repository import TodoRepository
+from services.todo_service import TodoService
+
+
+def get_todo_repository() -> TodoRepository:
+    """Dependency for getting todo repository instance"""
+    return TodoRepository()
+
+
+def get_todo_service(
+    repository: TodoRepository = Depends(get_todo_repository)
+) -> TodoService:
+    """Dependency for getting todo service instance"""
+    try:
+        return TodoService(repository)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+'''
+
+    def _generate_api_models_code(self) -> str:
+        return '''"""
+API schemas for todo management
+"""
+
+from models.todo import Todo, TodoCreate, TodoUpdate
+
+__all__ = ["Todo", "TodoCreate", "TodoUpdate"]
 '''
     
     def _generate_test_code(self, filepath: str) -> str:

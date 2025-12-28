@@ -303,7 +303,10 @@ class Container:
             "state": self.state.value,
             "files": self.files,
             "artifacts": {
-                k: [asdict(a) for a in v] 
+                k: [
+                    {**asdict(a), "created_at": a.created_at.isoformat()}
+                    for a in v
+                ]
                 for k, v in self.artifacts.items()
             },
             "history": self.history,
