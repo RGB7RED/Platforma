@@ -209,8 +209,9 @@ def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
         task_data["artifacts_count"] = sum(len(a) for a in container.artifacts.values())
         task_data["iterations"] = container.metadata.get("iterations")
         task_data["max_iterations"] = container.metadata.get("max_iterations")
-        result = task_data.get("result")
-        if isinstance(result, dict):
+        result = coerce_mapping_payload(task_data.get("result"), field_name="task_result")
+        task_data["result"] = result
+        if result:
             result["files_count"] = task_data["files_count"]
             result["artifacts_count"] = task_data["artifacts_count"]
             result["iterations"] = task_data.get("iterations", result.get("iterations"))
@@ -415,6 +416,25 @@ def to_json_compatible(value: Any) -> Any:
         return json.loads(json.dumps(value, default=str))
 
 
+def coerce_mapping_payload(value: Any, *, field_name: str) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return {}
+        try:
+            parsed = json.loads(trimmed)
+        except json.JSONDecodeError:
+            return {"text": value}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+    return {"value": value}
+
+
 def to_iso_string(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -424,20 +444,22 @@ def to_iso_string(value: Any) -> Optional[str]:
 
 
 def normalize_event_item(event: Dict[str, Any]) -> EventItem:
+    payload = coerce_mapping_payload(event.get("payload"), field_name="event_payload")
     return EventItem(
         id=str(event.get("id")),
         type=str(event.get("type")),
-        payload=to_json_compatible(event.get("payload", {})) or {},
+        payload=to_json_compatible(payload) or {},
         created_at=to_iso_string(event.get("created_at")) or "",
     )
 
 
 def normalize_artifact_item(artifact: Dict[str, Any]) -> ArtifactItem:
+    payload = coerce_mapping_payload(artifact.get("payload"), field_name="artifact_payload")
     return ArtifactItem(
         id=str(artifact.get("id")),
         type=str(artifact.get("type")),
         produced_by=artifact.get("produced_by"),
-        payload=to_json_compatible(artifact.get("payload", {})) or {},
+        payload=to_json_compatible(payload) or {},
         created_at=to_iso_string(artifact.get("created_at")) or "",
     )
 
@@ -466,7 +488,7 @@ def dedupe_artifacts(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def normalize_container_state(raw_state: Any) -> ContainerStateSnapshot:
-    state: Dict[str, Any] = raw_state or {}
+    state = coerce_mapping_payload(raw_state, field_name="container_state")
     if isinstance(state, dict) and isinstance(state.get("state"), dict):
         state = state["state"]
 
@@ -1911,6 +1933,7 @@ async def resolve_patch_payload(task_id: str, container: Optional[Container]) ->
             container.metadata.get("baseline_files") or {},
             container.files,
         )
+    patch_payload = coerce_mapping_payload(patch_payload, field_name="patch_payload")
     return patch_payload or {"diff": "", "changed_files": [], "stats": {}}
 
 def resolve_latest_review_summary(container: Optional[Container]) -> Dict[str, Any]:
@@ -1920,7 +1943,8 @@ def resolve_latest_review_summary(container: Optional[Container]) -> Dict[str, A
     if not review_reports:
         return {}
     latest = review_reports[-1].content if hasattr(review_reports[-1], "content") else review_reports[-1]
-    if not isinstance(latest, dict):
+    latest = coerce_mapping_payload(latest, field_name="review_report")
+    if not latest:
         return {}
     issues = latest.get("issues")
     issues_count = len(issues) if isinstance(issues, list) else 0
@@ -2941,7 +2965,10 @@ async def get_task_questions(task_id: str, request: Request):
     try:
         task_data = await ensure_task_owner(task_id, request)
         pending_questions = normalize_questions(task_data.get("pending_questions"))
-        provided_answers = task_data.get("provided_answers") or {}
+        provided_answers = coerce_mapping_payload(
+            task_data.get("provided_answers"),
+            field_name="provided_answers",
+        )
         requested_at = None
         if pending_questions:
             if db.is_enabled():
@@ -2949,7 +2976,10 @@ async def get_task_questions(task_id: str, request: Request):
             else:
                 artifacts = get_in_memory_artifacts(task_id, "clarification_questions", 1, "desc")
             if artifacts:
-                payload = artifacts[0].get("payload") or {}
+                payload = coerce_mapping_payload(
+                    artifacts[0].get("payload"),
+                    field_name="clarification_payload",
+                )
                 requested_at = payload.get("requested_at")
         return {
             "task_id": task_id,
@@ -2969,7 +2999,10 @@ async def submit_task_input(task_id: str, payload: TaskInputRequest, request: Re
     try:
         task_data = await ensure_task_owner(task_id, request)
         existing_answers = task_data.get("provided_answers")
-        merged_answers = merge_answer_payload(existing_answers, payload.answers)
+        merged_answers = merge_answer_payload(
+            coerce_mapping_payload(existing_answers, field_name="provided_answers"),
+            payload.answers,
+        )
         if db.is_enabled():
             await db.update_task_row(
                 task_id,
@@ -2999,7 +3032,10 @@ async def resume_task(task_id: str, request: Request):
     try:
         task_data = await ensure_task_owner(task_id, request)
         pending_questions = normalize_questions(task_data.get("pending_questions"))
-        provided_answers = task_data.get("provided_answers") or {}
+        provided_answers = coerce_mapping_payload(
+            task_data.get("provided_answers"),
+            field_name="provided_answers",
+        )
         missing = validate_required_answers(pending_questions, provided_answers)
         if missing:
             raise HTTPException(

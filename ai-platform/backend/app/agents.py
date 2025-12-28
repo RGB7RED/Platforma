@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -71,6 +72,24 @@ def _parse_int_env(value: Optional[str]) -> int:
         return int(value)
     except ValueError:
         return 0
+
+
+def _extract_missing_files_from_issues(issues: Any) -> List[str]:
+    if not isinstance(issues, list):
+        return []
+    missing: List[str] = []
+    pattern = re.compile(r"Missing\s+\d+\s+files?\s+from\s+[^:]+:\s*(.+)")
+    for issue in issues:
+        if not isinstance(issue, str):
+            continue
+        match = pattern.search(issue)
+        if not match:
+            continue
+        for part in match.group(1).split(","):
+            path = part.strip()
+            if path:
+                missing.append(path)
+    return list(dict.fromkeys(missing))
 
 
 class SafeCommandRunner:
@@ -1058,10 +1077,18 @@ class AICoder(AIAgent):
 
     @staticmethod
     def _select_existing_files(review_report: Any, files: Any, limit: int = 50) -> Any:
+        if isinstance(review_report, str):
+            try:
+                review_report = json.loads(review_report)
+            except json.JSONDecodeError:
+                review_report = {"text": review_report}
         if isinstance(review_report, dict):
             missing_files = review_report.get("missing_files")
             if isinstance(missing_files, list) and missing_files:
                 return missing_files
+            issues_missing = _extract_missing_files_from_issues(review_report.get("issues"))
+            if issues_missing:
+                return issues_missing
         if isinstance(files, list):
             return files[:limit]
         return files
@@ -1205,6 +1232,8 @@ class AICoder(AIAgent):
             return self._generate_main_py()
         elif filepath == "models/todo.py":
             return self._generate_todo_model()
+        elif filepath == "database.py":
+            return self._generate_database_code()
         elif "service" in filepath:
             return self._generate_service_code(component, filepath)
         elif "repository" in filepath:
@@ -1376,30 +1405,30 @@ Todo repository - Data access layer
 from typing import List, Optional
 from datetime import datetime
 
+from database import InMemoryDatabase
 from models.todo import Todo, TodoCreate, TodoUpdate
 
 
 class TodoRepository:
     """Repository for todo data access with in-memory storage"""
     
-    def __init__(self):
-        self._todos = {}
-        self._next_id = 1
+    def __init__(self, database: InMemoryDatabase):
+        self._db = database
     
     async def get_all(self, skip: int = 0, limit: int = 100) -> List[Todo]:
         """Get all todos with pagination"""
-        todos = list(self._todos.values())
+        todos = list(self._db.todos.values())
         return todos[skip:skip + limit]
     
     async def get_by_id(self, todo_id: int) -> Optional[Todo]:
         """Get todo by ID"""
-        return self._todos.get(todo_id)
+        return self._db.todos.get(todo_id)
     
     async def create(self, todo_data: TodoCreate) -> Todo:
         """Create a new todo"""
         now = datetime.now()
         todo = Todo(
-            id=self._next_id,
+            id=self._db.next_id,
             title=todo_data.title,
             description=todo_data.description,
             completed=todo_data.completed,
@@ -1407,13 +1436,13 @@ class TodoRepository:
             updated_at=now
         )
         
-        self._todos[self._next_id] = todo
-        self._next_id += 1
+        self._db.todos[self._db.next_id] = todo
+        self._db.next_id += 1
         return todo
     
     async def update(self, todo_id: int, todo_data: TodoUpdate) -> Optional[Todo]:
         """Update an existing todo"""
-        todo = self._todos.get(todo_id)
+        todo = self._db.todos.get(todo_id)
         if not todo:
             return None
         
@@ -1426,8 +1455,8 @@ class TodoRepository:
     
     async def delete(self, todo_id: int) -> bool:
         """Delete a todo"""
-        if todo_id in self._todos:
-            del self._todos[todo_id]
+        if todo_id in self._db.todos:
+            del self._db.todos[todo_id]
             return True
         return False
     
@@ -1439,7 +1468,7 @@ class TodoRepository:
         query = query.lower()
         results = []
         
-        for todo in self._todos.values():
+        for todo in self._db.todos.values():
             if (todo.title and query in todo.title.lower()) or \
                (todo.description and query in todo.description.lower()):
                 results.append(todo)
@@ -1545,13 +1574,21 @@ API dependencies for todo management
 
 from fastapi import Depends, HTTPException
 
+from database import InMemoryDatabase, db
 from repositories.todo_repository import TodoRepository
 from services.todo_service import TodoService
 
 
-def get_todo_repository() -> TodoRepository:
+def get_db() -> InMemoryDatabase:
+    """Dependency for getting database instance"""
+    return db
+
+
+def get_todo_repository(
+    database: InMemoryDatabase = Depends(get_db),
+) -> TodoRepository:
     """Dependency for getting todo repository instance"""
-    return TodoRepository()
+    return TodoRepository(database)
 
 
 def get_todo_service(
@@ -1573,12 +1610,40 @@ from models.todo import Todo, TodoCreate, TodoUpdate
 
 __all__ = ["Todo", "TodoCreate", "TodoUpdate"]
 '''
+
+    def _generate_database_code(self) -> str:
+        return '''"""
+In-memory database for demo purposes
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict
+
+from models.todo import Todo
+
+
+@dataclass
+class InMemoryDatabase:
+    """Simple in-memory storage for todos"""
+    todos: Dict[int, Todo] = field(default_factory=dict)
+    next_id: int = 1
+
+    def reset(self) -> None:
+        """Reset the database to an empty state"""
+        self.todos.clear()
+        self.next_id = 1
+
+
+db = InMemoryDatabase()
+'''
     
     def _generate_test_code(self, filepath: str) -> str:
         if "test_api" in filepath:
             return self._generate_api_tests()
         elif "test_services" in filepath:
             return self._generate_service_tests()
+        elif "test_repositories" in filepath:
+            return self._generate_repository_tests()
         elif "conftest" in filepath:
             return self._generate_conftest()
         else:
@@ -1834,6 +1899,52 @@ class TestTodoService:
         results = await todo_service.search_todos("")
         assert len(results) == 0
 '''
+
+    def _generate_repository_tests(self) -> str:
+        return '''"""
+Repository layer tests
+"""
+
+import pytest
+from database import InMemoryDatabase
+from models.todo import TodoCreate, TodoUpdate
+from repositories.todo_repository import TodoRepository
+
+
+@pytest.fixture
+def todo_repository():
+    """Create repository with fresh database"""
+    database = InMemoryDatabase()
+    return TodoRepository(database)
+
+
+class TestTodoRepository:
+    """Test suite for TodoRepository"""
+    
+    @pytest.mark.asyncio
+    async def test_create_and_get_todo(self, todo_repository):
+        """Test creating and retrieving a todo"""
+        todo = await todo_repository.create(TodoCreate(title="Repo todo"))
+        retrieved = await todo_repository.get_by_id(todo.id)
+        assert retrieved is not None
+        assert retrieved.title == "Repo todo"
+    
+    @pytest.mark.asyncio
+    async def test_update_todo(self, todo_repository):
+        """Test updating a todo"""
+        todo = await todo_repository.create(TodoCreate(title="Original"))
+        updated = await todo_repository.update(todo.id, TodoUpdate(title="Updated"))
+        assert updated is not None
+        assert updated.title == "Updated"
+    
+    @pytest.mark.asyncio
+    async def test_delete_todo(self, todo_repository):
+        """Test deleting a todo"""
+        todo = await todo_repository.create(TodoCreate(title="Delete me"))
+        result = await todo_repository.delete(todo.id)
+        assert result is True
+        assert await todo_repository.get_by_id(todo.id) is None
+'''
     
     def _generate_conftest(self) -> str:
         return '''"""
@@ -2052,6 +2163,9 @@ class AIReviewer(AIAgent):
                 "progress": container.progress,
             },
         }
+        missing_files = _extract_missing_files_from_issues(issues)
+        if missing_files:
+            review_result["missing_files"] = missing_files
 
         # Добавляем артефакт ревью
         container.add_artifact(
