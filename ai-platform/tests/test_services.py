@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-import pytest
+from pytest import fixture, raises
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -13,7 +13,7 @@ from repositories.todo_repository import TodoRepository  # noqa: E402
 from services.todo_service import TodoService  # noqa: E402
 
 
-@pytest.fixture
+@fixture
 def todo_service() -> TodoService:
     """Create todo service for testing."""
     repository = TodoRepository()
@@ -38,7 +38,7 @@ class TestTodoService:
 
     def test_create_todo_invalid_title(self, todo_service: TodoService) -> None:
         """Test creating todo with invalid title."""
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             todo_service.create_todo(TodoCreate(title=""))
 
     def test_get_all_todos(self, todo_service: TodoService) -> None:
