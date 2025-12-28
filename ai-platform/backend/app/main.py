@@ -109,6 +109,12 @@ class GitHubConnectRequest(BaseModel):
     default_branch: Optional[str] = None
 
 
+class GitHubTestRequest(BaseModel):
+    repo_full_name: str
+    access_token: str
+    default_branch: Optional[str] = None
+
+
 class CreatePullRequestRequest(BaseModel):
     title: Optional[str] = None
     body: Optional[str] = None
@@ -810,6 +816,31 @@ def sanitize_branch_name(value: str) -> str:
     return slug or "ai-platform-task"
 
 
+GITHUB_ERROR_RESPONSE_LIMIT = 2000
+
+
+def truncate_github_error_response(value: Any, limit: int = GITHUB_ERROR_RESPONSE_LIMIT) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        text = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(value)
+    if len(text) > limit:
+        return f"{text[:limit - 3]}..."
+    return text
+
+
+def extract_github_error_message(value: Any) -> str:
+    if isinstance(value, dict):
+        message = value.get("message")
+        if message:
+            return str(message)
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item) for item in value)
+    return str(value) if value is not None else "GitHub API error"
+
+
 async def github_api_request(
     *,
     method: str,
@@ -829,9 +860,15 @@ async def github_api_request(
             detail = response.json()
         except ValueError:
             detail = response.text
+        message = extract_github_error_message(detail)
         raise HTTPException(
             status_code=400,
-            detail={"error": "github_api_error", "message": detail},
+            detail={
+                "error": "github_api_error",
+                "status_code": response.status_code,
+                "message": message,
+                "response": detail,
+            },
         )
     if response.status_code == 204:
         return {}
@@ -2464,6 +2501,48 @@ async def connect_github_project(project_id: str, payload: GitHubConnectRequest,
     return normalize_project_row(project)
 
 
+@app.post("/api/projects/{project_id}/test-github")
+async def test_github_connection(project_id: str, payload: GitHubTestRequest, req: Request):
+    _, owner_user_id = await require_user_auth(req)
+    repo_full_name = payload.repo_full_name.strip()
+    access_token = payload.access_token.strip()
+    if not repo_full_name:
+        raise HTTPException(status_code=400, detail="repo_full_name is required")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="access_token is required")
+
+    if db.is_enabled():
+        project = await db.get_project_row(project_id, owner_user_id)
+    else:
+        project = storage.projects.get(project_id)
+        if project and project.get("owner_user_id") != owner_user_id:
+            project = None
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    owner, repo = parse_repo_full_name(repo_full_name)
+    repo_info = await github_api_request(
+        method="GET",
+        url=f"https://api.github.com/repos/{owner}/{repo}",
+        token=access_token,
+    )
+    default_branch = (payload.default_branch or repo_info.get("default_branch") or "").strip()
+    if not default_branch:
+        raise HTTPException(status_code=400, detail="default_branch is required")
+    branch_info = await github_api_request(
+        method="GET",
+        url=f"https://api.github.com/repos/{owner}/{repo}/branches/{default_branch}",
+        token=access_token,
+    )
+    branch_sha = branch_info.get("commit", {}).get("sha")
+    return {
+        "status": "ok",
+        "repo_full_name": repo_full_name,
+        "default_branch": default_branch,
+        "branch_sha": branch_sha,
+    }
+
+
 @app.get("/api/projects/{project_id}/tasks")
 async def list_project_tasks(project_id: str, req: Request):
     _, owner_user_id = await require_user_auth(req)
@@ -2633,6 +2712,24 @@ async def get_task_status(task_id: str, request: Request):
 @app.post("/api/tasks/{task_id}/create-pr")
 async def create_pull_request(task_id: str, payload: CreatePullRequestRequest, request: Request):
     task_token = set_task_id(task_id)
+    request_id = get_request_id()
+
+    async def record_pr_result(success: bool, payload_data: Dict[str, Any]) -> None:
+        artifact_payload = {
+            "success": success,
+            "payload": normalize_payload(payload_data),
+            "request_id": request_id,
+        }
+        try:
+            await record_artifact(
+                task_id,
+                "pr_create_result.json",
+                artifact_payload,
+                produced_by="system",
+            )
+        except Exception:
+            logger.exception("Failed to record pr_create_result artifact for task %s", task_id)
+
     try:
         auth_context, owner_user_id = await require_user_auth(request)
         task_data = await ensure_task_owner(task_id, request)
@@ -2791,12 +2888,49 @@ async def create_pull_request(task_id: str, payload: CreatePullRequestRequest, r
                 "draft": bool(payload.draft),
             },
         )
-        return {
+        result_payload = {
             "pull_request_url": pull_request.get("html_url"),
             "pull_request_number": pull_request.get("number"),
             "branch": branch_name,
             "repo_full_name": repo_full_name,
         }
+        await record_pr_result(True, result_payload)
+        return result_payload
+    except HTTPException as exc:
+        detail = exc.detail
+        if isinstance(detail, dict) and detail.get("error") == "github_api_error":
+            github_status = detail.get("status_code") or exc.status_code
+            github_response = detail.get("response")
+            structured_error = {
+                "status_code": github_status,
+                "github_error_message": detail.get("message") or extract_github_error_message(github_response),
+                "github_error_response": truncate_github_error_response(github_response),
+                "request_id": request_id,
+            }
+            await record_pr_result(False, structured_error)
+            return JSONResponse(
+                status_code=int(github_status) if github_status else 400,
+                content=structured_error,
+            )
+        await record_pr_result(
+            False,
+            {
+                "status_code": exc.status_code,
+                "error": detail,
+                "request_id": request_id,
+            },
+        )
+        raise
+    except Exception as exc:
+        await record_pr_result(
+            False,
+            {
+                "status_code": 500,
+                "error": str(exc),
+                "request_id": request_id,
+            },
+        )
+        raise
     finally:
         reset_task_id(task_token)
 
