@@ -1,10 +1,16 @@
 """Test configuration for the FastAPI template."""
 
+import sys
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
-from database import db
-from main import app
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from database import db  # noqa: E402
+from main import app  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

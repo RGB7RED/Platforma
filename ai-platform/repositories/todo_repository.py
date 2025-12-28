@@ -70,16 +70,16 @@ class TodoRepository:
         """Search todos by title or description."""
         if not query:
             return []
-        query_lower = query.lower()
-        query_variants = {query_lower}
-        if query_lower.endswith("y"):
-            query_variants.add(f"{query_lower[:-1]}ies")
-        if query_lower.endswith("ies"):
-            query_variants.add(f"{query_lower[:-3]}y")
+        query_folded = query.casefold()
+        query_variants = {query_folded}
+        if query_folded.endswith("y"):
+            query_variants.add(f"{query_folded[:-1]}ies")
+        if query_folded.endswith("ies"):
+            query_variants.add(f"{query_folded[:-3]}y")
 
         def matches(text: str) -> bool:
-            text_lower = text.lower()
-            return any(variant in text_lower for variant in query_variants)
+            text_folded = text.casefold()
+            return any(variant in text_folded for variant in query_variants)
         results = []
         for todo in self._todos.values():
             if todo.title and matches(todo.title):
