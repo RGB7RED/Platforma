@@ -681,6 +681,14 @@ class AICoder(AIAgent):
         if len(files) > max_files:
             files = files[:max_files]
 
+        new_paths = {
+            str(file_entry.get("path") or file_entry.get("file") or "").strip()
+            for file_entry in files
+        }
+        new_paths.discard("")
+        all_paths = set(container.files.keys()) | new_paths
+        template_id = self._resolve_template_id(container)
+
         written_files = []
         file_sizes = {}
         for file_entry in files:
@@ -689,6 +697,7 @@ class AICoder(AIAgent):
             if not path:
                 continue
             self._assert_safe_path(path, allowed_paths)
+            content = self._sanitize_fastapi_root_layout(template_id, path, content, all_paths)
             container.add_file(path, content)
             written_files.append(path)
             file_sizes[path] = len(content)
@@ -775,7 +784,15 @@ class AICoder(AIAgent):
         review_report = task.get("review_report")
         review_errors = task.get("review_errors") or task.get("errors")
         review_warnings = task.get("review_warnings") or task.get("warnings")
-        constraints = rules.get("constraints", [])
+        constraints = list(rules.get("constraints", []))
+        template_id = self._resolve_template_id(container)
+        if template_id == "python_fastapi":
+            constraints.append(
+                "Use root layout with main.py at the repository root. "
+                "Do not create an app/ directory. "
+                "Only import modules that exist in the generated files; "
+                "do not import api.* unless an api/ package is created."
+            )
         system_prompt = (
             "You are the Coder agent. Follow the codex rules strictly.\n"
             "Return JSON only with fields: files (list of {path, content}), "
@@ -801,6 +818,51 @@ class AICoder(AIAgent):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+
+    def _resolve_template_id(self, container: Container) -> Optional[str]:
+        template_id = container.metadata.get("template_id")
+        if template_id:
+            return template_id
+        manifest = container.metadata.get("template_manifest")
+        if isinstance(manifest, dict):
+            return manifest.get("id")
+        return None
+
+    def _sanitize_fastapi_root_layout(
+        self,
+        template_id: Optional[str],
+        path: str,
+        content: str,
+        all_paths: set[str],
+    ) -> str:
+        if template_id != "python_fastapi":
+            return content
+        if path not in {"main.py", "app/main.py"}:
+            return content
+        has_api_module = any(
+            candidate == "api.py" or candidate.startswith("api/")
+            for candidate in all_paths
+        )
+        if has_api_module:
+            return content
+        lines = content.splitlines()
+        filtered_lines = []
+        removed = False
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("from api") or stripped.startswith("import api"):
+                removed = True
+                continue
+            if "api_router" in line:
+                removed = True
+                continue
+            filtered_lines.append(line)
+        if not removed:
+            return content
+        sanitized = "\n".join(filtered_lines)
+        if content.endswith("\n"):
+            sanitized += "\n"
+        return sanitized
 
     def _parse_llm_response(self, text: str) -> Dict[str, Any]:
         """Parse JSON response, handling optional code fences."""
@@ -1718,7 +1780,7 @@ class AIReviewer(AIAgent):
         return None
 
     def _skip_architecture_compliance(self, template_id: Optional[str]) -> bool:
-        return template_id == "python_cli"
+        return template_id in {"python_cli", "python_fastapi"}
 
     def _apply_template_checks(
         self,
@@ -1737,7 +1799,7 @@ class AIReviewer(AIAgent):
         if template_id == "python_fastapi":
             missing_deps = self._missing_requirements(
                 container.files,
-                ("fastapi", "uvicorn", "pydantic"),
+                ("fastapi", "uvicorn[standard]", "pydantic"),
             )
             if missing_deps:
                 issues.append(
