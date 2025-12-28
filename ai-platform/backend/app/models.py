@@ -293,7 +293,6 @@ class Container:
             "progress": self.progress
         }
         self.history.append(entry)
-        self.metadata["iterations"] += 1
     
     def to_dict(self) -> Dict[str, Any]:
         """Конвертировать контейнер в словарь для сериализации"""

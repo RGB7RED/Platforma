@@ -5,6 +5,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 from app.orchestrator import AIOrchestrator
+from app.agents import ParseError
 from app.models import ProjectState
 
 
@@ -132,6 +133,61 @@ class TestAIOrchestrator:
 
         assert result["status"] == "failed"
         assert orchestrator.container.state == ProjectState.ERROR
+
+    @pytest.mark.asyncio
+    async def test_llm_invalid_json_retry_once(self, orchestrator, mock_agents, monkeypatch):
+        """Неверный JSON от LLM приводит к контролируемому отказу после одной попытки"""
+        orchestrator.initialize_project("Test")
+        monkeypatch.setenv("LLM_MAX_CALLS_PER_TASK", "10")
+        monkeypatch.setenv("LLM_MAX_RETRIES_PER_STEP", "1")
+
+        mock_agents["coder"].execute.side_effect = [
+            ParseError("llm_invalid_json", raw_text="bad", error="boom"),
+            ParseError("llm_invalid_json", raw_text="still bad", error="boom"),
+        ]
+
+        result = await orchestrator.process_task("Create a test API")
+
+        assert result["status"] == "failed"
+        assert result["failure_reason"] == "llm_invalid_json"
+        assert mock_agents["coder"].execute.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_llm_call_budget_exhausted(self, orchestrator, mock_agents, monkeypatch):
+        """Проверка остановки по лимиту LLM вызовов"""
+        orchestrator.initialize_project("Test")
+        monkeypatch.setenv("LLM_MAX_CALLS_PER_TASK", "1")
+        monkeypatch.setenv("LLM_MAX_RETRIES_PER_STEP", "1")
+
+        mock_agents["coder"].execute.side_effect = [
+            ParseError("llm_invalid_json", raw_text="bad", error="boom"),
+        ]
+
+        result = await orchestrator.process_task("Create a test API")
+
+        assert result["status"] == "failed"
+        assert result["failure_reason"] == "llm_budget_exhausted"
+        assert mock_agents["coder"].execute.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_max_iterations_enforced(self, orchestrator, mock_agents, monkeypatch):
+        """Проверка соблюдения лимита итераций"""
+        orchestrator.codex["workflow"]["max_iterations"] = 2
+        orchestrator.initialize_project("Test")
+        monkeypatch.setenv("LLM_MAX_CALLS_PER_TASK", "10")
+        monkeypatch.setenv("LLM_MAX_RETRIES_PER_STEP", "1")
+
+        mock_agents["designer"].execute.return_value = {
+            "components": [{"name": "Test", "files": ["test.py"]}]
+        }
+        mock_agents["reviewer"].execute.return_value = {"status": "rejected", "passed": False}
+
+        result = await orchestrator.process_task("Create a test API")
+
+        assert result["failure_reason"] == "max_iterations_exhausted"
+        assert result["iterations"] == 2
+        assert orchestrator.container.metadata["iterations"] == 2
+        assert mock_agents["coder"].execute.call_count == 2
     
     @pytest.mark.asyncio
     async def test_get_next_task(self, orchestrator):

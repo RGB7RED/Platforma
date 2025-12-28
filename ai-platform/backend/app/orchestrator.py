@@ -152,6 +152,16 @@ class AIOrchestrator:
         normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", text.strip().lower()).strip("_")
         return normalized or str(uuid.uuid4())
 
+    @staticmethod
+    def _get_int_env(name: str, default: int) -> int:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except ValueError:
+            return default
+
     def _plan_clarification_questions(
         self,
         user_task: str,
@@ -381,10 +391,16 @@ class AIOrchestrator:
             failure_reason: Optional[str] = None
             failure_stage: Optional[str] = None
             next_task_override: Optional[Dict[str, Any]] = None
+            max_llm_calls = self._get_int_env("LLM_MAX_CALLS_PER_TASK", 10)
+            max_retries_per_step = self._get_int_env("LLM_MAX_RETRIES_PER_STEP", 1)
+            self.container.metadata.setdefault("llm_calls", 0)
+            self.container.metadata.setdefault("llm_retries", 0)
+            self.container.metadata["iterations"] = iteration
 
             if start_index <= stages.index("implementation"):
                 while not self.container.is_complete() and iteration < max_iterations:
                     iteration += 1
+                    self.container.metadata["iterations"] = iteration
                     logger.info(f"Implementation iteration {iteration}")
 
                     # 3.1 Получаем следующую задачу от планировщика
@@ -400,8 +416,42 @@ class AIOrchestrator:
                     # 3.2 Кодер выполняет задачу
                     coder_result = None
                     correction_prompt = None
-                    for attempt in range(2):
+                    retries_used = 0
+                    for attempt in range(max_retries_per_step + 1):
                         try:
+                            if (
+                                max_llm_calls > 0
+                                and self.container.metadata.get("llm_calls", 0) >= max_llm_calls
+                            ):
+                                await self._run_hook(
+                                    callbacks.get("stage_failed") if callbacks else None,
+                                    {
+                                        "stage": "implementation",
+                                        "reason": "llm_budget_exhausted",
+                                        "error": "llm_budget_exhausted",
+                                    },
+                                )
+                                self.container.update_state(
+                                    ProjectState.ERROR,
+                                    "llm_budget_exhausted",
+                                )
+                                return {
+                                    "status": "failed",
+                                    "container_id": self.container.project_id,
+                                    "state": self.container.state.value,
+                                    "progress": self.container.progress,
+                                    "files_count": len(self.container.files),
+                                    "artifacts_count": sum(
+                                        len(a) for a in self.container.artifacts.values()
+                                    ),
+                                    "iterations": iteration,
+                                    "max_iterations": max_iterations,
+                                    "history": self.task_history[-5:],
+                                    "failure_reason": "llm_budget_exhausted",
+                                }
+                            self.container.metadata["llm_calls"] = (
+                                self.container.metadata.get("llm_calls", 0) + 1
+                            )
                             coder_result = await self.roles["coder"].execute(
                                 next_task,
                                 self.container,
@@ -409,10 +459,15 @@ class AIOrchestrator:
                             )
                             break
                         except LLMResponseParseError as exc:
-                            if attempt == 0:
+                            if retries_used < max_retries_per_step:
+                                retries_used += 1
+                                self.container.metadata["llm_retries"] = (
+                                    self.container.metadata.get("llm_retries", 0) + 1
+                                )
                                 correction_prompt = (
-                                    "Return ONLY valid JSON matching schema. "
-                                    "No markdown, no commentary."
+                                    "Return ONLY valid JSON. "
+                                    "No markdown, no commentary. "
+                                    "Must be a single JSON object."
                                 )
                                 continue
                             await self._run_hook(
