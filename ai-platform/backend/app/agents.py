@@ -39,6 +39,8 @@ class BudgetExceededError(RuntimeError):
 class ParseError(ValueError):
     """Raised when parsing an LLM response fails."""
 
+    MAX_RAW_LLM_OUTPUT_CHARS = 40000
+
     def __init__(
         self,
         reason: str,
@@ -53,7 +55,7 @@ class ParseError(ValueError):
 
     @property
     def truncated_raw(self) -> str:
-        return self.raw_text[:2000]
+        return self.raw_text[: self.MAX_RAW_LLM_OUTPUT_CHARS]
 
 
 LLMResponseParseError = ParseError
@@ -702,12 +704,16 @@ class AICoder(AIAgent):
         try:
             parsed = self._parse_llm_response(response_text)
         except LLMResponseParseError as exc:
+            truncated_raw = exc.truncated_raw
+            raw_truncated = len(exc.raw_text) > len(truncated_raw)
             container.add_artifact(
                 "llm_invalid_json",
                 {
                     "reason": exc.reason,
                     "error": exc.error or str(exc),
-                    "truncated_raw": exc.truncated_raw,
+                    "truncated_raw": truncated_raw,
+                    "raw_llm_output": truncated_raw,
+                    "raw_llm_output_truncated": raw_truncated,
                 },
                 self.role_name,
             )

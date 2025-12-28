@@ -216,10 +216,11 @@ async def generate_with_retry(
     delay = 1.0
     response_format = {"type": "json_object"} if require_json else None
     temperature = 0.0 if require_json else settings.temperature
+    prepared_messages = _inject_json_system_instruction(messages, provider, require_json)
     while True:
         try:
             return await provider.generate_text(
-                messages=messages,
+                messages=prepared_messages,
                 model=settings.model,
                 temperature=temperature,
                 max_tokens=settings.max_tokens,
@@ -231,6 +232,26 @@ async def generate_with_retry(
             await asyncio.sleep(delay)
             delay *= 2
             attempt += 1
+
+
+def _inject_json_system_instruction(
+    messages: List[Dict[str, str]],
+    provider: LLMProvider,
+    require_json: bool,
+) -> List[Dict[str, str]]:
+    if not require_json or provider.name != "openai":
+        return messages
+    instruction = "OUTPUT JSON ONLY. No markdown. No extra keys."
+    if not messages:
+        return [{"role": "system", "content": instruction}]
+    updated = [dict(message) for message in messages]
+    if updated[0].get("role") == "system":
+        content = updated[0].get("content", "")
+        if instruction not in content:
+            updated[0]["content"] = f"{content.rstrip()}\n{instruction}"
+        return updated
+    updated.insert(0, {"role": "system", "content": instruction})
+    return updated
 
 
 def _extract_between(text: str, start: str, end: str) -> str:

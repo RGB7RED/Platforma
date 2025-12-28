@@ -459,17 +459,22 @@ class AIOrchestrator:
                             )
                             break
                         except LLMResponseParseError as exc:
-                            if retries_used < max_retries_per_step:
+                            parse_retry_limit = min(max_retries_per_step, 1)
+                            if retries_used < parse_retry_limit:
                                 retries_used += 1
                                 self.container.metadata["llm_retries"] = (
                                     self.container.metadata.get("llm_retries", 0) + 1
                                 )
                                 correction_prompt = (
-                                    "Return ONLY valid JSON. "
-                                    "No markdown, no commentary. "
+                                    "OUTPUT JSON ONLY. "
+                                    "No markdown. "
+                                    "No extra keys. "
                                     "Must be a single JSON object."
                                 )
                                 continue
+                            reason_detail = (exc.error or "invalid JSON").strip()
+                            if len(reason_detail) > 200:
+                                reason_detail = f"{reason_detail[:200].rstrip()}..."
                             await self._run_hook(
                                 callbacks.get("stage_failed") if callbacks else None,
                                 {
@@ -491,7 +496,7 @@ class AIOrchestrator:
                                 "iterations": iteration,
                                 "max_iterations": max_iterations,
                                 "history": self.task_history[-5:],
-                                "failure_reason": "llm_invalid_json",
+                                "failure_reason": f"llm_invalid_json: {reason_detail}",
                             }
                         except BudgetExceededError:
                             await self._run_hook(
