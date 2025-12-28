@@ -325,7 +325,7 @@ async def generate_text_chunks_json(
             total_usage = _accumulate_usage(total_usage, usage)
             text = response.get("text", "") or ""
             try:
-                payload = _parse_chunk_payload(text)
+                payload = _parse_chunk_payload(text, expected_index=chunk_index)
             except ValueError as exc:
                 last_error_text = text
                 if invalid_attempts >= 2:
@@ -527,13 +527,17 @@ def _build_chunk_messages(
     return messages
 
 
-def _parse_chunk_payload(text: str) -> Dict[str, Any]:
+def _parse_chunk_payload(text: str, *, expected_index: Optional[int] = None) -> Dict[str, Any]:
     payload = json.loads(text)
     if not isinstance(payload, dict):
         raise ValueError("Chunk payload must be a JSON object.")
     status = payload.get("status")
     if status not in {"partial", "complete"}:
         raise ValueError("Chunk status must be 'partial' or 'complete'.")
+    if expected_index is not None:
+        chunk_index = payload.get("chunk_index")
+        if chunk_index != expected_index:
+            raise ValueError(f"chunk_index must be {expected_index}.")
     content_chunk = payload.get("content_chunk")
     if content_chunk is None:
         raise ValueError("content_chunk is required.")
