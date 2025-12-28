@@ -101,7 +101,47 @@ async def test_generate_with_retry_retries_on_truncation():
 
 
 @pytest.mark.asyncio
-async def test_generate_with_retry_truncation_raises_after_retry():
+async def test_generate_with_retry_continues_on_truncation():
+    provider = FakeProvider(
+        [
+            {
+                "text": "ignored",
+                "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
+                "finish_reason": "length",
+            },
+            {
+                "text": "hello ",
+                "usage": {"input_tokens": 3, "output_tokens": 3, "total_tokens": 6},
+                "finish_reason": "length",
+            },
+            {
+                "text": "world",
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "finish_reason": "stop",
+            },
+        ]
+    )
+    settings = LLMSettings(
+        provider="openai",
+        model="gpt-4o-mini",
+        api_key="test",
+        max_tokens=50,
+        max_tokens_coder=50,
+        timeout_seconds=10,
+        temperature=0.2,
+        response_format="json_object",
+        chunking_enabled=True,
+        max_chunks=8,
+        max_file_chars=12000,
+    )
+
+    response = await generate_with_retry(provider, [], settings)
+
+    assert response["text"] == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_generate_with_retry_truncation_raises_after_continuations():
     provider = FakeProvider(
         [
             {
@@ -111,6 +151,21 @@ async def test_generate_with_retry_truncation_raises_after_retry():
             },
             {
                 "text": "{\"partial_again\":",
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                "finish_reason": "length",
+            },
+            {
+                "text": "{\"partial_more\":",
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                "finish_reason": "length",
+            },
+            {
+                "text": "{\"partial_even_more\":",
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                "finish_reason": "length",
+            },
+            {
+                "text": "{\"partial_final\":",
                 "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
                 "finish_reason": "length",
             },
@@ -133,7 +188,7 @@ async def test_generate_with_retry_truncation_raises_after_retry():
     with pytest.raises(LLMOutputTruncatedError) as excinfo:
         await generate_with_retry(provider, [], settings, require_json=True)
 
-    assert excinfo.value.usage["total_tokens"] == 15
+    assert excinfo.value.usage["total_tokens"] == 30
 
 
 @pytest.mark.asyncio

@@ -568,6 +568,22 @@ class AIOrchestrator:
                                 "failure_reason": "quota_exceeded",
                             }
                         except LLMOutputTruncatedError as exc:
+                            if retries_used < max_retries_per_step:
+                                retries_used += 1
+                                self.container.metadata["llm_retries"] = (
+                                    self.container.metadata.get("llm_retries", 0) + 1
+                                )
+                                correction_prompt = (
+                                    "Previous response was truncated. "
+                                    "Respond concisely and fit within the token limits. "
+                                    "OUTPUT JSON ONLY. No markdown. No extra keys."
+                                )
+                                logger.warning(
+                                    "LLM output truncated; retrying step (%s/%s).",
+                                    retries_used,
+                                    max_retries_per_step,
+                                )
+                                continue
                             reason = str(exc) or "llm_output_truncated"
                             if not reason.startswith("llm_output_"):
                                 reason = "llm_output_truncated"
