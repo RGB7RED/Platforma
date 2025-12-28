@@ -73,6 +73,7 @@ class TaskRequest(BaseModel):
     user_id: Optional[str] = None
     codex_version: Optional[str] = "1.0.0-mvp"
     template_id: Optional[str] = None
+    project_id: Optional[str] = None
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -80,6 +81,17 @@ class TaskResponse(BaseModel):
     message: str
     progress: float = 0.0
     estimated_time: Optional[int] = None
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    template_id: Optional[str] = None
+
+class ProjectResponse(BaseModel):
+    id: str
+    name: str
+    template_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 class FileContentRequest(BaseModel):
     filepath: str
@@ -93,6 +105,7 @@ class Storage:
         self.events: Dict[str, List[Dict[str, Any]]] = {}
         self.artifacts: Dict[str, List[Dict[str, Any]]] = {}
         self.state: Dict[str, Dict[str, Any]] = {}
+        self.projects: Dict[str, Dict[str, Any]] = {}
 
 storage = Storage()
 database_url = os.getenv("DATABASE_URL")
@@ -237,6 +250,14 @@ async def get_auth_context(request: Request) -> AuthContext:
         owner_key_hash=hash_api_key(api_key),
         api_key=api_key,
     )
+
+
+async def require_user_auth(request: Request) -> tuple[AuthContext, str]:
+    auth_context = await get_auth_context(request)
+    if not auth_context.user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    owner_user_id = str(auth_context.user["id"])
+    return auth_context, owner_user_id
 
 
 def task_access_allowed(
@@ -732,6 +753,14 @@ def build_container_state(
     if include_created_at:
         state["timestamps"]["created_at"] = now_iso
     return normalize_payload(state)
+
+
+def normalize_project_row(project: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(project)
+    project_id = data.get("id")
+    if project_id is not None:
+        data["id"] = str(project_id)
+    return data
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -2149,6 +2178,87 @@ async def list_templates_endpoint(request: Request):
     await get_auth_context(request)
     return {"templates": list_available_templates()}
 
+@app.post("/api/projects", response_model=ProjectResponse)
+async def create_project(request: ProjectCreateRequest, req: Request):
+    auth_context, owner_user_id = await require_user_auth(req)
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Project name is required")
+
+    project_id = str(uuid.uuid4())
+    template_id = request.template_id.strip() if request.template_id else None
+    now = db.now_utc()
+
+    if db.is_enabled():
+        project = await db.create_project_row(
+            project_id=project_id,
+            owner_user_id=owner_user_id,
+            name=name,
+            template_id=template_id,
+        )
+        return normalize_project_row(project)
+
+    project = {
+        "id": project_id,
+        "owner_user_id": owner_user_id,
+        "name": name,
+        "template_id": template_id,
+        "created_at": now,
+        "updated_at": now,
+    }
+    storage.projects[project_id] = project
+    return normalize_project_row(project)
+
+
+@app.get("/api/projects")
+async def list_projects(req: Request):
+    _, owner_user_id = await require_user_auth(req)
+    if db.is_enabled():
+        projects = await db.list_projects_for_owner_user(owner_user_id)
+    else:
+        projects = [
+            project
+            for project in storage.projects.values()
+            if project.get("owner_user_id") == owner_user_id
+        ]
+        projects = sorted(projects, key=lambda item: item.get("created_at") or db.now_utc(), reverse=True)
+    return {"projects": [normalize_project_row(project) for project in projects]}
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str, req: Request):
+    _, owner_user_id = await require_user_auth(req)
+    if db.is_enabled():
+        project = await db.get_project_row(project_id, owner_user_id)
+    else:
+        project = storage.projects.get(project_id)
+        if project and project.get("owner_user_id") != owner_user_id:
+            project = None
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return normalize_project_row(project)
+
+
+@app.get("/api/projects/{project_id}/tasks")
+async def list_project_tasks(project_id: str, req: Request):
+    _, owner_user_id = await require_user_auth(req)
+    if db.is_enabled():
+        project = await db.get_project_row(project_id, owner_user_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        tasks = await db.list_tasks_for_project(project_id, owner_user_id)
+        tasks = [enrich_task_data(str(task["id"]), task) for task in tasks]
+    else:
+        project = storage.projects.get(project_id)
+        if project is None or project.get("owner_user_id") != owner_user_id:
+            raise HTTPException(status_code=404, detail="Project not found")
+        tasks = [
+            task
+            for task in storage.active_tasks.values()
+            if task.get("project_id") == project_id and task.get("owner_user_id") == owner_user_id
+        ]
+    return {"project": normalize_project_row(project), "tasks": tasks, "total": len(tasks)}
+
 @app.post("/api/tasks", response_model=TaskResponse)
 async def create_task(request: TaskRequest, req: Request):
     """Создание новой задачи для обработки ИИ"""
@@ -2163,7 +2273,25 @@ async def create_task(request: TaskRequest, req: Request):
         user_id = request.user_id or f"user_{uuid.uuid4().hex[:8]}"
     request_id = get_request_id()
     template_id = request.template_id.strip() if request.template_id else None
+    project_id = request.project_id.strip() if request.project_id else None
     template_hash = None
+    if project_id:
+        try:
+            uuid.UUID(project_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid project id")
+        if not auth_context.user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        if db.is_enabled():
+            project = await db.get_project_row(project_id, owner_user_id)
+        else:
+            project = storage.projects.get(project_id)
+            if project and project.get("owner_user_id") != owner_user_id:
+                project = None
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if not template_id and project.get("template_id"):
+            template_id = project.get("template_id")
     if template_id:
         template_info = resolve_template(template_id)
         if not template_info:
@@ -2187,6 +2315,7 @@ async def create_task(request: TaskRequest, req: Request):
                 codex_version=request.codex_version,
                 template_id=template_id,
                 template_hash=template_hash,
+                project_id=project_id,
                 client_ip=client_ip,
                 owner_key_hash=owner_key_hash,
             )
@@ -2204,6 +2333,7 @@ async def create_task(request: TaskRequest, req: Request):
                 "codex_version": request.codex_version,
                 "template_id": template_id,
                 "template_hash": template_hash,
+                "project_id": project_id,
                 "client_ip": client_ip,
                 "owner_key_hash": owner_key_hash,
                 "owner_user_id": owner_user_id,
@@ -2228,6 +2358,7 @@ async def create_task(request: TaskRequest, req: Request):
                     "codex_version": request.codex_version,
                     "template_id": template_id,
                     "template_hash": template_hash,
+                    "project_id": project_id,
                 }
             ),
         )

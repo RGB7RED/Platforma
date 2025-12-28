@@ -158,6 +158,7 @@
     charCount: document.getElementById('charCount'),
     codexVersion: document.getElementById('codexVersion'),
     templateSelect: document.getElementById('templateSelect'),
+    projectSelect: document.getElementById('projectSelect'),
     currentTaskId: document.getElementById('currentTaskId'),
     progressBarFill: document.getElementById('progressBarFill'),
     progressPercentage: document.getElementById('progressPercentage'),
@@ -227,7 +228,16 @@
     loadingSubtext: document.getElementById('loadingSubtext'),
     notificationToast: document.getElementById('notificationToast'),
     toastIcon: document.getElementById('toastIcon'),
-    toastMessage: document.getElementById('toastMessage')
+    toastMessage: document.getElementById('toastMessage'),
+    projectNameInput: document.getElementById('projectNameInput'),
+    projectTemplateSelect: document.getElementById('projectTemplateSelect'),
+    createProjectBtn: document.getElementById('createProjectBtn'),
+    refreshDashboardBtn: document.getElementById('refreshDashboardBtn'),
+    projectsList: document.getElementById('projectsList'),
+    projectsEmpty: document.getElementById('projectsEmpty'),
+    projectError: document.getElementById('projectError'),
+    tasksList: document.getElementById('tasksList'),
+    tasksEmpty: document.getElementById('tasksEmpty')
   };
 
   let currentTaskId = null;
@@ -257,6 +267,9 @@
   let latestTaskSnapshot = null;
   let latestQuestionsPayload = null;
   let missingAuthMessage = 'Please sign in to continue.';
+  let cachedProjects = [];
+  let cachedTasks = [];
+  let projectLookup = new Map();
 
   const hydrateStoredTokens = () => {
     const storedToken = window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY);
@@ -536,29 +549,51 @@
   };
 
   const setTemplateOptions = (templates) => {
-    if (!elements.templateSelect) {
+    const templateSelects = [elements.templateSelect, elements.projectTemplateSelect].filter(Boolean);
+    templateSelects.forEach((select) => {
+      select.innerHTML = '';
+      const noneOption = document.createElement('option');
+      noneOption.value = '';
+      noneOption.textContent = select === elements.projectTemplateSelect ? 'No template' : 'None';
+      select.appendChild(noneOption);
+
+      templates.forEach((template) => {
+        if (!template || !template.template_id) {
+          return;
+        }
+        const option = document.createElement('option');
+        option.value = template.template_id;
+        const description = template.description ? ` — ${template.description}` : '';
+        option.textContent = `${template.template_id}${description}`;
+        select.appendChild(option);
+      });
+    });
+  };
+
+  const setProjectOptions = (projects) => {
+    if (!elements.projectSelect) {
       return;
     }
-    elements.templateSelect.innerHTML = '';
+    elements.projectSelect.innerHTML = '';
     const noneOption = document.createElement('option');
     noneOption.value = '';
-    noneOption.textContent = 'None';
-    elements.templateSelect.appendChild(noneOption);
+    noneOption.textContent = 'No project';
+    elements.projectSelect.appendChild(noneOption);
 
-    templates.forEach((template) => {
-      if (!template || !template.template_id) {
+    projects.forEach((project) => {
+      if (!project || !project.id) {
         return;
       }
       const option = document.createElement('option');
-      option.value = template.template_id;
-      const description = template.description ? ` — ${template.description}` : '';
-      option.textContent = `${template.template_id}${description}`;
-      elements.templateSelect.appendChild(option);
+      option.value = project.id;
+      const templateSuffix = project.template_id ? ` • ${project.template_id}` : '';
+      option.textContent = `${project.name}${templateSuffix}`;
+      elements.projectSelect.appendChild(option);
     });
   };
 
   const loadTemplates = async () => {
-    if (!elements.templateSelect) {
+    if (!elements.templateSelect && !elements.projectTemplateSelect) {
       return;
     }
     try {
@@ -579,6 +614,240 @@
       setTemplateOptions(templates);
     } catch (error) {
       setTemplateOptions([]);
+    }
+  };
+
+  const getAuthUserId = () => authUser?.id || authUser?.user_id || null;
+
+  const setProjectError = (message) => {
+    if (!elements.projectError) {
+      return;
+    }
+    const text = message ? String(message) : '';
+    elements.projectError.textContent = text;
+    elements.projectError.classList.toggle('hidden', !text);
+  };
+
+  const fetchProjects = async () => {
+    const userId = getAuthUserId();
+    if (!userId) {
+      setProjectError('Sign in to view projects.');
+      return [];
+    }
+    try {
+      const response = await apiFetch(buildApiUrl('/api/projects'));
+      if (response.status === 401 || response.status === 403) {
+        setProjectError('Sign in to view projects.');
+        return [];
+      }
+      if (!response.ok) {
+        throw new Error(`Projects unavailable (${response.status})`);
+      }
+      const data = await response.json();
+      setProjectError('');
+      return Array.isArray(data.projects) ? data.projects : [];
+    } catch (error) {
+      setProjectError(error?.message || 'Unable to load projects.');
+      return [];
+    }
+  };
+
+  const fetchTasksForUser = async () => {
+    const userId = getAuthUserId();
+    if (!userId) {
+      return [];
+    }
+    try {
+      const response = await apiFetch(buildApiUrl(`/api/users/${userId}/tasks?limit=50`));
+      if (response.status === 401 || response.status === 403) {
+        return [];
+      }
+      if (!response.ok) {
+        throw new Error(`Tasks unavailable (${response.status})`);
+      }
+      const data = await response.json();
+      return Array.isArray(data.tasks) ? data.tasks : [];
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const renderProjects = (projects, tasksByProject) => {
+    if (!elements.projectsList || !elements.projectsEmpty) {
+      return;
+    }
+    elements.projectsList.innerHTML = '';
+    elements.projectsEmpty.classList.toggle('hidden', projects.length > 0);
+    if (!projects.length) {
+      return;
+    }
+    projects.forEach((project) => {
+      const item = document.createElement('div');
+      item.className = 'task-history-item';
+
+      const info = document.createElement('div');
+      info.className = 'task-history-info';
+      const title = document.createElement('h4');
+      title.textContent = project.name || 'Untitled project';
+      const meta = document.createElement('div');
+      meta.className = 'task-history-meta';
+      const taskCount = tasksByProject.get(project.id)?.length || 0;
+      const templateLabel = project.template_id ? `Template: ${project.template_id}` : 'Template: none';
+      meta.textContent = `${templateLabel} • ${taskCount} task${taskCount === 1 ? '' : 's'} • ${formatShortDate(project.created_at)}`;
+
+      info.appendChild(title);
+      info.appendChild(meta);
+      item.appendChild(info);
+      elements.projectsList.appendChild(item);
+    });
+  };
+
+  const renderTasks = (tasks, projects) => {
+    if (!elements.tasksList || !elements.tasksEmpty) {
+      return;
+    }
+    elements.tasksList.innerHTML = '';
+    elements.tasksEmpty.classList.toggle('hidden', tasks.length > 0);
+    if (!tasks.length) {
+      return;
+    }
+
+    const projectNameById = new Map(projects.map((project) => [project.id, project.name]));
+    const grouped = tasks.reduce((acc, task) => {
+      const key = task.project_id || 'unassigned';
+      if (!acc.has(key)) {
+        acc.set(key, []);
+      }
+      acc.get(key).push(task);
+      return acc;
+    }, new Map());
+
+    grouped.forEach((groupTasks, projectId) => {
+      const header = document.createElement('h4');
+      header.textContent =
+        projectId === 'unassigned'
+          ? 'Unassigned'
+          : projectNameById.get(projectId) || 'Unknown project';
+      elements.tasksList.appendChild(header);
+
+      groupTasks.forEach((task) => {
+        const item = document.createElement('div');
+        item.className = 'task-history-item';
+
+        const info = document.createElement('div');
+        info.className = 'task-history-info';
+        const title = document.createElement('h4');
+        title.textContent = task.description || 'Untitled task';
+        const meta = document.createElement('div');
+        meta.className = 'task-history-meta';
+        const status = task.status || 'unknown';
+        meta.textContent = `${status} • ${formatShortDate(task.created_at || task.updated_at)}`;
+        info.appendChild(title);
+        info.appendChild(meta);
+
+        const actions = document.createElement('div');
+        actions.className = 'task-history-actions';
+        const openButton = document.createElement('button');
+        openButton.className = 'secondary-btn';
+        openButton.type = 'button';
+        openButton.textContent = 'Open';
+        openButton.addEventListener('click', () => {
+          if (!ensureAuthForAction()) {
+            return;
+          }
+          activateTask(task.id || task.task_id);
+        });
+        actions.appendChild(openButton);
+
+        item.appendChild(info);
+        item.appendChild(actions);
+        elements.tasksList.appendChild(item);
+      });
+    });
+  };
+
+  const refreshDashboard = async ({ silent = false } = {}) => {
+    if (!hasAuthCredentials()) {
+      if (!silent) {
+        showToast(missingAuthMessage, '⚠️');
+      }
+      cachedProjects = [];
+      cachedTasks = [];
+      projectLookup = new Map();
+      setProjectOptions([]);
+      renderProjects([], new Map());
+      renderTasks([], []);
+      return;
+    }
+    const [projects, tasks] = await Promise.all([fetchProjects(), fetchTasksForUser()]);
+    cachedProjects = projects;
+    cachedTasks = tasks;
+    projectLookup = new Map(projects.map((project) => [project.id, project]));
+    setProjectOptions(projects);
+    const tasksByProject = tasks.reduce((acc, task) => {
+      const key = task.project_id || 'unassigned';
+      if (!acc.has(key)) {
+        acc.set(key, []);
+      }
+      acc.get(key).push(task);
+      return acc;
+    }, new Map());
+    renderProjects(projects, tasksByProject);
+    renderTasks(tasks, projects);
+  };
+
+  const createProject = async () => {
+    const userId = getAuthUserId();
+    if (!userId) {
+      showToast('Please sign in to create projects.', '⚠️');
+      return;
+    }
+    const name = elements.projectNameInput?.value.trim();
+    if (!name) {
+      showToast('Please provide a project name.', '⚠️');
+      return;
+    }
+    const templateId = elements.projectTemplateSelect?.value?.trim();
+    const payload = { name };
+    if (templateId) {
+      payload.template_id = templateId;
+    }
+    try {
+      const response = await apiFetch(buildApiUrl('/api/projects'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'Sign in to create projects.'
+          : `Project creation failed (${response.status})`;
+        throw new Error(message);
+      }
+      await response.json();
+      if (elements.projectNameInput) {
+        elements.projectNameInput.value = '';
+      }
+      showToast('Project created.', '✅');
+      await refreshDashboard();
+    } catch (error) {
+      showToast(error?.message || 'Unable to create project.', '⚠️');
+    }
+  };
+
+  const applyProjectTemplate = () => {
+    if (!elements.projectSelect || !elements.templateSelect) {
+      return;
+    }
+    const projectId = elements.projectSelect.value;
+    if (!projectId) {
+      return;
+    }
+    const project = projectLookup.get(projectId);
+    if (project?.template_id) {
+      elements.templateSelect.value = project.template_id;
     }
   };
 
@@ -719,6 +988,7 @@
       }
       setAuthError('');
       showToast(successMessage, '✅');
+      refreshDashboard({ silent: true });
       return true;
     }
     throw new Error('No access token returned.');
@@ -779,6 +1049,7 @@
       setStoredAccessToken('', null);
       setAuthError('');
       showToast('Signed out.', 'ℹ️');
+      refreshDashboard({ silent: true });
     }
   };
 
@@ -2089,6 +2360,10 @@
     if (templateValue) {
       payload.template_id = templateValue;
     }
+    const projectValue = elements.projectSelect?.value?.trim();
+    if (projectValue) {
+      payload.project_id = projectValue;
+    }
     if (window.USER_ID) {
       payload.user_id = window.USER_ID;
     }
@@ -2300,7 +2575,16 @@
   if (elements.viewTasksBtn) {
     elements.viewTasksBtn.addEventListener('click', () => {
       showSection(elements.previousTasks);
+      refreshDashboard();
     });
+  }
+
+  if (elements.refreshDashboardBtn) {
+    elements.refreshDashboardBtn.addEventListener('click', refreshDashboard);
+  }
+
+  if (elements.createProjectBtn) {
+    elements.createProjectBtn.addEventListener('click', createProject);
   }
 
   if (elements.refreshProgressBtn) {
@@ -2317,6 +2601,10 @@
 
   if (elements.submitTaskBtn) {
     elements.submitTaskBtn.addEventListener('click', submitTask);
+  }
+
+  if (elements.projectSelect) {
+    elements.projectSelect.addEventListener('change', applyProjectTemplate);
   }
 
   if (elements.saveApiKeyBtn) {
@@ -2570,7 +2858,8 @@
   updateAccessTokenInputs(getStoredAccessToken());
   void fetchRuntimeConfig()
     .then(() => validateAuthSession())
-    .then(loadTemplates);
+    .then(loadTemplates)
+    .then(() => refreshDashboard({ silent: true }));
   setActiveInspectorTab(activeInspectorTab);
   updateTimeTakenDisplay({});
 })();
