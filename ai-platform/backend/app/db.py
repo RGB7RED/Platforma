@@ -53,6 +53,16 @@ async def init_db(database_url: str) -> None:
                 pending_questions JSONB NULL,
                 provided_answers JSONB NULL,
                 resume_from_stage TEXT NULL,
+                manual_step_enabled BOOLEAN NULL,
+                awaiting_manual_step BOOLEAN NULL,
+                manual_step_stage TEXT NULL,
+                manual_step_options JSONB NULL,
+                last_review_status TEXT NULL,
+                last_review_report_artifact_id TEXT NULL,
+                next_task_preview JSONB NULL,
+                resume_phase TEXT NULL,
+                resume_iteration INTEGER NULL,
+                resume_payload JSONB NULL,
                 result JSONB NULL,
                 container_state JSONB NULL,
                 error TEXT NULL,
@@ -90,10 +100,43 @@ async def init_db(database_url: str) -> None:
         await conn.execute(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_from_stage TEXT;"
         )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS manual_step_enabled BOOLEAN;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS awaiting_manual_step BOOLEAN;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS manual_step_stage TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS manual_step_options JSONB;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_review_status TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_review_report_artifact_id TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS next_task_preview JSONB;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_phase TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_iteration INTEGER;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS resume_payload JSONB;"
+        )
         await _ensure_jsonb_column(conn, table="tasks", column="result")
         await _ensure_jsonb_column(conn, table="tasks", column="container_state")
         await _ensure_jsonb_column(conn, table="tasks", column="pending_questions")
         await _ensure_jsonb_column(conn, table="tasks", column="provided_answers")
+        await _ensure_jsonb_column(conn, table="tasks", column="manual_step_options")
+        await _ensure_jsonb_column(conn, table="tasks", column="next_task_preview")
+        await _ensure_jsonb_column(conn, table="tasks", column="resume_payload")
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS api_rate_limits (
@@ -477,6 +520,7 @@ async def create_task_row(
     project_id: Optional[str],
     client_ip: Optional[str],
     owner_key_hash: str,
+    manual_step_enabled: bool,
 ) -> Dict[str, Any]:
     if _pool is None:
         raise RuntimeError("Database pool is not initialized")
@@ -497,9 +541,11 @@ async def create_task_row(
                 template_hash,
                 project_id,
                 client_ip,
-                owner_key_hash
+                owner_key_hash,
+                manual_step_enabled,
+                awaiting_manual_step
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             RETURNING *;
             """,
             _coerce_task_id(task_id),
@@ -515,6 +561,8 @@ async def create_task_row(
             _coerce_project_id(project_id) if project_id else None,
             client_ip,
             owner_key_hash,
+            manual_step_enabled,
+            False,
         )
     except Exception:
         _log_db_error(
@@ -628,23 +676,25 @@ async def add_artifact(
     type: str,
     payload: Optional[Dict[str, Any]] = None,
     produced_by: Optional[str] = None,
-) -> None:
+) -> Optional[str]:
     if _pool is None:
         logger.debug("Database not enabled; skipping add_artifact for task %s", task_id)
-        return
+        return None
 
     try:
+        artifact_id = uuid.uuid4()
         await _pool.execute(
             """
             INSERT INTO task_artifacts (id, task_id, type, payload_json, produced_by)
             VALUES ($1, $2, $3, $4::jsonb, $5);
             """,
-            uuid.uuid4(),
+            artifact_id,
             _coerce_task_id(task_id),
             type,
             _json_payload(payload),
             produced_by,
         )
+        return str(artifact_id)
     except Exception:
         _log_db_error(
             "add_artifact",
@@ -969,6 +1019,16 @@ async def update_task_row(task_id: str, fields: Dict[str, Any]) -> Optional[Dict
         "pending_questions",
         "provided_answers",
         "resume_from_stage",
+        "manual_step_enabled",
+        "awaiting_manual_step",
+        "manual_step_stage",
+        "manual_step_options",
+        "last_review_status",
+        "last_review_report_artifact_id",
+        "next_task_preview",
+        "resume_phase",
+        "resume_iteration",
+        "resume_payload",
         "error",
         "failure_reason",
         "completed_at",
@@ -980,7 +1040,15 @@ async def update_task_row(task_id: str, fields: Dict[str, Any]) -> Optional[Dict
 
     set_clauses = []
     values: List[Any] = []
-    json_fields = {"result", "container_state", "pending_questions", "provided_answers"}
+    json_fields = {
+        "result",
+        "container_state",
+        "pending_questions",
+        "provided_answers",
+        "manual_step_options",
+        "next_task_preview",
+        "resume_payload",
+    }
     for idx, (key, value) in enumerate(updates.items(), start=1):
         if key in json_fields:
             set_clauses.append(f"{key} = ${idx}::jsonb")
@@ -1015,6 +1083,9 @@ async def get_task_row(task_id: str) -> Optional[Dict[str, Any]]:
         data["container_state"] = _coerce_json_value(data.get("container_state"))
         data["pending_questions"] = _coerce_json_value(data.get("pending_questions"))
         data["provided_answers"] = _coerce_json_value(data.get("provided_answers"))
+        data["manual_step_options"] = _coerce_json_value(data.get("manual_step_options"))
+        data["next_task_preview"] = _coerce_json_value(data.get("next_task_preview"))
+        data["resume_payload"] = _coerce_json_value(data.get("resume_payload"))
     return data
 
 

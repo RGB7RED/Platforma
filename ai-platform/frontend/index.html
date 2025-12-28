@@ -285,6 +285,28 @@
                     </div>
                 </div>
 
+                <div class="task-form-card manual-step-panel hidden" id="manualStepPanel">
+                    <h3>Manual step required</h3>
+                    <p class="task-lookup-hint" id="manualStepMessage">
+                        The task is awaiting a manual next step decision.
+                    </p>
+                    <div class="status-row">
+                        <strong>Stage:</strong> <span id="manualStepStage">-</span>
+                    </div>
+                    <div class="status-row">
+                        <strong>Last review:</strong> <span id="manualStepReviewStatus">-</span>
+                    </div>
+                    <div class="status-row">
+                        <strong>Next task preview:</strong>
+                        <pre id="manualStepPreview">-</pre>
+                    </div>
+                    <div class="form-actions">
+                        <button class="primary-btn" id="nextStepBtn" type="button">
+                            Next step
+                        </button>
+                    </div>
+                </div>
+
                 <div class="container-inspector">
                     <div class="inspector-header">
                         <h3>Container Inspector</h3>

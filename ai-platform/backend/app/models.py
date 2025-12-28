@@ -57,6 +57,7 @@ class Container:
             "repro_manifest": [],
             "usage_report": [],
             "clarification_questions": [],
+            "next_actions": [],
         }
         
         # Уровень 3: История изменений

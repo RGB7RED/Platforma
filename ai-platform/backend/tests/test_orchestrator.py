@@ -135,6 +135,18 @@ class TestAIOrchestrator:
         assert orchestrator.container.state == ProjectState.ERROR
 
     @pytest.mark.asyncio
+    async def test_process_task_manual_gate_after_review(self, orchestrator, mock_agents, monkeypatch):
+        """Manual step should pause after iteration review when enabled."""
+        monkeypatch.setenv("MANUAL_STEP_ENABLED", "true")
+        orchestrator.initialize_project("Test")
+
+        result = await orchestrator.process_task("Create a test API")
+
+        assert result["status"] == "needs_input"
+        assert result["awaiting_manual_step"] is True
+        assert result["manual_step_stage"] == "post_iteration_review"
+
+    @pytest.mark.asyncio
     async def test_llm_invalid_json_retry_once(self, orchestrator, mock_agents, monkeypatch):
         """Неверный JSON от LLM приводит к контролируемому отказу после одной попытки"""
         orchestrator.initialize_project("Test")
