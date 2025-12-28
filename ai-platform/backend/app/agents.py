@@ -20,6 +20,7 @@ from typing import Dict, Any, Optional, List, Callable, Sequence
 from .models import Container
 from . import db
 from .llm import (
+    LLMOutputTruncatedError,
     LLMProviderError,
     generate_with_retry,
     get_llm_provider,
@@ -695,12 +696,46 @@ class AICoder(AIAgent):
                 settings,
                 require_json=True,
             )
+        except LLMOutputTruncatedError as exc:
+            if exc.usage:
+                tokens_in = int(exc.usage.get("input_tokens", 0) or 0)
+                tokens_out = int(exc.usage.get("output_tokens", 0) or 0)
+                container.record_llm_usage(
+                    stage="implementation",
+                    provider=provider.name,
+                    model=settings.model,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    metadata={
+                        "task_type": task_type,
+                        "task_description": task.get("description"),
+                        "finish_reason": exc.finish_reason,
+                    },
+                )
+            self._log_action("llm_failed", {"error": str(exc)})
+            raise
         except LLMProviderError as exc:
             self._log_action("llm_failed", {"error": str(exc)})
             raise
         request_finished_at = datetime.now().isoformat()
 
         response_text = response.get("text", "")
+        usage = response.get("usage", {}) or {}
+        tokens_in = int(usage.get("input_tokens", 0) or 0)
+        tokens_out = int(usage.get("output_tokens", 0) or 0)
+        finish_reason = response.get("finish_reason")
+        container.record_llm_usage(
+            stage="implementation",
+            provider=provider.name,
+            model=settings.model,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            metadata={
+                "task_type": task_type,
+                "task_description": task.get("description"),
+                "finish_reason": finish_reason,
+            },
+        )
         try:
             parsed = self._parse_llm_response(response_text)
         except LLMResponseParseError as exc:
@@ -714,6 +749,7 @@ class AICoder(AIAgent):
                     "truncated_raw": truncated_raw,
                     "raw_llm_output": truncated_raw,
                     "raw_llm_output_truncated": raw_truncated,
+                    "finish_reason": finish_reason,
                 },
                 self.role_name,
             )
@@ -772,18 +808,6 @@ class AICoder(AIAgent):
                 "code_summary": f"Updated files: {', '.join(written_files)}",
             }
 
-        usage = response.get("usage", {}) or {}
-        tokens_in = int(usage.get("input_tokens", 0) or 0)
-        tokens_out = int(usage.get("output_tokens", 0) or 0)
-        container.record_llm_usage(
-            stage="implementation",
-            provider=provider.name,
-            model=settings.model,
-            tokens_in=tokens_in,
-            tokens_out=tokens_out,
-            metadata={"task_type": task_type},
-        )
-
         usage_report = {
             "stage": "implementation",
             "provider": provider.name,
@@ -794,6 +818,7 @@ class AICoder(AIAgent):
             "started_at": request_started_at,
             "finished_at": request_finished_at,
             "task": task.get("description"),
+            "finish_reason": finish_reason,
         }
         container.add_artifact("usage_report", usage_report, self.role_name)
         artifact_type = "implementation_plan" if "implementation_plan" in artifacts else "code_summary"

@@ -158,6 +158,14 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Optional
 - **Notes:** Defaults to 1024.
 
+### LLM_RESPONSE_FORMAT
+- **Purpose:** Controls OpenAI JSON enforcement mode.
+- **Example:** `LLM_RESPONSE_FORMAT=json_object` or `LLM_RESPONSE_FORMAT=json_schema`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `json_object`. When set to `json_schema`, the provider sends structured
+  outputs JSON schema (recommended for models that support Structured Outputs such as
+  `gpt-4o-mini` or `gpt-4o-2024-08-06`).
+
 ### LLM_TIMEOUT_SECONDS
 - **Purpose:** Hard timeout for provider requests.
 - **Example:** `LLM_TIMEOUT_SECONDS=30`
@@ -181,6 +189,12 @@ Open `http://localhost` in your browser.
 - **Example:** `LLM_MAX_RETRIES_PER_STEP=1`
 - **Required in production?:** Optional
 - **Notes:** Defaults to 1. Applies to JSON parsing retries.
+
+### LLM_MAX_TOTAL_TOKENS_PER_TASK
+- **Purpose:** Max total LLM tokens per task (input + output) to prevent runaway usage.
+- **Example:** `LLM_MAX_TOTAL_TOKENS_PER_TASK=5000`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 5000. When exceeded, tasks fail fast with `llm_budget_exceeded`.
 
 ### APP_API_KEY
 - **Purpose:** Require an API key for all task endpoints (including rerun review).

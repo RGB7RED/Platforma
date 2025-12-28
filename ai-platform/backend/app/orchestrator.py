@@ -23,7 +23,7 @@ from .agents import (
     BudgetExceededError,
     LLMResponseParseError,
 )
-from .llm import LLMProviderError
+from .llm import LLMOutputTruncatedError, LLMProviderError
 
 
 configure_logging()
@@ -161,6 +161,18 @@ class AIOrchestrator:
             return int(value)
         except ValueError:
             return default
+
+    def _get_task_token_usage(self, task_description: Optional[str]) -> int:
+        if not task_description:
+            return 0
+        usage_entries = self.container.metadata.get("llm_usage", [])
+        total_tokens = 0
+        for entry in usage_entries:
+            metadata = entry.get("metadata") or {}
+            if metadata.get("task_description") != task_description:
+                continue
+            total_tokens += int(entry.get("total_tokens", 0) or 0)
+        return total_tokens
 
     def _plan_clarification_questions(
         self,
@@ -419,6 +431,41 @@ class AIOrchestrator:
                     retries_used = 0
                     for attempt in range(max_retries_per_step + 1):
                         try:
+                            max_tokens_per_task = self._get_int_env(
+                                "LLM_MAX_TOTAL_TOKENS_PER_TASK",
+                                5000,
+                            )
+                            if max_tokens_per_task > 0:
+                                used_tokens = self._get_task_token_usage(
+                                    next_task.get("description")
+                                )
+                                if used_tokens >= max_tokens_per_task:
+                                    await self._run_hook(
+                                        callbacks.get("stage_failed") if callbacks else None,
+                                        {
+                                            "stage": "implementation",
+                                            "reason": "llm_budget_exceeded",
+                                            "error": "llm_budget_exceeded",
+                                        },
+                                    )
+                                    self.container.update_state(
+                                        ProjectState.ERROR,
+                                        "llm_budget_exceeded",
+                                    )
+                                    return {
+                                        "status": "failed",
+                                        "container_id": self.container.project_id,
+                                        "state": self.container.state.value,
+                                        "progress": self.container.progress,
+                                        "files_count": len(self.container.files),
+                                        "artifacts_count": sum(
+                                            len(a) for a in self.container.artifacts.values()
+                                        ),
+                                        "iterations": iteration,
+                                        "max_iterations": max_iterations,
+                                        "history": self.task_history[-5:],
+                                        "failure_reason": "llm_budget_exceeded",
+                                    }
                             if (
                                 max_llm_calls > 0
                                 and self.container.metadata.get("llm_calls", 0) >= max_llm_calls
@@ -519,6 +566,33 @@ class AIOrchestrator:
                                 "max_iterations": max_iterations,
                                 "history": self.task_history[-5:],
                                 "failure_reason": "quota_exceeded",
+                            }
+                        except LLMOutputTruncatedError as exc:
+                            await self._run_hook(
+                                callbacks.get("stage_failed") if callbacks else None,
+                                {
+                                    "stage": "implementation",
+                                    "reason": "llm_output_truncated",
+                                    "error": str(exc),
+                                },
+                            )
+                            self.container.update_state(
+                                ProjectState.ERROR,
+                                "llm_output_truncated",
+                            )
+                            return {
+                                "status": "failed",
+                                "container_id": self.container.project_id,
+                                "state": self.container.state.value,
+                                "progress": self.container.progress,
+                                "files_count": len(self.container.files),
+                                "artifacts_count": sum(
+                                    len(a) for a in self.container.artifacts.values()
+                                ),
+                                "iterations": iteration,
+                                "max_iterations": max_iterations,
+                                "history": self.task_history[-5:],
+                                "failure_reason": "llm_output_truncated",
                             }
                         except LLMProviderError as exc:
                             await self._run_hook(
