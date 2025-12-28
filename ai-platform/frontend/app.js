@@ -1,12 +1,40 @@
 (() => {
+  const railwayHostPattern = /^[^/]+\.up\.railway\.app(?:\/|$)/i;
+  const normalizeApiBaseUrl = (value) => {
+    if (typeof value !== 'string') {
+      return '';
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return '';
+    }
+    if (trimmed.toLowerCase().startsWith('http://')) {
+      return `https://${trimmed.slice(7)}`;
+    }
+    if (railwayHostPattern.test(trimmed) && !/^[a-z]+:\/\//i.test(trimmed)) {
+      return `https://${trimmed}`;
+    }
+    return trimmed;
+  };
+  const isMixedContentUrl = (value) =>
+    typeof value === 'string' &&
+    window.location.protocol === 'https:' &&
+    value.toLowerCase().startsWith('http://');
+  const formatNetworkError = (url) => {
+    if (isMixedContentUrl(url)) {
+      return 'network_error: API_BASE_URL must be HTTPS';
+    }
+    return 'network_error: Unable to reach the API.';
+  };
+
   const resolveApiBaseUrl = () => {
     const configValue = window.__APP_CONFIG__?.API_BASE_URL;
     if (typeof configValue === 'string' && configValue.trim()) {
-      return configValue.trim();
+      return normalizeApiBaseUrl(configValue);
     }
     const metaValue = document.querySelector('meta[name="api-base-url"]')?.content;
     if (typeof metaValue === 'string' && metaValue.trim()) {
-      return metaValue.trim();
+      return normalizeApiBaseUrl(metaValue);
     }
     return '';
   };
@@ -41,7 +69,7 @@
   };
 
   const runtimeConfig = {
-    apiBaseUrl: resolveApiBaseUrl(),
+    apiBaseUrl: normalizeApiBaseUrl(resolveApiBaseUrl()),
     wsBaseUrl: '',
     authMode: normalizeAuthMode(resolveAuthMode()),
     googleOAuthEnabled: false
@@ -486,10 +514,11 @@
       }
       const data = await response.json();
       runtimeConfig.authMode = normalizeAuthMode(data?.auth_mode || runtimeConfig.authMode);
-      runtimeConfig.apiBaseUrl =
+      runtimeConfig.apiBaseUrl = normalizeApiBaseUrl(
         typeof data?.api_base_url === 'string' && data.api_base_url.trim()
           ? data.api_base_url.trim()
-          : runtimeConfig.apiBaseUrl;
+          : runtimeConfig.apiBaseUrl
+      );
       runtimeConfig.wsBaseUrl =
         typeof data?.ws_base_url === 'string' && data.ws_base_url.trim()
           ? data.ws_base_url.trim()
@@ -614,11 +643,19 @@
     const accessToken = getStoredAccessToken();
     const apiKey = getStoredApiKey();
     const shouldIncludeCredentials = isAuthEnabled();
-    const response = await fetch(url, {
-      ...rest,
-      headers,
-      credentials: shouldIncludeCredentials ? 'include' : rest.credentials
-    });
+    if (isMixedContentUrl(url)) {
+      throw new Error(formatNetworkError(url));
+    }
+    let response;
+    try {
+      response = await fetch(url, {
+        ...rest,
+        headers,
+        credentials: shouldIncludeCredentials ? 'include' : rest.credentials
+      });
+    } catch (error) {
+      throw new Error(formatNetworkError(url));
+    }
     if (
       response.status === 401 &&
       retryOnUnauthorized &&
@@ -643,18 +680,20 @@
   };
 
   const parseAuthError = async (response) => {
-    let message =
-      response.status === 401
-        ? 'Invalid credentials.'
-        : `Request failed (${response.status})`;
+    let message = `http_error (${response.status})`;
+    let hasDetail = false;
     try {
       const data = await response.json();
       const detail = data?.detail || data?.error || data?.message;
       if (detail) {
-        message = String(detail);
+        message = `http_error (${response.status}): ${detail}`;
+        hasDetail = true;
       }
     } catch (error) {
       // Ignore parse errors.
+    }
+    if (response.status === 401 && !hasDetail) {
+      message = `http_error (${response.status}): Invalid credentials.`;
     }
     return message;
   };
@@ -756,7 +795,7 @@
       }
       setAuthError(`Session validation failed (${response.status}).`);
     } catch (error) {
-      setAuthError('Unable to validate session.');
+      setAuthError(error?.message || 'network_error: Unable to validate session.');
     }
   };
 
