@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import base64
 import uuid
 import json
 import asyncio
@@ -31,6 +32,9 @@ import subprocess
 import sys
 import time
 from urllib.parse import urlparse
+import re
+
+import httpx
 
 from .models import Container, ProjectState
 from .orchestrator import AIOrchestrator
@@ -90,11 +94,26 @@ class ProjectResponse(BaseModel):
     id: str
     name: str
     template_id: Optional[str] = None
+    repo_full_name: Optional[str] = None
+    default_branch: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
 class FileContentRequest(BaseModel):
     filepath: str
+
+
+class GitHubConnectRequest(BaseModel):
+    repo_full_name: str
+    access_token: str
+    default_branch: Optional[str] = None
+
+
+class CreatePullRequestRequest(BaseModel):
+    title: Optional[str] = None
+    body: Optional[str] = None
+    branch_name: Optional[str] = None
+    draft: Optional[bool] = False
 
 # Глобальное хранилище (в продакшене заменить на Redis/БД)
 class Storage:
@@ -106,6 +125,7 @@ class Storage:
         self.artifacts: Dict[str, List[Dict[str, Any]]] = {}
         self.state: Dict[str, Dict[str, Any]] = {}
         self.projects: Dict[str, Dict[str, Any]] = {}
+        self.oauth_accounts: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
 storage = Storage()
 database_url = os.getenv("DATABASE_URL")
@@ -761,6 +781,90 @@ def normalize_project_row(project: Dict[str, Any]) -> Dict[str, Any]:
     if project_id is not None:
         data["id"] = str(project_id)
     return data
+
+
+def parse_repo_full_name(repo_full_name: str) -> tuple[str, str]:
+    normalized = repo_full_name.strip()
+    if not normalized or "/" not in normalized:
+        raise HTTPException(status_code=400, detail="Invalid repo_full_name")
+    owner, repo = normalized.split("/", 1)
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="Invalid repo_full_name")
+    return owner, repo
+
+
+def sanitize_branch_name(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug or "ai-platform-task"
+
+
+async def github_api_request(
+    *,
+    method: str,
+    url: str,
+    token: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.request(method, url, headers=headers, json=payload)
+    if response.status_code >= 400:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "github_api_error", "message": detail},
+        )
+    if response.status_code == 204:
+        return {}
+    return response.json()
+
+
+def build_pr_body(
+    *,
+    task_id: str,
+    task_data: Dict[str, Any],
+    patch_payload: Dict[str, Any],
+    api_base_url: str,
+    artifacts: List[Dict[str, Any]],
+) -> str:
+    stats = patch_payload.get("stats") or {}
+    description = (task_data.get("description") or "").strip()
+    lines = [
+        "## Summary",
+        description or f"Automated changes for task {task_id}",
+        "",
+        "## Patch Stats",
+        f"- Changed files: {stats.get('changed_total', 0)}",
+        f"- Added: {stats.get('added', 0)}",
+        f"- Modified: {stats.get('modified', 0)}",
+        f"- Removed: {stats.get('removed', 0)}",
+        f"- Diff lines: {stats.get('diff_lines', 0)}",
+        "",
+        "## Artifacts",
+    ]
+    if artifacts:
+        for artifact in artifacts:
+            artifact_type = artifact.get("type") or "artifact"
+            lines.append(
+                f"- {artifact_type}: {api_base_url}/api/tasks/{task_id}/artifacts?type={artifact_type}"
+            )
+    else:
+        lines.append(f"- Artifacts: {api_base_url}/api/tasks/{task_id}/artifacts")
+    lines.extend(
+        [
+            f"- Patch diff: {api_base_url}/api/tasks/{task_id}/artifacts?type=patch_diff",
+            f"- Git export: {api_base_url}/api/tasks/{task_id}/git-export.zip",
+        ]
+    )
+    return "\n".join(lines)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -2239,6 +2343,76 @@ async def get_project(project_id: str, req: Request):
     return normalize_project_row(project)
 
 
+@app.post("/api/projects/{project_id}/connect-github", response_model=ProjectResponse)
+async def connect_github_project(project_id: str, payload: GitHubConnectRequest, req: Request):
+    auth_context, owner_user_id = await require_user_auth(req)
+    repo_full_name = payload.repo_full_name.strip()
+    access_token = payload.access_token.strip()
+    if not repo_full_name:
+        raise HTTPException(status_code=400, detail="repo_full_name is required")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="access_token is required")
+
+    if db.is_enabled():
+        project = await db.get_project_row(project_id, owner_user_id)
+    else:
+        project = storage.projects.get(project_id)
+        if project and project.get("owner_user_id") != owner_user_id:
+            project = None
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    owner, repo = parse_repo_full_name(repo_full_name)
+    github_user = await github_api_request(
+        method="GET",
+        url="https://api.github.com/user",
+        token=access_token,
+    )
+    github_user_id = github_user.get("id")
+    if not github_user_id:
+        raise HTTPException(status_code=400, detail="Unable to resolve GitHub user id")
+    repo_info = await github_api_request(
+        method="GET",
+        url=f"https://api.github.com/repos/{owner}/{repo}",
+        token=access_token,
+    )
+    default_branch = (payload.default_branch or repo_info.get("default_branch") or "").strip()
+    if not default_branch:
+        raise HTTPException(status_code=400, detail="default_branch is required")
+
+    if db.is_enabled():
+        project = await db.update_project_repo_settings(
+            project_id=project_id,
+            owner_user_id=owner_user_id,
+            repo_full_name=repo_full_name,
+            default_branch=default_branch,
+        )
+        await db.upsert_oauth_account(
+            provider="github",
+            provider_account_id=str(github_user_id),
+            user_id=owner_user_id,
+            email=github_user.get("email"),
+            access_token=access_token,
+            token_type="bearer",
+            scopes="repo",
+        )
+    else:
+        project = dict(project)
+        project["repo_full_name"] = repo_full_name
+        project["default_branch"] = default_branch
+        project["updated_at"] = db.now_utc()
+        storage.projects[project_id] = project
+        storage.oauth_accounts.setdefault(owner_user_id, {})["github"] = {
+            "provider": "github",
+            "provider_account_id": str(github_user_id),
+            "email": github_user.get("email"),
+            "access_token": access_token,
+            "token_type": "bearer",
+        }
+
+    return normalize_project_row(project)
+
+
 @app.get("/api/projects/{project_id}/tasks")
 async def list_project_tasks(project_id: str, req: Request):
     _, owner_user_id = await require_user_auth(req)
@@ -2401,6 +2575,177 @@ async def get_task_status(task_id: str, request: Request):
         if db.is_enabled():
             await resolve_container_with_db(task_id)
         return enrich_task_data(task_id, task_data)
+    finally:
+        reset_task_id(task_token)
+
+
+@app.post("/api/tasks/{task_id}/create-pr")
+async def create_pull_request(task_id: str, payload: CreatePullRequestRequest, request: Request):
+    task_token = set_task_id(task_id)
+    try:
+        auth_context, owner_user_id = await require_user_auth(request)
+        task_data = await ensure_task_owner(task_id, request)
+        if str(task_data.get("status")).lower() != "completed":
+            raise HTTPException(status_code=400, detail="Task must be completed before creating a PR")
+
+        project_id = task_data.get("project_id")
+        if not project_id:
+            raise HTTPException(status_code=400, detail="Task is not linked to a project")
+
+        if db.is_enabled():
+            project = await db.get_project_row(str(project_id), owner_user_id)
+        else:
+            project = storage.projects.get(str(project_id))
+            if project and project.get("owner_user_id") != owner_user_id:
+                project = None
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        repo_full_name = project.get("repo_full_name") or ""
+        default_branch = project.get("default_branch") or ""
+        if not repo_full_name or not default_branch:
+            raise HTTPException(status_code=400, detail="Project GitHub settings are not configured")
+
+        if db.is_enabled():
+            oauth_account = await db.get_oauth_account_for_user(provider="github", user_id=owner_user_id)
+        else:
+            oauth_account = storage.oauth_accounts.get(owner_user_id, {}).get("github")
+        access_token = oauth_account.get("access_token") if oauth_account else None
+        if not access_token:
+            raise HTTPException(status_code=400, detail="GitHub access token not found for user")
+
+        container = await resolve_container_with_db(task_id)
+        if not container:
+            raise HTTPException(status_code=404, detail="Container not found")
+        patch_payload = await resolve_patch_payload(task_id, container)
+        changed_files = patch_payload.get("changed_files") or []
+        if not changed_files:
+            raise HTTPException(status_code=400, detail="No changes detected for task")
+
+        binary_files = [item.get("path") for item in changed_files if item.get("is_binary")]
+        if binary_files:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "binary_files_detected", "files": binary_files},
+            )
+
+        missing_files: List[str] = []
+        tree_entries: List[Dict[str, Any]] = []
+        for change in changed_files:
+            path = change.get("path")
+            change_type = change.get("change_type")
+            if not path:
+                continue
+            if change_type == "removed":
+                tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
+                continue
+            content = container.files.get(path)
+            if content is None:
+                missing_files.append(path)
+                continue
+            if isinstance(content, (bytes, bytearray)):
+                encoded = base64.b64encode(bytes(content)).decode("utf-8")
+                blob = await github_api_request(
+                    method="POST",
+                    url=f"https://api.github.com/repos/{repo_full_name}/git/blobs",
+                    token=access_token,
+                    payload={"content": encoded, "encoding": "base64"},
+                )
+                tree_entries.append(
+                    {"path": path, "mode": "100644", "type": "blob", "sha": blob.get("sha")}
+                )
+            else:
+                tree_entries.append(
+                    {"path": path, "mode": "100644", "type": "blob", "content": str(content)}
+                )
+
+        if missing_files:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "missing_files", "files": missing_files},
+            )
+
+        owner, repo = parse_repo_full_name(repo_full_name)
+        base_ref = await github_api_request(
+            method="GET",
+            url=f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}",
+            token=access_token,
+        )
+        base_sha = base_ref.get("object", {}).get("sha")
+        if not base_sha:
+            raise HTTPException(status_code=400, detail="Unable to resolve base branch SHA")
+        base_commit = await github_api_request(
+            method="GET",
+            url=f"https://api.github.com/repos/{owner}/{repo}/git/commits/{base_sha}",
+            token=access_token,
+        )
+        base_tree_sha = base_commit.get("tree", {}).get("sha")
+        if not base_tree_sha:
+            raise HTTPException(status_code=400, detail="Unable to resolve base tree SHA")
+        new_tree = await github_api_request(
+            method="POST",
+            url=f"https://api.github.com/repos/{owner}/{repo}/git/trees",
+            token=access_token,
+            payload={"base_tree": base_tree_sha, "tree": tree_entries},
+        )
+        tree_sha = new_tree.get("sha")
+        if not tree_sha:
+            raise HTTPException(status_code=400, detail="Unable to create git tree")
+
+        description = (task_data.get("description") or "").strip()
+        title = (payload.title or description or f"AI Platform task {task_id}").strip()
+        if len(title) > 120:
+            title = title[:117].rstrip() + "..."
+
+        commit = await github_api_request(
+            method="POST",
+            url=f"https://api.github.com/repos/{owner}/{repo}/git/commits",
+            token=access_token,
+            payload={"message": title, "tree": tree_sha, "parents": [base_sha]},
+        )
+        commit_sha = commit.get("sha")
+        if not commit_sha:
+            raise HTTPException(status_code=400, detail="Unable to create commit")
+
+        branch_name = payload.branch_name or f"ai-platform/task-{task_id}"
+        branch_name = sanitize_branch_name(branch_name)
+        await github_api_request(
+            method="POST",
+            url=f"https://api.github.com/repos/{owner}/{repo}/git/refs",
+            token=access_token,
+            payload={"ref": f"refs/heads/{branch_name}", "sha": commit_sha},
+        )
+
+        api_base_url, _ = build_base_urls(request)
+        if db.is_enabled():
+            artifacts = await db.get_artifacts(task_id, type=None, limit=50, order="desc")
+        else:
+            artifacts = get_in_memory_artifacts(task_id, None, 50, "desc")
+        pr_body = payload.body or build_pr_body(
+            task_id=task_id,
+            task_data=task_data,
+            patch_payload=patch_payload,
+            api_base_url=api_base_url,
+            artifacts=artifacts,
+        )
+
+        pull_request = await github_api_request(
+            method="POST",
+            url=f"https://api.github.com/repos/{owner}/{repo}/pulls",
+            token=access_token,
+            payload={
+                "title": title,
+                "head": branch_name,
+                "base": default_branch,
+                "body": pr_body,
+                "draft": bool(payload.draft),
+            },
+        )
+        return {
+            "pull_request_url": pull_request.get("html_url"),
+            "pull_request_number": pull_request.get("number"),
+            "branch": branch_name,
+            "repo_full_name": repo_full_name,
+        }
     finally:
         reset_task_id(task_token)
 

@@ -448,6 +448,9 @@
                         <button class="secondary-btn copy-project-btn" id="copyProjectBtn" disabled>
                             📋 Copy to Clipboard (Coming soon)
                         </button>
+                        <button class="primary-btn download-zip-btn" id="createPrBtn" disabled>
+                            🚀 Create PR
+                        </button>
                     </div>
                     <div class="download-info">
                         <p>The ZIP file contains all generated files with proper structure.</p>
@@ -493,6 +496,31 @@
                     </button>
                 </div>
                 <div class="task-lookup-hint error-message hidden" id="projectError"></div>
+
+                <div class="task-lookup-actions github-connect">
+                    <select id="githubProjectSelect" class="task-priority-select">
+                        <option value="">Select project</option>
+                    </select>
+                    <input
+                        type="text"
+                        id="githubRepoInput"
+                        class="task-id-input"
+                        placeholder="GitHub repo (owner/name)">
+                    <input
+                        type="text"
+                        id="githubDefaultBranchInput"
+                        class="task-id-input"
+                        placeholder="Default branch (optional)">
+                    <input
+                        type="password"
+                        id="githubTokenInput"
+                        class="task-id-input"
+                        placeholder="GitHub access token">
+                    <button class="secondary-btn" id="connectGithubBtn">
+                        Connect GitHub
+                    </button>
+                </div>
+                <div class="task-lookup-hint hidden" id="githubConnectStatus"></div>
 
                 <div class="tasks-list" id="projectsList">
                     <!-- Projects will be added here -->

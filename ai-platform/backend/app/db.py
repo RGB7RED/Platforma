@@ -145,10 +145,18 @@ async def init_db(database_url: str) -> None:
                 owner_user_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 template_id TEXT NULL,
+                repo_full_name TEXT NULL,
+                default_branch TEXT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
+        )
+        await conn.execute(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS repo_full_name TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS default_branch TEXT;"
         )
         await conn.execute(
             """
@@ -227,12 +235,32 @@ async def init_db(database_url: str) -> None:
                 provider TEXT NOT NULL,
                 provider_account_id TEXT NOT NULL,
                 email TEXT NULL,
+                access_token TEXT NULL,
+                refresh_token TEXT NULL,
+                token_type TEXT NULL,
+                scopes TEXT NULL,
+                expires_at TIMESTAMPTZ NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE (provider, provider_account_id),
                 UNIQUE (user_id, provider)
             );
             """
+        )
+        await conn.execute(
+            "ALTER TABLE auth_oauth_accounts ADD COLUMN IF NOT EXISTS access_token TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE auth_oauth_accounts ADD COLUMN IF NOT EXISTS refresh_token TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE auth_oauth_accounts ADD COLUMN IF NOT EXISTS token_type TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE auth_oauth_accounts ADD COLUMN IF NOT EXISTS scopes TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE auth_oauth_accounts ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;"
         )
         await conn.execute(
             """
@@ -519,15 +547,19 @@ async def create_project_row(
                 id,
                 owner_user_id,
                 name,
-                template_id
+                template_id,
+                repo_full_name,
+                default_branch
             )
-            VALUES ($1, $2, $3, $4)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *;
             """,
             _coerce_project_id(project_id),
             owner_user_id,
             name,
             template_id,
+            None,
+            None,
         )
     except Exception:
         _log_db_error(
@@ -539,6 +571,32 @@ async def create_project_row(
         )
         raise
     return _row_to_dict(row) or {}
+
+
+async def update_project_repo_settings(
+    *,
+    project_id: str,
+    owner_user_id: str,
+    repo_full_name: str,
+    default_branch: str,
+) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    row = await _pool.fetchrow(
+        """
+        UPDATE projects
+        SET repo_full_name = $3,
+            default_branch = $4,
+            updated_at = NOW()
+        WHERE id = $1 AND owner_user_id = $2
+        RETURNING *;
+        """,
+        _coerce_project_id(project_id),
+        owner_user_id,
+        repo_full_name,
+        default_branch,
+    )
+    return _row_to_dict(row)
 
 
 async def append_event(task_id: str, type: str, payload: Optional[Dict[str, Any]] = None) -> None:
@@ -1557,7 +1615,19 @@ async def get_oauth_account(
         raise RuntimeError("Database pool is not initialized")
     row = await _pool.fetchrow(
         """
-        SELECT id, user_id, provider, provider_account_id, email, created_at, updated_at
+        SELECT
+            id,
+            user_id,
+            provider,
+            provider_account_id,
+            email,
+            access_token,
+            refresh_token,
+            token_type,
+            scopes,
+            expires_at,
+            created_at,
+            updated_at
         FROM auth_oauth_accounts
         WHERE provider = $1 AND provider_account_id = $2;
         """,
@@ -1573,6 +1643,11 @@ async def upsert_oauth_account(
     provider_account_id: str,
     user_id: str,
     email: Optional[str],
+    access_token: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+    token_type: Optional[str] = None,
+    scopes: Optional[str] = None,
+    expires_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     if _pool is None:
         raise RuntimeError("Database pool is not initialized")
@@ -1583,23 +1658,81 @@ async def upsert_oauth_account(
             user_id,
             provider,
             provider_account_id,
-            email
+            email,
+            access_token,
+            refresh_token,
+            token_type,
+            scopes,
+            expires_at
         )
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (provider, provider_account_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (user_id, provider)
         DO UPDATE SET
-            user_id = EXCLUDED.user_id,
+            provider_account_id = EXCLUDED.provider_account_id,
             email = EXCLUDED.email,
+            access_token = EXCLUDED.access_token,
+            refresh_token = EXCLUDED.refresh_token,
+            token_type = EXCLUDED.token_type,
+            scopes = EXCLUDED.scopes,
+            expires_at = EXCLUDED.expires_at,
             updated_at = NOW()
-        RETURNING id, user_id, provider, provider_account_id, email, created_at, updated_at;
+        RETURNING
+            id,
+            user_id,
+            provider,
+            provider_account_id,
+            email,
+            access_token,
+            refresh_token,
+            token_type,
+            scopes,
+            expires_at,
+            created_at,
+            updated_at;
         """,
         uuid.uuid4(),
         _coerce_user_id(user_id),
         provider,
         provider_account_id,
         email,
+        access_token,
+        refresh_token,
+        token_type,
+        scopes,
+        expires_at,
     )
     return _row_to_dict(row) or {}
+
+
+async def get_oauth_account_for_user(
+    *,
+    provider: str,
+    user_id: str,
+) -> Optional[Dict[str, Any]]:
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    row = await _pool.fetchrow(
+        """
+        SELECT
+            id,
+            user_id,
+            provider,
+            provider_account_id,
+            email,
+            access_token,
+            refresh_token,
+            token_type,
+            scopes,
+            expires_at,
+            created_at,
+            updated_at
+        FROM auth_oauth_accounts
+        WHERE provider = $1 AND user_id = $2;
+        """,
+        provider,
+        _coerce_user_id(user_id),
+    )
+    return _row_to_dict(row)
 
 
 async def create_refresh_session(

@@ -302,6 +302,11 @@ body {
     gap: 12px;
 }
 
+.task-lookup-actions.github-connect {
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    align-items: center;
+}
+
 .auth-login-actions {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
 }

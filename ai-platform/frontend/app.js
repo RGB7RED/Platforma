@@ -232,12 +232,19 @@
     projectNameInput: document.getElementById('projectNameInput'),
     projectTemplateSelect: document.getElementById('projectTemplateSelect'),
     createProjectBtn: document.getElementById('createProjectBtn'),
+    githubProjectSelect: document.getElementById('githubProjectSelect'),
+    githubRepoInput: document.getElementById('githubRepoInput'),
+    githubDefaultBranchInput: document.getElementById('githubDefaultBranchInput'),
+    githubTokenInput: document.getElementById('githubTokenInput'),
+    connectGithubBtn: document.getElementById('connectGithubBtn'),
+    githubConnectStatus: document.getElementById('githubConnectStatus'),
     refreshDashboardBtn: document.getElementById('refreshDashboardBtn'),
     projectsList: document.getElementById('projectsList'),
     projectsEmpty: document.getElementById('projectsEmpty'),
     projectError: document.getElementById('projectError'),
     tasksList: document.getElementById('tasksList'),
-    tasksEmpty: document.getElementById('tasksEmpty')
+    tasksEmpty: document.getElementById('tasksEmpty'),
+    createPrBtn: document.getElementById('createPrBtn')
   };
 
   let currentTaskId = null;
@@ -571,25 +578,43 @@
   };
 
   const setProjectOptions = (projects) => {
-    if (!elements.projectSelect) {
+    if (!elements.projectSelect && !elements.githubProjectSelect) {
       return;
     }
-    elements.projectSelect.innerHTML = '';
-    const noneOption = document.createElement('option');
-    noneOption.value = '';
-    noneOption.textContent = 'No project';
-    elements.projectSelect.appendChild(noneOption);
+    if (elements.projectSelect) {
+      elements.projectSelect.innerHTML = '';
+      const noneOption = document.createElement('option');
+      noneOption.value = '';
+      noneOption.textContent = 'No project';
+      elements.projectSelect.appendChild(noneOption);
 
-    projects.forEach((project) => {
-      if (!project || !project.id) {
-        return;
-      }
-      const option = document.createElement('option');
-      option.value = project.id;
-      const templateSuffix = project.template_id ? ` • ${project.template_id}` : '';
-      option.textContent = `${project.name}${templateSuffix}`;
-      elements.projectSelect.appendChild(option);
-    });
+      projects.forEach((project) => {
+        if (!project || !project.id) {
+          return;
+        }
+        const option = document.createElement('option');
+        option.value = project.id;
+        const templateSuffix = project.template_id ? ` • ${project.template_id}` : '';
+        option.textContent = `${project.name}${templateSuffix}`;
+        elements.projectSelect.appendChild(option);
+      });
+    }
+    if (elements.githubProjectSelect) {
+      elements.githubProjectSelect.innerHTML = '';
+      const noneOption = document.createElement('option');
+      noneOption.value = '';
+      noneOption.textContent = 'Select project';
+      elements.githubProjectSelect.appendChild(noneOption);
+      projects.forEach((project) => {
+        if (!project || !project.id) {
+          return;
+        }
+        const option = document.createElement('option');
+        option.value = project.id;
+        option.textContent = project.name || 'Untitled project';
+        elements.githubProjectSelect.appendChild(option);
+      });
+    }
   };
 
   const loadTemplates = async () => {
@@ -626,6 +651,16 @@
     const text = message ? String(message) : '';
     elements.projectError.textContent = text;
     elements.projectError.classList.toggle('hidden', !text);
+  };
+
+  const setGithubConnectStatus = (message, tone = '') => {
+    if (!elements.githubConnectStatus) {
+      return;
+    }
+    const text = message ? String(message) : '';
+    elements.githubConnectStatus.textContent = text;
+    elements.githubConnectStatus.classList.toggle('hidden', !text);
+    elements.githubConnectStatus.classList.toggle('error-message', tone === 'error');
   };
 
   const fetchProjects = async () => {
@@ -693,7 +728,10 @@
       meta.className = 'task-history-meta';
       const taskCount = tasksByProject.get(project.id)?.length || 0;
       const templateLabel = project.template_id ? `Template: ${project.template_id}` : 'Template: none';
-      meta.textContent = `${templateLabel} • ${taskCount} task${taskCount === 1 ? '' : 's'} • ${formatShortDate(project.created_at)}`;
+      const repoLabel = project.repo_full_name
+        ? `Repo: ${project.repo_full_name}${project.default_branch ? ` (${project.default_branch})` : ''}`
+        : 'Repo: not connected';
+      meta.textContent = `${templateLabel} • ${repoLabel} • ${taskCount} task${taskCount === 1 ? '' : 's'} • ${formatShortDate(project.created_at)}`;
 
       info.appendChild(title);
       info.appendChild(meta);
@@ -777,6 +815,7 @@
       setProjectOptions([]);
       renderProjects([], new Map());
       renderTasks([], []);
+      setCreatePrEnabled(false);
       return;
     }
     const [projects, tasks] = await Promise.all([fetchProjects(), fetchTasksForUser()]);
@@ -794,6 +833,7 @@
     }, new Map());
     renderProjects(projects, tasksByProject);
     renderTasks(tasks, projects);
+    updateCreatePrState();
   };
 
   const createProject = async () => {
@@ -834,6 +874,61 @@
       await refreshDashboard();
     } catch (error) {
       showToast(error?.message || 'Unable to create project.', '⚠️');
+    }
+  };
+
+  const connectGithubProject = async () => {
+    const userId = getAuthUserId();
+    if (!userId) {
+      showToast('Please sign in to connect GitHub.', '⚠️');
+      return;
+    }
+    const projectId = elements.githubProjectSelect?.value?.trim();
+    if (!projectId) {
+      showToast('Select a project to connect.', '⚠️');
+      return;
+    }
+    const repoFullName = elements.githubRepoInput?.value?.trim();
+    if (!repoFullName) {
+      showToast('Enter a GitHub repository (owner/name).', '⚠️');
+      return;
+    }
+    const accessToken = elements.githubTokenInput?.value?.trim();
+    if (!accessToken) {
+      showToast('Provide a GitHub access token.', '⚠️');
+      return;
+    }
+    const payload = {
+      repo_full_name: repoFullName,
+      access_token: accessToken
+    };
+    const defaultBranch = elements.githubDefaultBranchInput?.value?.trim();
+    if (defaultBranch) {
+      payload.default_branch = defaultBranch;
+    }
+    setGithubConnectStatus('');
+    try {
+      const response = await apiFetch(buildApiUrl(`/api/projects/${projectId}/connect-github`), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'Sign in to connect GitHub.'
+          : `GitHub connect failed (${response.status})`;
+        throw new Error(message);
+      }
+      await response.json();
+      showToast('GitHub repository connected.', '✅');
+      setGithubConnectStatus('GitHub repository connected.');
+      await refreshDashboard();
+    } catch (error) {
+      const message = error?.message || 'Unable to connect GitHub.';
+      setGithubConnectStatus(message, 'error');
+      showToast(message, '⚠️');
     }
   };
 
@@ -1374,6 +1469,32 @@
     }
   };
 
+  const setCreatePrEnabled = (isEnabled) => {
+    if (elements.createPrBtn) {
+      elements.createPrBtn.disabled = !isEnabled;
+    }
+  };
+
+  const canCreatePr = () => {
+    if (!latestTaskSnapshot) {
+      return false;
+    }
+    const status = String(latestTaskSnapshot.status || '').toLowerCase();
+    if (status !== 'completed') {
+      return false;
+    }
+    const projectId = latestTaskSnapshot.project_id;
+    if (!projectId) {
+      return false;
+    }
+    const project = projectLookup.get(projectId);
+    return Boolean(project?.repo_full_name);
+  };
+
+  const updateCreatePrState = () => {
+    setCreatePrEnabled(canCreatePr());
+  };
+
   const saveApiKey = () => {
     if (!elements.apiKeyInput) {
       return;
@@ -1440,6 +1561,7 @@
     latestTaskSnapshot = normalized;
     const isCompleted = String(normalized.status).toLowerCase() === 'completed';
     setDownloadEnabled(isCompleted);
+    updateCreatePrState();
     if (elements.taskStatus) {
       elements.taskStatus.textContent = normalized.status || '-';
     }
@@ -1487,6 +1609,7 @@
     lastQuestionsSignature = '';
     updateSummaryCounts({ filesTotal: 0, artifactsTotal: 0, iterationsUsed: 0, maxIterations: null });
     setDownloadEnabled(false);
+    setCreatePrEnabled(false);
     updateTimeTakenDisplay({});
     if (elements.taskStatus) {
       elements.taskStatus.textContent = '-';
@@ -2587,6 +2710,10 @@
     elements.createProjectBtn.addEventListener('click', createProject);
   }
 
+  if (elements.connectGithubBtn) {
+    elements.connectGithubBtn.addEventListener('click', connectGithubProject);
+  }
+
   if (elements.refreshProgressBtn) {
     elements.refreshProgressBtn.addEventListener('click', refreshStatus);
   }
@@ -2813,6 +2940,39 @@
     }
   };
 
+  const createPullRequest = async (taskId) => {
+    if (!taskId) {
+      showToast('No task available for PR.', '⚠️');
+      return;
+    }
+    if (!canCreatePr()) {
+      showToast('Connect GitHub and complete the task to create a PR.', 'ℹ️');
+      return;
+    }
+    try {
+      const response = await apiFetch(buildApiUrl(`/api/tasks/${taskId}/create-pr`), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({})
+      });
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'Sign in to create a PR.'
+          : `PR creation failed (${response.status})`;
+        throw new Error(message);
+      }
+      const data = await response.json();
+      showToast('Pull request created.', '✅');
+      if (data.pull_request_url) {
+        window.open(data.pull_request_url, '_blank', 'noopener');
+      }
+    } catch (error) {
+      showToast(error?.message || 'Unable to create PR.', '⚠️');
+    }
+  };
+
   if (elements.downloadZipBtn) {
     elements.downloadZipBtn.addEventListener('click', () => {
       if (!currentTaskId) {
@@ -2840,6 +3000,20 @@
         return;
       }
       downloadGitExport(currentTaskId);
+    });
+  }
+
+  if (elements.createPrBtn) {
+    elements.createPrBtn.addEventListener('click', () => {
+      if (!currentTaskId) {
+        showToast('No task available to create a PR.', '⚠️');
+        return;
+      }
+      if (elements.createPrBtn.disabled) {
+        showToast('Complete the task and connect GitHub to create a PR.', 'ℹ️');
+        return;
+      }
+      createPullRequest(currentTaskId);
     });
   }
 
