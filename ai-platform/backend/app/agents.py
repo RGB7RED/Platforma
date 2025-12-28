@@ -850,6 +850,10 @@ class AICoder(AIAgent):
         files = parsed.get("files", [])
         if isinstance(parsed.get("file"), dict):
             files.append(parsed["file"])
+        elif isinstance(parsed.get("file"), str) and parsed.get("content"):
+            files.append({"path": parsed["file"], "content": parsed["content"]})
+        if isinstance(parsed.get("path"), str) and parsed.get("content"):
+            files.append({"path": parsed["path"], "content": parsed["content"]})
         if parsed.get("content") and filepath:
             files.append({"path": filepath, "content": parsed["content"]})
 
