@@ -24,6 +24,12 @@ class AuthSettings:
     action_token_secret: str
     email_verify_ttl_hours: int
     password_reset_ttl_hours: int
+    bootstrap_admin_enabled: bool
+    bootstrap_admin_email: str
+    bootstrap_admin_password: str
+    public_registration_enabled: bool
+    invite_registration_enabled: bool
+    invite_token_secret: str
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,18 @@ def normalize_auth_mode(raw_mode: str | None) -> str:
     if normalized in {"api_key", "apikey", "api-key"}:
         return "api_key"
     return "api_key"
+
+
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    return default
 
 
 @lru_cache
@@ -61,6 +79,12 @@ def get_auth_settings() -> AuthSettings:
     refresh_cookie_secure = environment == "production"
     issuer = os.getenv("AUTH_JWT_ISSUER")
     audience = os.getenv("AUTH_JWT_AUDIENCE")
+    bootstrap_admin_enabled = parse_bool_env("BOOTSTRAP_ADMIN_ENABLED", False)
+    bootstrap_admin_email = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "")
+    bootstrap_admin_password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
+    public_registration_enabled = parse_bool_env("PUBLIC_REGISTRATION_ENABLED", False)
+    invite_registration_enabled = parse_bool_env("INVITE_REGISTRATION_ENABLED", False)
+    invite_token_secret = os.getenv("INVITE_TOKEN_SECRET", "")
 
     return AuthSettings(
         mode=mode,
@@ -79,6 +103,12 @@ def get_auth_settings() -> AuthSettings:
         action_token_secret=action_token_secret,
         email_verify_ttl_hours=email_verify_ttl_hours,
         password_reset_ttl_hours=password_reset_ttl_hours,
+        bootstrap_admin_enabled=bootstrap_admin_enabled,
+        bootstrap_admin_email=bootstrap_admin_email,
+        bootstrap_admin_password=bootstrap_admin_password,
+        public_registration_enabled=public_registration_enabled,
+        invite_registration_enabled=invite_registration_enabled,
+        invite_token_secret=invite_token_secret,
     )
 
 
