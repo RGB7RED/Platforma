@@ -2,7 +2,13 @@ import json
 
 import pytest
 
-from app.llm import LLMOutputTruncatedError, LLMSettings, OpenAIProvider, generate_with_retry
+from app.llm import (
+    LLMOutputTruncatedError,
+    LLMSettings,
+    OpenAIProvider,
+    generate_text_chunks_json,
+    generate_with_retry,
+)
 
 
 class FakeProvider:
@@ -42,9 +48,13 @@ async def test_generate_with_retry_json_mode_returns_parsable_json():
         model="gpt-4o-mini",
         api_key="test",
         max_tokens=100,
+        max_tokens_coder=100,
         timeout_seconds=10,
         temperature=0.2,
         response_format="json_object",
+        chunking_enabled=True,
+        max_chunks=8,
+        max_file_chars=12000,
     )
 
     response = await generate_with_retry(provider, [], settings, require_json=True)
@@ -74,9 +84,13 @@ async def test_generate_with_retry_retries_on_truncation():
         model="gpt-4o-mini",
         api_key="test",
         max_tokens=50,
+        max_tokens_coder=50,
         timeout_seconds=10,
         temperature=0.2,
         response_format="json_object",
+        chunking_enabled=True,
+        max_chunks=8,
+        max_file_chars=12000,
     )
 
     response = await generate_with_retry(provider, [], settings, require_json=True)
@@ -107,9 +121,13 @@ async def test_generate_with_retry_truncation_raises_after_retry():
         model="gpt-4o-mini",
         api_key="test",
         max_tokens=50,
+        max_tokens_coder=50,
         timeout_seconds=10,
         temperature=0.2,
         response_format="json_object",
+        chunking_enabled=True,
+        max_chunks=8,
+        max_file_chars=12000,
     )
 
     with pytest.raises(LLMOutputTruncatedError) as excinfo:
@@ -164,3 +182,163 @@ async def test_openai_provider_captures_finish_reason(monkeypatch):
     )
 
     assert response["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
+async def test_generate_text_chunks_concatenates_partial_chunks():
+    provider = FakeProvider(
+        [
+            {
+                "text": json.dumps(
+                    {
+                        "status": "partial",
+                        "chunk_index": 1,
+                        "content_chunk": "hello ",
+                    }
+                ),
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "finish_reason": "stop",
+            },
+            {
+                "text": json.dumps(
+                    {
+                        "status": "partial",
+                        "chunk_index": 2,
+                        "content_chunk": "world",
+                    }
+                ),
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "finish_reason": "stop",
+            },
+            {
+                "text": json.dumps(
+                    {
+                        "status": "complete",
+                        "chunk_index": 3,
+                        "content_chunk": "!",
+                    }
+                ),
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "finish_reason": "stop",
+            },
+        ]
+    )
+    settings = LLMSettings(
+        provider="openai",
+        model="gpt-4o-mini",
+        api_key="test",
+        max_tokens=50,
+        max_tokens_coder=50,
+        timeout_seconds=10,
+        temperature=0.2,
+        response_format="json_object",
+        chunking_enabled=True,
+        max_chunks=5,
+        max_file_chars=50,
+    )
+
+    response = await generate_text_chunks_json(
+        provider,
+        settings,
+        base_messages=[{"role": "system", "content": "test"}],
+        max_tokens=20,
+        max_chunks=5,
+        max_file_chars=50,
+    )
+
+    assert response["text"] == "hello world!"
+    assert response["chunks"] == 3
+    assert response["usage"]["total_tokens"] == 9
+
+
+@pytest.mark.asyncio
+async def test_generate_text_chunks_enforces_char_limit():
+    provider = FakeProvider(
+        [
+            {
+                "text": json.dumps(
+                    {
+                        "status": "complete",
+                        "chunk_index": 1,
+                        "content_chunk": "too long",
+                    }
+                ),
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "finish_reason": "stop",
+            }
+        ]
+    )
+    settings = LLMSettings(
+        provider="openai",
+        model="gpt-4o-mini",
+        api_key="test",
+        max_tokens=50,
+        max_tokens_coder=50,
+        timeout_seconds=10,
+        temperature=0.2,
+        response_format="json_object",
+        chunking_enabled=True,
+        max_chunks=5,
+        max_file_chars=3,
+    )
+
+    with pytest.raises(LLMOutputTruncatedError) as excinfo:
+        await generate_text_chunks_json(
+            provider,
+            settings,
+            base_messages=[{"role": "system", "content": "test"}],
+            max_tokens=20,
+            max_chunks=5,
+            max_file_chars=3,
+        )
+
+    assert str(excinfo.value) == "llm_output_budget_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_generate_text_chunks_retries_invalid_json():
+    provider = FakeProvider(
+        [
+            {
+                "text": "not json",
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "finish_reason": "stop",
+            },
+            {
+                "text": json.dumps(
+                    {
+                        "status": "complete",
+                        "chunk_index": 1,
+                        "content_chunk": "ok",
+                    }
+                ),
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "finish_reason": "stop",
+            },
+        ]
+    )
+    settings = LLMSettings(
+        provider="openai",
+        model="gpt-4o-mini",
+        api_key="test",
+        max_tokens=50,
+        max_tokens_coder=50,
+        timeout_seconds=10,
+        temperature=0.2,
+        response_format="json_object",
+        chunking_enabled=True,
+        max_chunks=5,
+        max_file_chars=50,
+    )
+
+    response = await generate_text_chunks_json(
+        provider,
+        settings,
+        base_messages=[{"role": "system", "content": "test"}],
+        max_tokens=20,
+        max_chunks=5,
+        max_file_chars=50,
+    )
+
+    assert response["text"] == "ok"
+    assert len(provider.calls) == 2

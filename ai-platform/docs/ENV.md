@@ -158,6 +158,30 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Optional
 - **Notes:** Defaults to 1024.
 
+### LLM_MAX_TOKENS_CODER
+- **Purpose:** Cap on output tokens for the coder agent (falls back to `LLM_MAX_TOKENS`).
+- **Example:** `LLM_MAX_TOKENS_CODER=800`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `LLM_MAX_TOKENS` when unset.
+
+### LLM_CHUNKING_ENABLED
+- **Purpose:** Toggle chunked JSON output for large file generation.
+- **Example:** `LLM_CHUNKING_ENABLED=1`
+- **Required in production?:** Optional
+- **Notes:** Defaults to enabled (`1`).
+
+### LLM_MAX_CHUNKS
+- **Purpose:** Max number of JSON chunks allowed for a single file generation.
+- **Example:** `LLM_MAX_CHUNKS=8`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 8.
+
+### LLM_MAX_FILE_CHARS
+- **Purpose:** Hard cap on total characters generated per file (prevents runaway costs).
+- **Example:** `LLM_MAX_FILE_CHARS=12000`
+- **Required in production?:** Optional
+- **Notes:** Defaults to 12,000.
+
 ### LLM_RESPONSE_FORMAT
 - **Purpose:** Controls OpenAI JSON enforcement mode.
 - **Example:** `LLM_RESPONSE_FORMAT=json_object` or `LLM_RESPONSE_FORMAT=json_schema`

@@ -20,8 +20,10 @@ from typing import Dict, Any, Optional, List, Callable, Sequence
 from .models import Container
 from . import db
 from .llm import (
+    LLMInvalidResponseError,
     LLMOutputTruncatedError,
     LLMProviderError,
+    generate_text_chunks_json,
     generate_with_retry,
     get_llm_provider,
     load_llm_settings,
@@ -666,6 +668,7 @@ class AICoder(AIAgent):
             allowed_paths = []
         max_files = rules.get("parameters", {}).get("max_files_per_iteration", 5)
 
+        use_chunking = bool(settings.chunking_enabled and filepath)
         messages = self._build_messages(
             task=task,
             container=container,
@@ -689,34 +692,94 @@ class AICoder(AIAgent):
                 raise BudgetExceededError("max_command_runs_per_day exceeded")
 
         request_started_at = datetime.now().isoformat()
-        try:
-            response = await generate_with_retry(
-                provider,
-                messages,
-                settings,
-                require_json=True,
+        if use_chunking:
+            self._assert_safe_path(filepath, allowed_paths)
+            chunk_messages = self._build_chunk_messages(
+                task=task,
+                container=container,
+                rules=rules,
+                allowed_paths=allowed_paths,
             )
-        except LLMOutputTruncatedError as exc:
-            if exc.usage:
-                tokens_in = int(exc.usage.get("input_tokens", 0) or 0)
-                tokens_out = int(exc.usage.get("output_tokens", 0) or 0)
-                container.record_llm_usage(
-                    stage="implementation",
-                    provider=provider.name,
-                    model=settings.model,
-                    tokens_in=tokens_in,
-                    tokens_out=tokens_out,
-                    metadata={
-                        "task_type": task_type,
-                        "task_description": task.get("description"),
-                        "finish_reason": exc.finish_reason,
-                    },
+            try:
+                response = await generate_text_chunks_json(
+                    provider,
+                    settings,
+                    base_messages=chunk_messages,
+                    max_tokens=settings.max_tokens_coder,
                 )
-            self._log_action("llm_failed", {"error": str(exc)})
-            raise
-        except LLMProviderError as exc:
-            self._log_action("llm_failed", {"error": str(exc)})
-            raise
+            except LLMInvalidResponseError as exc:
+                self._log_action("llm_failed", {"error": str(exc)})
+                truncated_raw = exc.raw_text[: LLMResponseParseError.MAX_RAW_LLM_OUTPUT_CHARS]
+                raw_truncated = len(exc.raw_text) > len(truncated_raw)
+                container.add_artifact(
+                    "llm_invalid_json",
+                    {
+                        "reason": "llm_invalid_json",
+                        "error": str(exc),
+                        "truncated_raw": truncated_raw,
+                        "raw_llm_output": truncated_raw,
+                        "raw_llm_output_truncated": raw_truncated,
+                        "finish_reason": "invalid_json",
+                    },
+                    self.role_name,
+                )
+                raise LLMResponseParseError(
+                    "llm_invalid_json",
+                    raw_text=exc.raw_text,
+                    error=str(exc),
+                ) from exc
+            except LLMOutputTruncatedError as exc:
+                if exc.usage:
+                    tokens_in = int(exc.usage.get("input_tokens", 0) or 0)
+                    tokens_out = int(exc.usage.get("output_tokens", 0) or 0)
+                    container.record_llm_usage(
+                        stage="implementation",
+                        provider=provider.name,
+                        model=settings.model,
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        metadata={
+                            "task_type": task_type,
+                            "task_description": task.get("description"),
+                            "finish_reason": exc.finish_reason,
+                            "chunking": True,
+                        },
+                    )
+                self._log_action("llm_failed", {"error": str(exc)})
+                raise
+            except LLMProviderError as exc:
+                self._log_action("llm_failed", {"error": str(exc)})
+                raise
+        else:
+            try:
+                response = await generate_with_retry(
+                    provider,
+                    messages,
+                    settings,
+                    require_json=True,
+                    max_tokens_override=settings.max_tokens_coder,
+                )
+            except LLMOutputTruncatedError as exc:
+                if exc.usage:
+                    tokens_in = int(exc.usage.get("input_tokens", 0) or 0)
+                    tokens_out = int(exc.usage.get("output_tokens", 0) or 0)
+                    container.record_llm_usage(
+                        stage="implementation",
+                        provider=provider.name,
+                        model=settings.model,
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        metadata={
+                            "task_type": task_type,
+                            "task_description": task.get("description"),
+                            "finish_reason": exc.finish_reason,
+                        },
+                    )
+                self._log_action("llm_failed", {"error": str(exc)})
+                raise
+            except LLMProviderError as exc:
+                self._log_action("llm_failed", {"error": str(exc)})
+                raise
         request_finished_at = datetime.now().isoformat()
 
         response_text = response.get("text", "")
@@ -724,36 +787,46 @@ class AICoder(AIAgent):
         tokens_in = int(usage.get("input_tokens", 0) or 0)
         tokens_out = int(usage.get("output_tokens", 0) or 0)
         finish_reason = response.get("finish_reason")
+        metadata = {
+            "task_type": task_type,
+            "task_description": task.get("description"),
+            "finish_reason": finish_reason,
+        }
+        if use_chunking:
+            metadata["chunking"] = True
+            metadata["chunk_count"] = response.get("chunks")
         container.record_llm_usage(
             stage="implementation",
             provider=provider.name,
             model=settings.model,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
-            metadata={
-                "task_type": task_type,
-                "task_description": task.get("description"),
-                "finish_reason": finish_reason,
-            },
+            metadata=metadata,
         )
-        try:
-            parsed = self._parse_llm_response(response_text)
-        except LLMResponseParseError as exc:
-            truncated_raw = exc.truncated_raw
-            raw_truncated = len(exc.raw_text) > len(truncated_raw)
-            container.add_artifact(
-                "llm_invalid_json",
-                {
-                    "reason": exc.reason,
-                    "error": exc.error or str(exc),
-                    "truncated_raw": truncated_raw,
-                    "raw_llm_output": truncated_raw,
-                    "raw_llm_output_truncated": raw_truncated,
-                    "finish_reason": finish_reason,
-                },
-                self.role_name,
-            )
-            raise
+        if use_chunking:
+            parsed = {
+                "files": [{"path": filepath, "content": response_text}],
+                "artifacts": {"code_summary": f"Updated file: {filepath}"},
+            }
+        else:
+            try:
+                parsed = self._parse_llm_response(response_text)
+            except LLMResponseParseError as exc:
+                truncated_raw = exc.truncated_raw
+                raw_truncated = len(exc.raw_text) > len(truncated_raw)
+                container.add_artifact(
+                    "llm_invalid_json",
+                    {
+                        "reason": exc.reason,
+                        "error": exc.error or str(exc),
+                        "truncated_raw": truncated_raw,
+                        "raw_llm_output": truncated_raw,
+                        "raw_llm_output_truncated": raw_truncated,
+                        "finish_reason": finish_reason,
+                    },
+                    self.role_name,
+                )
+                raise
 
         files = parsed.get("files", [])
         if isinstance(parsed.get("file"), dict):
@@ -782,6 +855,8 @@ class AICoder(AIAgent):
             content = str(file_entry.get("content") or "")
             if not path:
                 continue
+            if use_chunking:
+                content = self._strip_markdown_fences(content)
             self._assert_safe_path(path, allowed_paths)
             content = self._sanitize_fastapi_root_layout(template_id, path, content, all_paths)
             container.add_file(path, content)
@@ -820,6 +895,9 @@ class AICoder(AIAgent):
             "task": task.get("description"),
             "finish_reason": finish_reason,
         }
+        if use_chunking:
+            usage_report["chunking"] = True
+            usage_report["chunk_count"] = response.get("chunks")
         container.add_artifact("usage_report", usage_report, self.role_name)
         artifact_type = "implementation_plan" if "implementation_plan" in artifacts else "code_summary"
         container.add_artifact(
@@ -897,6 +975,58 @@ class AICoder(AIAgent):
         if correction_prompt:
             messages.append({"role": "user", "content": correction_prompt})
         return messages
+
+    def _build_chunk_messages(
+        self,
+        *,
+        task: Dict[str, Any],
+        container: Container,
+        rules: Dict[str, Any],
+        allowed_paths: List[str],
+    ) -> List[Dict[str, str]]:
+        context = container.get_relevant_context("coder")
+        task_description = task.get("description", "")
+        target_file = task.get("file", "")
+        review_report = task.get("review_report")
+        review_errors = task.get("review_errors") or task.get("errors")
+        review_warnings = task.get("review_warnings") or task.get("warnings")
+        constraints = list(rules.get("constraints", []))
+        template_id = self._resolve_template_id(container)
+        if template_id == "python_fastapi":
+            constraints.append(
+                "Use root layout with main.py at the repository root. "
+                "Do not create an app/ directory. "
+                "Only import modules that exist in the generated files; "
+                "do not import api.* unless an api/ package is created."
+            )
+        system_prompt = (
+            "You are the Coder agent. Generate file content in small JSON chunks. "
+            "Return JSON only; no markdown fences or extra keys."
+        )
+        user_payload = {
+            "Task": task_description,
+            "Type": task.get("type"),
+            "Component": task.get("component"),
+            "Target file": target_file,
+            "Allowed paths": allowed_paths,
+            "Existing files": context.get("files", []),
+            "Architecture": context.get("architecture"),
+            "Recent changes": context.get("recent_changes"),
+            "Review report": review_report,
+            "Review errors": review_errors,
+            "Review warnings": review_warnings,
+            "Constraints": constraints,
+            "Guidance": (
+                "Provide file content only. "
+                "First chunk should include imports/module header and top-level structure. "
+                "Subsequent chunks must continue without repeating earlier content."
+            ),
+        }
+        user_prompt = f"{json.dumps(user_payload, ensure_ascii=False, indent=2)}"
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
     def _resolve_template_id(self, container: Container) -> Optional[str]:
         template_id = container.metadata.get("template_id")

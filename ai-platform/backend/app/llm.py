@@ -34,6 +34,21 @@ class LLMOutputTruncatedError(RuntimeError):
         self.finish_reason = finish_reason
 
 
+class LLMInvalidResponseError(RuntimeError):
+    """Error raised when an LLM returns invalid JSON payloads."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_text: str,
+        usage: Optional[Dict[str, int]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+        self.usage = usage or {}
+
+
 class LLMProvider(Protocol):
     name: str
 
@@ -54,9 +69,13 @@ class LLMSettings:
     model: str
     api_key: Optional[str]
     max_tokens: int
+    max_tokens_coder: int
     timeout_seconds: float
     temperature: float
     response_format: str
+    chunking_enabled: bool
+    max_chunks: int
+    max_file_chars: int
 
 
 def load_llm_settings() -> LLMSettings:
@@ -64,17 +83,25 @@ def load_llm_settings() -> LLMSettings:
     model = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
     api_key = os.getenv("LLM_API_KEY")
     max_tokens = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+    max_tokens_coder = int(os.getenv("LLM_MAX_TOKENS_CODER", str(max_tokens)))
     timeout_seconds = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     response_format = os.getenv("LLM_RESPONSE_FORMAT", "json_object").strip().lower()
+    chunking_enabled = _parse_bool_env(os.getenv("LLM_CHUNKING_ENABLED", "1"))
+    max_chunks = int(os.getenv("LLM_MAX_CHUNKS", "8"))
+    max_file_chars = int(os.getenv("LLM_MAX_FILE_CHARS", "12000"))
     return LLMSettings(
         provider=provider,
         model=model,
         api_key=api_key,
         max_tokens=max_tokens,
+        max_tokens_coder=max_tokens_coder,
         timeout_seconds=timeout_seconds,
         temperature=temperature,
         response_format=response_format,
+        chunking_enabled=chunking_enabled,
+        max_chunks=max_chunks,
+        max_file_chars=max_file_chars,
     )
 
 
@@ -226,6 +253,91 @@ def get_llm_provider(settings: LLMSettings) -> LLMProvider:
     return MockProvider()
 
 
+async def generate_text_chunks_json(
+    provider: LLMProvider,
+    settings: LLMSettings,
+    *,
+    base_messages: List[Dict[str, str]],
+    max_tokens: Optional[int] = None,
+    max_chunks: Optional[int] = None,
+    max_file_chars: Optional[int] = None,
+) -> Dict[str, Any]:
+    chunk_limit = max_chunks or settings.max_chunks
+    char_limit = max_file_chars or settings.max_file_chars
+    token_limit = max_tokens or settings.max_tokens
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    aggregated = []
+    response_format = _resolve_response_format(settings.response_format, True)
+    temperature = 0.0
+
+    for chunk_index in range(1, chunk_limit + 1):
+        if char_limit > 0 and sum(len(chunk) for chunk in aggregated) >= char_limit:
+            raise LLMOutputTruncatedError(
+                "llm_output_budget_exceeded",
+                usage=total_usage,
+                finish_reason="max_file_chars",
+            )
+        invalid_attempts = 0
+        last_error_text = ""
+        while True:
+            messages = _build_chunk_messages(
+                base_messages=base_messages,
+                chunk_index=chunk_index,
+                remaining_chars=char_limit - sum(len(chunk) for chunk in aggregated)
+                if char_limit > 0
+                else None,
+                tail_text=_tail_text("".join(aggregated)),
+                invalid_json=invalid_attempts > 0,
+            )
+            prepared_messages = _inject_json_system_instruction(messages, provider, True)
+            response = await provider.generate_text(
+                messages=prepared_messages,
+                model=settings.model,
+                temperature=temperature,
+                max_tokens=token_limit,
+                response_format=response_format,
+            )
+            usage = response.get("usage", {}) or {}
+            total_usage = _accumulate_usage(total_usage, usage)
+            text = response.get("text", "") or ""
+            try:
+                payload = _parse_chunk_payload(text)
+            except ValueError as exc:
+                last_error_text = text
+                if invalid_attempts >= 2:
+                    raise LLMInvalidResponseError(
+                        "llm_invalid_json",
+                        raw_text=last_error_text,
+                        usage=total_usage,
+                    ) from exc
+                invalid_attempts += 1
+                continue
+            content_chunk = payload["content_chunk"]
+            if content_chunk:
+                aggregated.append(content_chunk)
+            combined = "".join(aggregated)
+            if char_limit > 0 and len(combined) > char_limit:
+                raise LLMOutputTruncatedError(
+                    "llm_output_budget_exceeded",
+                    usage=total_usage,
+                    finish_reason="max_file_chars",
+                )
+            if payload["status"] == "complete":
+                return {
+                    "text": combined,
+                    "usage": total_usage,
+                    "chunks": chunk_index,
+                    "finish_reason": "complete",
+                }
+            break
+
+    raise LLMOutputTruncatedError(
+        "llm_output_truncated",
+        usage=total_usage,
+        finish_reason="max_chunks",
+    )
+
+
 async def generate_with_retry(
     provider: LLMProvider,
     messages: List[Dict[str, str]],
@@ -233,13 +345,14 @@ async def generate_with_retry(
     *,
     max_retries: int = 2,
     require_json: bool = False,
+    max_tokens_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     attempt = 0
     delay = 1.0
     response_format = _resolve_response_format(settings.response_format, require_json)
     temperature = 0.0 if require_json else settings.temperature
     prepared_messages = _inject_json_system_instruction(messages, provider, require_json)
-    max_tokens = settings.max_tokens
+    max_tokens = max_tokens_override or settings.max_tokens
     truncation_retries = 0
     max_truncation_retries = 1
     total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -321,6 +434,94 @@ def _inject_json_system_instruction(
         return updated
     updated.insert(0, {"role": "system", "content": instruction})
     return updated
+
+
+def _build_chunk_messages(
+    *,
+    base_messages: List[Dict[str, str]],
+    chunk_index: int,
+    remaining_chars: Optional[int],
+    tail_text: str,
+    invalid_json: bool,
+) -> List[Dict[str, str]]:
+    schema = (
+        '{\n'
+        '  "status": "partial" | "complete",\n'
+        '  "chunk_index": 1,\n'
+        '  "content_chunk": "string (may be empty)",\n'
+        '  "notes": "optional short string"\n'
+        "}"
+    )
+    instructions = [
+        "Return ONLY a JSON object that matches this schema exactly:",
+        schema,
+        "Rules:",
+        "- content_chunk must be raw text (no markdown fences).",
+        "- status=partial means send the next chunk continuing exactly where you stopped.",
+        "- status=complete ends the stream.",
+        f"- chunk_index must be {chunk_index}.",
+    ]
+    if remaining_chars is not None:
+        instructions.append(f"- Remaining character budget: {remaining_chars}.")
+    if chunk_index == 1:
+        instructions.append(
+            "- First chunk should include imports/module header and top-level structure."
+        )
+    if tail_text:
+        instructions.append("Continue after this exact tail without repeating it:")
+        instructions.append(tail_text)
+    else:
+        instructions.append("Begin the file content now.")
+    if invalid_json:
+        instructions.append("Return JSON object only. Do not include any extra text.")
+    messages = [dict(message) for message in base_messages]
+    messages.append({"role": "user", "content": "\n".join(instructions)})
+    return messages
+
+
+def _parse_chunk_payload(text: str) -> Dict[str, Any]:
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("Chunk payload must be a JSON object.")
+    status = payload.get("status")
+    if status not in {"partial", "complete"}:
+        raise ValueError("Chunk status must be 'partial' or 'complete'.")
+    content_chunk = payload.get("content_chunk")
+    if content_chunk is None:
+        raise ValueError("content_chunk is required.")
+    if not isinstance(content_chunk, str):
+        content_chunk = str(content_chunk)
+    return {
+        "status": status,
+        "content_chunk": content_chunk,
+    }
+
+
+def _accumulate_usage(
+    total_usage: Dict[str, int],
+    usage: Dict[str, Any],
+) -> Dict[str, int]:
+    total_usage["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
+    total_usage["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+    if usage.get("total_tokens") is not None:
+        total_usage["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+    else:
+        total_usage["total_tokens"] += int(usage.get("input_tokens", 0) or 0) + int(
+            usage.get("output_tokens", 0) or 0
+        )
+    return total_usage
+
+
+def _parse_bool_env(value: str) -> bool:
+    return str(value or "").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _tail_text(text: str, max_chars: int = 500) -> str:
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
 
 
 def _extract_between(text: str, start: str, end: str) -> str:
