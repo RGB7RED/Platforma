@@ -193,6 +193,12 @@
     clarificationForm: document.getElementById('clarificationForm'),
     submitClarificationBtn: document.getElementById('submitClarificationBtn'),
     resumeTaskBtn: document.getElementById('resumeTaskBtn'),
+    manualStepPanel: document.getElementById('manualStepPanel'),
+    manualStepMessage: document.getElementById('manualStepMessage'),
+    manualStepStage: document.getElementById('manualStepStage'),
+    manualStepReviewStatus: document.getElementById('manualStepReviewStatus'),
+    manualStepPreview: document.getElementById('manualStepPreview'),
+    nextStepBtn: document.getElementById('nextStepBtn'),
     taskIdInput: document.getElementById('taskIdInput'),
     loadTaskBtn: document.getElementById('loadTaskBtn'),
     copyTaskIdBtn: document.getElementById('copyTaskIdBtn'),
@@ -1682,9 +1688,17 @@
     updateTimeTakenDisplay(normalized);
     refreshMetricsDisplay();
     if (String(normalized.status).toLowerCase() === 'needs_input' && currentTaskId) {
-      loadClarificationQuestions(currentTaskId);
+      if (normalized.awaiting_manual_step) {
+        setClarificationPanelVisible(false);
+        renderManualStepPanel(normalized);
+        setManualStepPanelVisible(true);
+      } else {
+        setManualStepPanelVisible(false);
+        loadClarificationQuestions(currentTaskId);
+      }
     } else {
       setClarificationPanelVisible(false);
+      setManualStepPanelVisible(false);
     }
   };
   const isTerminalState = (data) => {
@@ -1733,6 +1747,16 @@
       elements.clarificationForm.innerHTML = '';
     }
     setClarificationPanelVisible(false);
+    setManualStepPanelVisible(false);
+    if (elements.manualStepStage) {
+      elements.manualStepStage.textContent = '-';
+    }
+    if (elements.manualStepReviewStatus) {
+      elements.manualStepReviewStatus.textContent = '-';
+    }
+    if (elements.manualStepPreview) {
+      elements.manualStepPreview.textContent = '-';
+    }
     resetFilePanel();
   };
 
@@ -1940,6 +1964,13 @@
     elements.clarificationPanel.classList.toggle('hidden', !isVisible);
   };
 
+  const setManualStepPanelVisible = (isVisible) => {
+    if (!elements.manualStepPanel) {
+      return;
+    }
+    elements.manualStepPanel.classList.toggle('hidden', !isVisible);
+  };
+
   const buildQuestionInput = (question, answerValue) => {
     const questionId = question.id;
     const labelText = question.required ? `${question.text} *` : question.text;
@@ -2015,6 +2046,29 @@
     elements.clarificationMessage.textContent = requestedAt
       ? `Please answer the questions below. ${requestedAt}`
       : 'Please answer the questions below so the task can continue.';
+  };
+
+  const renderManualStepPanel = (payload) => {
+    if (!elements.manualStepPanel) {
+      return;
+    }
+    if (elements.manualStepStage) {
+      elements.manualStepStage.textContent = payload?.manual_step_stage || '-';
+    }
+    if (elements.manualStepReviewStatus) {
+      elements.manualStepReviewStatus.textContent = payload?.last_review_status || '-';
+    }
+    if (elements.manualStepPreview) {
+      const preview = payload?.next_task_preview;
+      elements.manualStepPreview.textContent = preview
+        ? JSON.stringify(preview, null, 2)
+        : '-';
+    }
+    if (elements.manualStepMessage) {
+      elements.manualStepMessage.textContent = payload?.manual_step_stage
+        ? `Awaiting manual action at ${payload.manual_step_stage}.`
+        : 'The task is awaiting a manual next step decision.';
+    }
   };
 
   const collectClarificationAnswers = () => {
@@ -2523,6 +2577,29 @@
     }
   };
 
+  const applyManualStepDecision = async (taskId, decision) => {
+    try {
+      const response = await apiFetch(buildApiUrl(`/api/tasks/${taskId}/next`), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ decision })
+      });
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'Invalid credentials or no access to this task.'
+          : response.status === 409
+            ? 'Task is not awaiting manual input.'
+            : `Request failed (${response.status})`;
+        throw new Error(message);
+      }
+      return { data: await response.json() };
+    } catch (error) {
+      return { error: error?.message || 'Unable to apply manual step.' };
+    }
+  };
+
   const setActiveInspectorTab = (tab) => {
     activeInspectorTab = tab;
     if (elements.inspectorTabs) {
@@ -2641,7 +2718,7 @@
     pollEvents(currentTaskId);
     pollArtifacts(currentTaskId);
     pollFiles(currentTaskId);
-    if (latestTaskSnapshot?.status === 'needs_input') {
+    if (latestTaskSnapshot?.status === 'needs_input' && !latestTaskSnapshot?.awaiting_manual_step) {
       loadClarificationQuestions(currentTaskId);
     }
   };
@@ -2692,6 +2769,26 @@
     lastQuestionsSignature = '';
     setClarificationPanelVisible(false);
     startPolling(currentTaskId);
+  };
+
+  const continueManualStep = async () => {
+    if (!currentTaskId) {
+      showToast('No active task to continue.', 'ℹ️');
+      return;
+    }
+    if (!ensureAuthForAction()) {
+      return;
+    }
+    setLoading(true, 'Applying manual step...', 'Resuming task execution');
+    const { error } = await applyManualStepDecision(currentTaskId, 'continue');
+    setLoading(false);
+    if (error) {
+      showToast(error, '⚠️');
+      return;
+    }
+    showToast('Manual step applied.', '✅');
+    setManualStepPanelVisible(false);
+    refreshStatus();
   };
 
   const rerunReview = async () => {
@@ -2828,6 +2925,10 @@
 
   if (elements.resumeTaskBtn) {
     elements.resumeTaskBtn.addEventListener('click', resumeClarification);
+  }
+
+  if (elements.nextStepBtn) {
+    elements.nextStepBtn.addEventListener('click', continueManualStep);
   }
 
   if (elements.submitTaskBtn) {

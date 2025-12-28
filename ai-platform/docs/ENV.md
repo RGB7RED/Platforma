@@ -127,6 +127,12 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Optional
 - **Notes:** Defaults to 20KB.
 
+### MANUAL_STEP_ENABLED
+- **Purpose:** Enables manual “Next step” gating between iterations and before final review.
+- **Example:** `MANUAL_STEP_ENABLED=true`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `false`. Can be overridden per task via the `manual_step` request flag.
+
 ### CODEX_PATH
 - **Purpose:** Override the JSON codex loaded by the orchestrator.
 - **Example:** `CODEX_PATH=ai-platform/backend/app/codex.json`

@@ -162,6 +162,28 @@ class AIOrchestrator:
         except ValueError:
             return default
 
+    @staticmethod
+    def _get_bool_env(name: str) -> Optional[bool]:
+        value = os.getenv(name)
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        return None
+
+    def _manual_step_enabled(self, manual_step_enabled: Optional[bool]) -> bool:
+        if manual_step_enabled is not None:
+            return bool(manual_step_enabled)
+        if self.container:
+            metadata_value = self.container.metadata.get("manual_step_enabled")
+            if isinstance(metadata_value, bool):
+                return metadata_value
+        env_value = self._get_bool_env("MANUAL_STEP_ENABLED")
+        return bool(env_value) if env_value is not None else False
+
     def _get_task_token_usage(self, task_description: Optional[str]) -> int:
         if not task_description:
             return 0
@@ -173,6 +195,54 @@ class AIOrchestrator:
                 continue
             total_tokens += int(entry.get("total_tokens", 0) or 0)
         return total_tokens
+
+    @staticmethod
+    def _build_next_actions(
+        *,
+        stage: str,
+        iteration: int,
+        review_result: Dict[str, Any],
+        next_task_preview: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        summary = "Review completed"
+        if isinstance(review_result, dict):
+            message = review_result.get("message") or review_result.get("summary")
+            status = review_result.get("status")
+            issues = review_result.get("issues") if isinstance(review_result.get("issues"), list) else None
+            if message:
+                summary = str(message)
+            elif issues:
+                summary = f"{len(issues)} issue(s) reported"
+            elif status:
+                summary = str(status)
+
+        actions: List[Dict[str, Any]] = []
+        passed = bool(review_result.get("passed")) if isinstance(review_result, dict) else False
+        if next_task_preview:
+            action_type = "continue" if passed else "fix"
+            priority = "normal" if passed else "high"
+            actions.append(
+                {
+                    "role": "coder",
+                    "type": action_type,
+                    "priority": priority,
+                    "details": next_task_preview.get("description") if isinstance(next_task_preview, dict) else None,
+                }
+            )
+        return {
+            "stage": stage,
+            "iteration": iteration,
+            "based_on": "review_report",
+            "summary": summary,
+            "actions": actions,
+        }
+
+    @staticmethod
+    def _preview_task(task: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(task, dict):
+            return None
+        preview_keys = {"type", "description", "file", "component"}
+        return {key: task.get(key) for key in preview_keys if task.get(key) is not None}
 
     def _plan_clarification_questions(
         self,
@@ -277,6 +347,8 @@ class AIOrchestrator:
         command_runner: Optional[Any] = None,
         provided_answers: Optional[Dict[str, Any]] = None,
         resume_from_stage: Optional[str] = None,
+        manual_step_enabled: Optional[bool] = None,
+        resume_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Основной метод обработки задачи пользователя"""
         if not self.container:
@@ -293,6 +365,10 @@ class AIOrchestrator:
 
         if resume_from_stage:
             self.container.metadata["resume_from_stage"] = resume_from_stage
+        if manual_step_enabled is not None:
+            self.container.metadata["manual_step_enabled"] = manual_step_enabled
+        if resume_payload is not None:
+            self.container.metadata["resume_payload"] = resume_payload
 
         stages = ["research", "design", "implementation", "review"]
         start_index = 0
@@ -403,6 +479,10 @@ class AIOrchestrator:
             failure_reason: Optional[str] = None
             failure_stage: Optional[str] = None
             next_task_override: Optional[Dict[str, Any]] = None
+            skip_manual_stage: Optional[str] = None
+            if isinstance(resume_payload, dict):
+                next_task_override = resume_payload.get("next_task_override")
+                skip_manual_stage = resume_payload.get("skip_manual_step_stage")
             max_llm_calls = self._get_int_env("LLM_MAX_CALLS_PER_TASK", 10)
             max_retries_per_step = self._get_int_env("LLM_MAX_RETRIES_PER_STEP", 1)
             self.container.metadata.setdefault("llm_calls", 0)
@@ -678,6 +758,58 @@ class AIOrchestrator:
                     else:
                         logger.warning(f"Iteration {iteration} rejected: {review_result.get('issues', [])}")
                         next_task_override = self._build_fix_task(next_task, review_result)
+                    next_task_preview = self._preview_task(next_task_override or self._get_next_task())
+                    next_actions = self._build_next_actions(
+                        stage="implementation",
+                        iteration=iteration,
+                        review_result=review_result,
+                        next_task_preview=next_task_preview,
+                    )
+                    self.container.add_artifact("next_actions", next_actions, "orchestrator")
+                    await self._run_hook(
+                        callbacks.get("next_actions") if callbacks else None,
+                        {"payload": next_actions},
+                    )
+                    manual_stage = "post_iteration_review"
+                    if self._manual_step_enabled(manual_step_enabled) and manual_stage != skip_manual_stage:
+                        last_review_status = (
+                            review_result.get("status") if isinstance(review_result, dict) else None
+                        )
+                        self.container.metadata.update(
+                            {
+                                "awaiting_manual_step": True,
+                                "manual_step_stage": manual_stage,
+                                "manual_step_options": ["continue", "stop", "retry"],
+                                "last_review_status": last_review_status,
+                                "next_task_preview": next_task_preview,
+                                "resume_phase": "implementation",
+                                "resume_iteration": iteration,
+                                "resume_payload": {
+                                    "next_task_override": next_task_override,
+                                    "next_task_preview": next_task_preview,
+                                },
+                            }
+                        )
+                        return {
+                            "status": "needs_input",
+                            "container_id": self.container.project_id,
+                            "state": self.container.state.value,
+                            "progress": self.container.progress,
+                            "awaiting_manual_step": True,
+                            "manual_step_stage": manual_stage,
+                            "manual_step_options": ["continue", "stop", "retry"],
+                            "last_review_status": last_review_status,
+                            "last_review_report_artifact_id": self.container.metadata.get(
+                                "last_review_report_artifact_id"
+                            ),
+                            "next_task_preview": next_task_preview,
+                            "resume_phase": "implementation",
+                            "resume_iteration": iteration,
+                            "resume_payload": {
+                                "next_task_override": next_task_override,
+                                "next_task_preview": next_task_preview,
+                            },
+                        }
             else:
                 iteration = self.container.metadata.get("iterations", 0) or 0
 
@@ -752,6 +884,31 @@ class AIOrchestrator:
                 self.codex.get("workflow", {}).get("require_review", True),
             )
             if review_required and start_index <= stages.index("review"):
+                manual_stage = "pre_final_review"
+                if self._manual_step_enabled(manual_step_enabled) and manual_stage != skip_manual_stage:
+                    self.container.metadata.update(
+                        {
+                            "awaiting_manual_step": True,
+                            "manual_step_stage": manual_stage,
+                            "manual_step_options": ["continue", "stop", "retry"],
+                            "resume_phase": "review",
+                            "resume_iteration": iteration,
+                            "resume_payload": {},
+                        }
+                    )
+                    return {
+                        "status": "needs_input",
+                        "container_id": self.container.project_id,
+                        "state": self.container.state.value,
+                        "progress": self.container.progress,
+                        "awaiting_manual_step": True,
+                        "manual_step_stage": manual_stage,
+                        "manual_step_options": ["continue", "stop", "retry"],
+                        "next_task_preview": None,
+                        "resume_phase": "review",
+                        "resume_iteration": iteration,
+                        "resume_payload": {},
+                    }
                 logger.info("Phase 4: Final Review")
                 await self._run_hook(
                     callbacks.get("stage_started") if callbacks else None,

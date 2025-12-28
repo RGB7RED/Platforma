@@ -49,6 +49,7 @@ from .schemas import (
     TaskInputRequest,
     TaskQuestionsResponse,
     TaskResumeResponse,
+    TaskManualStepRequest,
 )
 from .auth import (
     bootstrap_admin_user,
@@ -77,6 +78,7 @@ class TaskRequest(BaseModel):
     codex_version: Optional[str] = "1.0.0-mvp"
     template_id: Optional[str] = None
     project_id: Optional[str] = None
+    manual_step: Optional[bool] = None
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -160,6 +162,7 @@ RATE_LIMIT_RERUN_REVIEW_PER_MIN_ENV = os.getenv("RATE_LIMIT_RERUN_REVIEW_PER_MIN
 RATE_LIMIT_DOWNLOADS_PER_MIN_ENV = os.getenv("RATE_LIMIT_DOWNLOADS_PER_MIN")
 MAX_TOKENS_PER_DAY_ENV = os.getenv("MAX_TOKENS_PER_DAY")
 MAX_COMMAND_RUNS_PER_DAY_ENV = os.getenv("MAX_COMMAND_RUNS_PER_DAY")
+MANUAL_STEP_ENABLED_ENV = os.getenv("MANUAL_STEP_ENABLED")
 
 # Auth helpers
 @dataclass
@@ -522,6 +525,15 @@ def normalize_container_state(raw_state: Any) -> ContainerStateSnapshot:
             "timestamps",
             "container_state",
             "container_progress",
+            "awaiting_manual_step",
+            "manual_step_stage",
+            "manual_step_options",
+            "last_review_status",
+            "last_review_report_artifact_id",
+            "next_task_preview",
+            "resume_phase",
+            "resume_iteration",
+            "resume_payload",
         }
     }
     if extras:
@@ -538,6 +550,15 @@ def normalize_container_state(raw_state: Any) -> ContainerStateSnapshot:
         timestamps=normalized.get("timestamps"),
         container_state=normalized.get("container_state"),
         container_progress=normalized.get("container_progress"),
+        awaiting_manual_step=normalized.get("awaiting_manual_step"),
+        manual_step_stage=normalized.get("manual_step_stage"),
+        manual_step_options=normalized.get("manual_step_options"),
+        last_review_status=normalized.get("last_review_status"),
+        last_review_report_artifact_id=normalized.get("last_review_report_artifact_id"),
+        next_task_preview=normalized.get("next_task_preview"),
+        resume_phase=normalized.get("resume_phase"),
+        resume_iteration=normalized.get("resume_iteration"),
+        resume_payload=normalized.get("resume_payload"),
     )
 
 
@@ -577,17 +598,19 @@ def store_in_memory_artifact(
     artifact_type: str,
     payload: Optional[Dict[str, Any]] = None,
     produced_by: Optional[str] = None,
-) -> None:
+) -> str:
     artifacts = storage.artifacts.setdefault(task_id, [])
+    artifact_id = str(uuid.uuid4())
     artifacts.append(
         {
-            "id": str(uuid.uuid4()),
+            "id": artifact_id,
             "type": artifact_type,
             "produced_by": produced_by,
             "payload": normalize_payload(payload or {}),
             "created_at": db.now_utc(),
         }
     )
+    return artifact_id
 
 
 def store_in_memory_state(task_id: str, state: Dict[str, Any]) -> None:
@@ -650,16 +673,15 @@ async def record_artifact(
     artifact_type: str,
     payload: Optional[Dict[str, Any]] = None,
     produced_by: Optional[str] = None,
-) -> None:
+) -> Optional[str]:
     if db.is_enabled():
-        await db.add_artifact(
+        return await db.add_artifact(
             task_id,
             artifact_type,
             normalize_payload(payload or {}),
             produced_by=produced_by,
         )
-    else:
-        store_in_memory_artifact(task_id, artifact_type, payload, produced_by=produced_by)
+    return store_in_memory_artifact(task_id, artifact_type, payload, produced_by=produced_by)
 
 
 async def record_state(task_id: str, state: Dict[str, Any]) -> None:
@@ -793,6 +815,15 @@ def build_container_state(
     active_role: Optional[str] = None,
     current_task: Optional[str] = None,
     include_created_at: bool = False,
+    awaiting_manual_step: Optional[bool] = None,
+    manual_step_stage: Optional[str] = None,
+    manual_step_options: Optional[List[str]] = None,
+    last_review_status: Optional[str] = None,
+    last_review_report_artifact_id: Optional[str] = None,
+    next_task_preview: Optional[Dict[str, Any]] = None,
+    resume_phase: Optional[str] = None,
+    resume_iteration: Optional[int] = None,
+    resume_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     now_iso = db.now_utc().isoformat()
     state = {
@@ -808,6 +839,24 @@ def build_container_state(
             "updated_at": now_iso,
         },
     }
+    if awaiting_manual_step is not None:
+        state["awaiting_manual_step"] = awaiting_manual_step
+    if manual_step_stage is not None:
+        state["manual_step_stage"] = manual_step_stage
+    if manual_step_options is not None:
+        state["manual_step_options"] = manual_step_options
+    if last_review_status is not None:
+        state["last_review_status"] = last_review_status
+    if last_review_report_artifact_id is not None:
+        state["last_review_report_artifact_id"] = last_review_report_artifact_id
+    if next_task_preview is not None:
+        state["next_task_preview"] = next_task_preview
+    if resume_phase is not None:
+        state["resume_phase"] = resume_phase
+    if resume_iteration is not None:
+        state["resume_iteration"] = resume_iteration
+    if resume_payload is not None:
+        state["resume_payload"] = resume_payload
     if include_created_at:
         state["timestamps"]["created_at"] = now_iso
     return normalize_payload(state)
@@ -2602,6 +2651,10 @@ async def create_task(request: TaskRequest, req: Request):
     template_id = request.template_id.strip() if request.template_id else None
     project_id = request.project_id.strip() if request.project_id else None
     template_hash = None
+    env_manual = parse_bool_env(MANUAL_STEP_ENABLED_ENV)
+    manual_step_enabled = request.manual_step if request.manual_step is not None else (
+        env_manual if env_manual is not None else False
+    )
     if project_id:
         try:
             uuid.UUID(project_id)
@@ -2645,6 +2698,7 @@ async def create_task(request: TaskRequest, req: Request):
                 project_id=project_id,
                 client_ip=client_ip,
                 owner_key_hash=owner_key_hash,
+                manual_step_enabled=manual_step_enabled,
             )
         else:
             # Сохраняем задачу
@@ -2669,6 +2723,16 @@ async def create_task(request: TaskRequest, req: Request):
                 "pending_questions": [],
                 "provided_answers": {},
                 "resume_from_stage": None,
+                "manual_step_enabled": manual_step_enabled,
+                "awaiting_manual_step": False,
+                "manual_step_stage": None,
+                "manual_step_options": None,
+                "last_review_status": None,
+                "last_review_report_artifact_id": None,
+                "next_task_preview": None,
+                "resume_phase": None,
+                "resume_iteration": None,
+                "resume_payload": None,
             }
             
             # Сохраняем связь пользователь -> задача
@@ -3097,6 +3161,132 @@ async def resume_task(task_id: str, request: Request):
         reset_task_id(task_token)
 
 
+@app.post("/api/tasks/{task_id}/next")
+async def apply_manual_step(task_id: str, payload: TaskManualStepRequest, request: Request):
+    """Apply a manual-step decision and resume or stop the task."""
+    task_token = set_task_id(task_id)
+    try:
+        task_data = await ensure_task_owner(task_id, request)
+        if not task_data.get("awaiting_manual_step"):
+            raise HTTPException(status_code=409, detail="Task is not awaiting manual step input")
+        decision = (payload.decision or "").strip().lower()
+        if decision not in {"continue", "stop", "retry"}:
+            raise HTTPException(status_code=400, detail="Invalid decision")
+        await record_event(
+            task_id,
+            "manual_step_received",
+            normalize_payload(
+                {
+                    "decision": decision,
+                    "note": payload.note,
+                    "received_at": db.now_utc().isoformat(),
+                }
+            ),
+        )
+        manual_step_stage = task_data.get("manual_step_stage")
+        resume_phase = task_data.get("resume_phase") or task_data.get("resume_from_stage") or "implementation"
+        resume_payload = coerce_mapping_payload(
+            task_data.get("resume_payload"),
+            field_name="resume_payload",
+        )
+        if decision == "stop":
+            completed_at = db.now_utc()
+            await record_event(
+                task_id,
+                "manual_step_applied",
+                normalize_payload({"decision": decision, "applied_at": completed_at.isoformat()}),
+            )
+            update_fields = {
+                "status": "failed",
+                "progress": 1.0,
+                "current_stage": "manual_step",
+                "awaiting_manual_step": False,
+                "manual_step_stage": None,
+                "manual_step_options": None,
+                "last_review_status": task_data.get("last_review_status"),
+                "last_review_report_artifact_id": task_data.get("last_review_report_artifact_id"),
+                "next_task_preview": None,
+                "resume_phase": None,
+                "resume_iteration": None,
+                "resume_payload": None,
+                "failure_reason": "stopped_by_user",
+                "completed_at": completed_at,
+            }
+            if db.is_enabled():
+                await db.update_task_row(task_id, update_fields)
+            else:
+                task_data.update(update_fields)
+                task_data["updated_at"] = completed_at
+            await record_state(
+                task_id,
+                build_container_state(
+                    status="failed",
+                    progress=1.0,
+                    current_stage="manual_step",
+                    awaiting_manual_step=False,
+                    manual_step_stage=None,
+                    manual_step_options=None,
+                ),
+            )
+            return {"task_id": task_id, "status": "failed", "failure_reason": "stopped_by_user"}
+        if decision == "retry":
+            if payload.override_task:
+                resume_payload = dict(resume_payload or {})
+                resume_payload["next_task_override"] = payload.override_task
+        if decision == "continue" and manual_step_stage == "pre_final_review":
+            resume_payload = dict(resume_payload or {})
+            resume_payload["skip_manual_step_stage"] = manual_step_stage
+        await record_event(
+            task_id,
+            "manual_step_applied",
+            normalize_payload({"decision": decision, "applied_at": db.now_utc().isoformat()}),
+        )
+        update_fields = {
+            "status": "queued",
+            "progress": task_data.get("progress", 0.0),
+            "current_stage": "manual_step_resume",
+            "awaiting_manual_step": False,
+            "manual_step_stage": None,
+            "manual_step_options": None,
+            "next_task_preview": None,
+            "resume_from_stage": resume_phase,
+            "resume_phase": resume_phase,
+            "resume_iteration": task_data.get("resume_iteration"),
+            "resume_payload": resume_payload,
+        }
+        if db.is_enabled():
+            await db.update_task_row(task_id, update_fields)
+        else:
+            task_data.update(update_fields)
+            task_data["updated_at"] = db.now_utc()
+        await record_state(
+            task_id,
+            build_container_state(
+                status="queued",
+                progress=task_data.get("progress", 0.0) or 0.0,
+                current_stage="manual_step_resume",
+                awaiting_manual_step=False,
+                manual_step_stage=None,
+                manual_step_options=None,
+                resume_phase=resume_phase,
+                resume_iteration=task_data.get("resume_iteration"),
+                resume_payload=resume_payload,
+            ),
+        )
+        await task_governor.enqueue(
+            QueueItem(
+                task_id=task_id,
+                description=task_data.get("description"),
+                template_id=task_data.get("template_id"),
+                request_id=task_data.get("request_id"),
+                resume_from_stage=resume_phase,
+            )
+        )
+        return {"task_id": task_id, "status": "queued", "resume_from_stage": resume_phase}
+    finally:
+        reset_task_id(task_token)
+
+
 @app.post("/api/tasks/{task_id}/rerun-review")
 async def rerun_review(task_id: str, request: Request):
     """Перезапуск ревью для существующей задачи"""
@@ -3460,6 +3650,11 @@ async def process_task_background(
                 raise RuntimeError(f"Template '{template_id}' not found")
         resume_stage = resume_from_stage or task_data.get("resume_from_stage")
         provided_answers = task_data.get("provided_answers") if isinstance(task_data, dict) else None
+        manual_step_enabled = task_data.get("manual_step_enabled") if isinstance(task_data, dict) else None
+        resume_payload = coerce_mapping_payload(
+            task_data.get("resume_payload"),
+            field_name="resume_payload",
+        )
 
         async def fail_quota_exceeded() -> None:
             completed_at = db.now_utc()
@@ -3550,6 +3745,8 @@ async def process_task_background(
         container.metadata["owner_key_hash"] = owner_key_hash
         if owner_user_id:
             container.metadata["owner_user_id"] = owner_user_id
+        if isinstance(manual_step_enabled, bool):
+            container.metadata["manual_step_enabled"] = manual_step_enabled
         container.file_update_hook = workspace.write_file
         command_runner = build_command_runner(task_id, workspace.path, owner_key_hash)
         await persist_container_snapshot(task_id, container)
@@ -3663,12 +3860,14 @@ async def process_task_background(
 
         async def handle_review_result(payload: Dict[str, Any]) -> None:
             result = payload.get("result")
-            await record_artifact(
+            artifact_id = await record_artifact(
                 task_id,
                 "review_report",
                 normalize_payload(result),
                 produced_by="reviewer",
             )
+            if artifact_id:
+                container.metadata["last_review_report_artifact_id"] = artifact_id
             issues = result.get("issues") if isinstance(result, dict) else None
             issues_count = len(issues) if isinstance(issues, list) else 0
             await record_event(
@@ -3683,6 +3882,23 @@ async def process_task_background(
                 ),
             )
             await persist_all_container_files(task_id, container)
+            await persist_container_snapshot(task_id, container)
+
+        async def handle_next_actions(payload: Dict[str, Any]) -> None:
+            actions_payload = payload.get("payload") if isinstance(payload, dict) else None
+            if not isinstance(actions_payload, dict):
+                return
+            await record_artifact(
+                task_id,
+                "next_actions",
+                normalize_payload(actions_payload),
+                produced_by="orchestrator",
+            )
+            await record_event(
+                task_id,
+                "next_actions_created",
+                normalize_payload({"stage": actions_payload.get("stage")}),
+            )
             await persist_container_snapshot(task_id, container)
 
         async def handle_codex_loaded(payload: Dict[str, Any]) -> None:
@@ -3793,6 +4009,7 @@ async def process_task_background(
                 "review_started": handle_review_started,
                 "review_finished": handle_review_finished,
                 "review_result": handle_review_result,
+                "next_actions": handle_next_actions,
                 "codex_loaded": handle_codex_loaded,
                 "llm_usage": handle_llm_usage,
                 "llm_error": handle_llm_error,
@@ -3803,9 +4020,69 @@ async def process_task_background(
             command_runner=command_runner,
             provided_answers=provided_answers if isinstance(provided_answers, dict) else None,
             resume_from_stage=resume_stage,
+            manual_step_enabled=manual_step_enabled if isinstance(manual_step_enabled, bool) else None,
+            resume_payload=resume_payload if isinstance(resume_payload, dict) else None,
         )
 
         if result.get("status") == "needs_input":
+            if result.get("awaiting_manual_step"):
+                manual_stage = result.get("manual_step_stage")
+                manual_options = result.get("manual_step_options") or ["continue", "stop", "retry"]
+                resume_phase = result.get("resume_phase")
+                resume_iteration = result.get("resume_iteration")
+                resume_payload = coerce_mapping_payload(
+                    result.get("resume_payload"),
+                    field_name="resume_payload",
+                )
+                await record_event(
+                    task_id,
+                    "manual_step_requested",
+                    normalize_payload(
+                        {
+                            "manual_step_stage": manual_stage,
+                            "resume_phase": resume_phase,
+                            "resume_iteration": resume_iteration,
+                        }
+                    ),
+                )
+                await apply_task_update(
+                    {
+                        "status": "needs_input",
+                        "progress": container.progress,
+                        "current_stage": "manual_step",
+                        "awaiting_manual_step": True,
+                        "manual_step_stage": manual_stage,
+                        "manual_step_options": manual_options,
+                        "last_review_status": result.get("last_review_status"),
+                        "last_review_report_artifact_id": result.get("last_review_report_artifact_id"),
+                        "next_task_preview": result.get("next_task_preview"),
+                        "resume_phase": resume_phase,
+                        "resume_iteration": resume_iteration,
+                        "resume_payload": resume_payload,
+                    }
+                )
+                await record_state(
+                    task_id,
+                    build_container_state(
+                        status="needs_input",
+                        progress=container.progress,
+                        current_stage="manual_step",
+                        container=container,
+                        active_role=container.metadata.get("active_role"),
+                        current_task=container.current_task,
+                        awaiting_manual_step=True,
+                        manual_step_stage=manual_stage,
+                        manual_step_options=manual_options,
+                        last_review_status=result.get("last_review_status"),
+                        last_review_report_artifact_id=result.get("last_review_report_artifact_id"),
+                        next_task_preview=result.get("next_task_preview"),
+                        resume_phase=resume_phase,
+                        resume_iteration=resume_iteration,
+                        resume_payload=resume_payload,
+                    ),
+                )
+                logger.info("Task %s paused for manual step input", task_id)
+                return
             questions = normalize_questions(result.get("questions"))
             resume_stage_payload = result.get("resume_from_stage") or resume_stage
             await apply_task_update(
