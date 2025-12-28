@@ -132,8 +132,19 @@ database_url = os.getenv("DATABASE_URL")
 TASK_TTL_DAYS_ENV = os.getenv("TASK_TTL_DAYS")
 APP_API_KEY = os.getenv("APP_API_KEY")
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "data/workspaces"))
-DEFAULT_TEMPLATES_ROOT = Path(__file__).resolve().parents[2] / "templates"
-TEMPLATES_ROOT = Path(os.getenv("TEMPLATES_ROOT", str(DEFAULT_TEMPLATES_ROOT)))
+DEFAULT_TEMPLATES_DIR = Path("/app/templates")
+FALLBACK_TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "templates"
+TEMPLATES_DIR = Path(
+    os.getenv("TEMPLATES_DIR")
+    or os.getenv("TEMPLATES_ROOT")
+    or str(DEFAULT_TEMPLATES_DIR)
+)
+if (
+    not os.getenv("TEMPLATES_DIR")
+    and not os.getenv("TEMPLATES_ROOT")
+    and not TEMPLATES_DIR.exists()
+):
+    TEMPLATES_DIR = FALLBACK_TEMPLATES_DIR
 WORKSPACE_TTL_DAYS_ENV = os.getenv("WORKSPACE_TTL_DAYS")
 COMMAND_TIMEOUT_SECONDS = os.getenv("COMMAND_TIMEOUT_SECONDS")
 COMMAND_MAX_OUTPUT_BYTES = os.getenv("COMMAND_MAX_OUTPUT_BYTES")
@@ -881,6 +892,11 @@ async def lifespan(app: FastAPI):
     os.makedirs("data/logs", exist_ok=True)
     WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
     cleanup_workspaces(WORKSPACE_ROOT, WORKSPACE_TTL_DAYS)
+    templates_dir, templates_exists, template_ids, template_errors = inspect_templates_directory()
+    logger.info("Templates directory resolved to %s", templates_dir)
+    logger.info("Templates directory exists=%s templates=%s", templates_exists, template_ids)
+    if template_errors:
+        logger.warning("Templates directory issues: %s", template_errors)
 
     global FILE_PERSISTENCE_ENABLED, FILE_PERSISTENCE_REASON
     FILE_PERSISTENCE_ENABLED, FILE_PERSISTENCE_REASON = resolve_file_persistence_setting()
@@ -1518,7 +1534,7 @@ def compute_template_hash(files: Dict[str, Any]) -> str:
 
 
 def resolve_template(template_id: str) -> Optional[TemplateInfo]:
-    root = TEMPLATES_ROOT.resolve()
+    root = TEMPLATES_DIR.resolve()
     template_path = (root / template_id).resolve()
     if not template_path.is_relative_to(root):
         return None
@@ -1541,9 +1557,9 @@ def resolve_template(template_id: str) -> Optional[TemplateInfo]:
 
 def list_available_templates() -> List[Dict[str, Any]]:
     templates: List[Dict[str, Any]] = []
-    if not TEMPLATES_ROOT.exists():
+    if not TEMPLATES_DIR.exists():
         return templates
-    for entry in sorted(TEMPLATES_ROOT.iterdir(), key=lambda path: path.name):
+    for entry in sorted(TEMPLATES_DIR.iterdir(), key=lambda path: path.name):
         if not entry.is_dir():
             continue
         info = resolve_template(entry.name)
@@ -1557,6 +1573,28 @@ def list_available_templates() -> List[Dict[str, Any]]:
             }
         )
     return templates
+
+
+def inspect_templates_directory() -> tuple[Path, bool, list[str], list[str]]:
+    templates_dir = TEMPLATES_DIR.resolve()
+    errors: list[str] = []
+    templates: list[str] = []
+    exists = templates_dir.exists()
+    if not exists:
+        errors.append("Templates directory does not exist")
+        return templates_dir, exists, templates, errors
+    try:
+        for entry in sorted(templates_dir.iterdir(), key=lambda path: path.name):
+            if not entry.is_dir():
+                continue
+            info = resolve_template(entry.name)
+            if not info:
+                errors.append(f"Invalid template: {entry.name}")
+                continue
+            templates.append(info.template_id)
+    except Exception as exc:
+        errors.append(f"Failed to read templates directory: {exc}")
+    return templates_dir, exists, templates, errors
 
 class TaskWorkspace:
     """Workspace for materializing and syncing task files."""
@@ -2273,7 +2311,20 @@ async def ops_status():
         },
         "top_keys_last_24h": top_keys,
         "top_failure_reasons": top_failure_reasons,
-        "llm_usage_totals": aggregate_llm_usage(llm_summaries),
+            "llm_usage_totals": aggregate_llm_usage(llm_summaries),
+        }
+
+
+@app.get("/ops/templates")
+async def ops_templates(request: Request):
+    """Operational templates endpoint (auth required)."""
+    await get_auth_context(request)
+    templates_dir, exists, templates, errors = inspect_templates_directory()
+    return {
+        "templates_dir": str(templates_dir),
+        "exists": exists,
+        "templates": templates,
+        "errors": errors,
     }
 
 
