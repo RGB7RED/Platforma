@@ -3,6 +3,7 @@
 """
 
 import pytest
+from app import agents
 from app.agents import AIResearcher, AIDesigner, AICoder, AIReviewer
 from app.models import Container
 
@@ -89,6 +90,43 @@ class TestAIAgents:
         # Проверяем, что файл добавлен в контейнер
         assert "main.py" in container.files
         assert len(container.artifacts["code"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_coder_execute_chunking_missing_finish_reason(self, codex, container, monkeypatch):
+        """Тест chunking без finish_reason в ответе"""
+        async def fake_generate_text_chunks_json(
+            provider,
+            settings,
+            *,
+            base_messages,
+            max_tokens=None,
+            max_chunks=None,
+            max_file_chars=None,
+        ):
+            return {
+                "text": "print('ok')\n",
+                "usage": {"input_tokens": 3, "output_tokens": 5, "total_tokens": 8},
+                "chunks": 1,
+            }
+
+        monkeypatch.setattr(agents, "generate_text_chunks_json", fake_generate_text_chunks_json)
+
+        coder = AICoder(codex)
+        task = {
+            "type": "implement_component",
+            "component": "API",
+            "file": "main.py",
+            "description": "Implement main.py",
+        }
+
+        result = await coder.execute(task, container)
+
+        assert result["file"] == "main.py"
+        assert "main.py" in container.files
+        assert len(container.artifacts["usage_report"]) == 1
+        usage_report = container.artifacts["usage_report"][0].content
+        assert "finish_reason" in usage_report
+        assert usage_report["finish_reason"] is None
     
     @pytest.mark.asyncio
     async def test_coder_generate_code(self, codex):
