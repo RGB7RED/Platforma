@@ -1,1 +1,166 @@
+# Platforma Repository Guide
 
+Этот README описывает текущую структуру и работу платформы, чтобы ИИ мог
+быстро понять, какие компоненты существуют, как они связаны и как протекают
+основные процессы.
+
+## 1. Общая картина
+
+Платформа состоит из двух основных частей:
+
+1. **AI Platform (Telegram Mini App + backend orchestration)** — находится в каталоге
+   `ai-platform/` и включает FastAPI backend, статический frontend и инфраструктурные
+   конфигурации для локального запуска/продакшена.
+2. **Todo API (демо/шаблонный сервис)** — набор модулей `api/`, `models/`,
+   `repositories/`, `services/` и `todo_main.py`, реализующий CRUD API для задач.
+
+Корневая структура репозитория:
+
+```
+/README.md              <- этот файл
+/ai-platform/           <- основная платформа
+/workflows/ai-agent.yml <- workflow для CI/automation
+```
+
+## 2. AI Platform: ключевые компоненты
+
+### 2.1 Backend (FastAPI)
+
+**Путь:** `ai-platform/backend/`
+
+Главная точка входа — `ai-platform/backend/app/main.py`.
+
+Основные задачи backend:
+
+- предоставляет HTTP API для управления задачами и проектами;
+- реализует WebSocket-канал для стриминга прогресса;
+- управляет оркестрацией задач через набор LLM-агентов;
+- хранит события, артефакты, состояние задач и проекты (в памяти и/или в БД);
+- поддерживает авторизацию (API key и/или auth) + интеграцию с Telegram-ботом.
+
+#### Важные модули backend
+
+- `app/main.py`
+  - FastAPI приложение, роуты, WebSocket, контроль задач.
+  - Создание, резюмирование и мониторинг задач.
+  - Хранилище `Storage` для runtime-данных.
+- `app/orchestrator.py`
+  - Класс `AIOrchestrator` — главный цикл выполнения задачи.
+  - Загружает codex (`app/codex.json`), инициализирует роли (researcher/design/coder/reviewer).
+- `app/agents.py`
+  - Реализация агентов и безопасного запуска команд (`SafeCommandRunner`).
+  - Интеграция с LLM через `app/llm.py`.
+- `app/llm.py`
+  - Абстракция провайдера LLM, трекинг токенов и лимитов.
+- `app/db.py`
+  - Работа с базой данных (если задан `DATABASE_URL`).
+- `app/auth/`
+  - Авторизация, bootstrap администратора, OAuth Google.
+- `app/telegram_bot.py`
+  - Интеграция с Telegram-ботом.
+
+#### Контейнеры задач и состояние
+
+- Основные структуры данных — `Container`, `ProjectState` в `app/models.py`.
+- Состояние задачи хранится в памяти, а при наличии `DATABASE_URL`
+  сохраняется в Postgres.
+- Хранилище также ведёт события (`events`), артефакты (`artifacts`) и снапшоты.
+
+### 2.2 Frontend (Telegram Mini App UI)
+
+**Путь:** `ai-platform/frontend/`
+
+- Статическое приложение, управляется через `frontend/app.js`.
+- `index.html`, `styles.css` и `assets/` описывают интерфейс.
+- UI взаимодействует с backend через REST и WebSocket.
+- Поддерживаются разные режимы авторизации:
+  - API ключ (`apikey`)
+  - полноценная auth (`auth`)
+  - комбинированный (`hybrid`)
+
+Конфигурация подставляется через:
+
+- `window.__APP_CONFIG__` или метатеги (`meta[name="api-base-url"]`).
+
+### 2.3 Инфраструктура и запуск
+
+- Docker Compose: `ai-platform/docker-compose.yml`
+  - сервисы: `backend`, `frontend`, `nginx`
+- Nginx конфигурация: `ai-platform/nginx/`
+- Переменные окружения: `ai-platform/docs/ENV.md`
+
+## 3. Todo API (демо-сервис)
+
+Это независимый REST сервис в корневых модулях репозитория.
+
+### Архитектура
+
+- `todo_main.py` — FastAPI приложение
+- `api/routes.py` — CRUD маршруты `/todos`
+- `services/todo_service.py` — бизнес-логика
+- `repositories/todo_repository.py` — in-memory хранилище
+- `models/todo.py` — Pydantic модели
+
+### Поток данных
+
+1. **HTTP запрос** → `api/routes.py`
+2. **Service слой** → `services/todo_service.py`
+3. **Repository** → `repositories/todo_repository.py`
+4. Ответ возвращается клиенту
+
+## 4. Основной поток обработки AI-задачи
+
+1. Клиент отправляет задачу через API (`POST /api/tasks`).
+2. В `main.py` создаётся `Container`, сохраняется в `Storage`.
+3. `AIOrchestrator` запускает роль `researcher`, затем `designer`, `coder`, `reviewer`.
+4. Каждый агент может:
+   - генерировать планы/шаги;
+   - писать код и править файлы;
+   - запускать безопасные команды (`SafeCommandRunner`).
+5. Статус, события и артефакты сохраняются в памяти/БД и стримятся через WebSocket.
+6. Клиент периодически опрашивает или получает WebSocket-обновления.
+
+## 5. Где смотреть ключевую логику
+
+| Область | Ключевые файлы |
+|---|---|
+| Backend API | `ai-platform/backend/app/main.py` |
+| Оркестрация | `ai-platform/backend/app/orchestrator.py` |
+| LLM провайдер | `ai-platform/backend/app/llm.py` |
+| Агенты | `ai-platform/backend/app/agents.py` |
+| Авторизация | `ai-platform/backend/app/auth/*` |
+| Telegram бот | `ai-platform/backend/app/telegram_bot.py` |
+| Frontend UI | `ai-platform/frontend/app.js` |
+| Docker | `ai-platform/docker-compose.yml` |
+| Todo API | `todo_main.py`, `api/routes.py` |
+
+## 6. Как определить текущее состояние платформы
+
+ИИ может определить состояние платформы, анализируя:
+
+- **Backend**
+  - Содержимое `Storage` в `app/main.py` (task/event/artifact/state).
+  - Внешние статусы задач через API (`/api/tasks/...`).
+  - Подключение к БД (наличие `DATABASE_URL`).
+- **Orchestrator**
+  - Codex (`app/codex.json`) определяет правила и этапы.
+  - `Container.metadata` хранит историю, текущее состояние, лимиты.
+- **Frontend**
+  - Визуальное состояние отражает данные API (`task status`, `progress`).
+- **Docker/Env**
+  - Переменные окружения в `docs/ENV.md` описывают, какие функции включены.
+
+## 7. Быстрый старт (локально)
+
+```bash
+cd ai-platform
+docker compose up --build
+```
+
+Frontend будет доступен на `http://localhost`, backend — на `http://localhost:8000`.
+
+---
+
+Если требуется уточнение по конкретному модулю или расширение описания
+(например, добавление диаграмм взаимодействия или описания API эндпоинтов),
+можно расширить этот README дополнительными секциями.
