@@ -711,6 +711,9 @@ class AICoder(AIAgent):
                 raise BudgetExceededError("max_command_runs_per_day exceeded")
 
         request_started_at = datetime.now().isoformat()
+        tokens_in = 0
+        tokens_out = 0
+        finish_reason = None
         if use_chunking:
             self._assert_safe_path(filepath, allowed_paths)
             chunk_messages = self._build_chunk_messages(
@@ -891,6 +894,7 @@ class AICoder(AIAgent):
             usage = response.get("usage", {}) or {}
             tokens_in = int(usage.get("input_tokens", 0) or 0)
             tokens_out = int(usage.get("output_tokens", 0) or 0)
+            finish_reason = response.get("finish_reason")
             container.record_llm_usage(
                 stage="implementation",
                 provider=provider.name,
@@ -900,7 +904,7 @@ class AICoder(AIAgent):
                 metadata={
                     "task_type": task_type,
                     "task_description": task.get("description"),
-                    "finish_reason": response.get("finish_reason"),
+                    "finish_reason": finish_reason,
                     "chunking": True,
                     "chunk_count": response.get("chunks"),
                 },
