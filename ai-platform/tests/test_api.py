@@ -3,8 +3,8 @@
 import sys
 from pathlib import Path
 
-import pytest
 from fastapi.testclient import TestClient
+from pytest import fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -18,7 +18,7 @@ from todo_main import app  # noqa: E402
 client = TestClient(app)
 
 
-@pytest.fixture(autouse=True)
+@fixture(autouse=True)
 def clear_repository() -> None:
     """Reset repository data between tests."""
     repository = get_todo_repository()

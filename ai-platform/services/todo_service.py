@@ -7,6 +7,8 @@ from typing import List, Optional
 from models.todo import Todo, TodoCreate, TodoUpdate
 from repositories.todo_repository import TodoRepository
 
+__all__ = ["TodoService"]
+
 
 class TodoService:
     """Service for todo business logic."""
@@ -26,11 +28,19 @@ class TodoService:
         """Get a specific todo by ID."""
         return self.repository.get_by_id(todo_id)
 
+    def get(self, todo_id: int) -> Optional[Todo]:
+        """Alias for get_todo_by_id."""
+        return self.get_todo_by_id(todo_id)
+
     def create_todo(self, todo_data: TodoCreate) -> Todo:
         """Create a new todo item."""
         if not todo_data.title.strip():
             raise ValueError("Todo title cannot be empty")
         return self.repository.create(todo_data)
+
+    def create(self, todo_data: TodoCreate) -> Todo:
+        """Alias for create_todo."""
+        return self.create_todo(todo_data)
 
     def update_todo(self, todo_id: int, todo_data: TodoUpdate) -> Optional[Todo]:
         """Update an existing todo item."""
@@ -41,10 +51,22 @@ class TodoService:
             raise ValueError("Todo title cannot be empty")
         return self.repository.update(todo_id, todo_data)
 
+    def update(self, todo_id: int, todo_data: TodoUpdate) -> Optional[Todo]:
+        """Alias for update_todo."""
+        return self.update_todo(todo_id, todo_data)
+
     def delete_todo(self, todo_id: int) -> bool:
         """Delete a todo item."""
         return self.repository.delete(todo_id)
 
+    def delete(self, todo_id: int) -> bool:
+        """Alias for delete_todo."""
+        return self.delete_todo(todo_id)
+
     def search_todos(self, query: str) -> List[Todo]:
         """Search todos by title or description."""
         return self.repository.search(query)
+
+    def search(self, query: str) -> List[Todo]:
+        """Alias for search_todos."""
+        return self.search_todos(query)
