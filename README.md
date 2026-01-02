@@ -239,6 +239,9 @@
   - `content`: full file contents as a JSON string (newlines preserved)
 - Multiple files are supported via the `files` array (extra entries beyond `max_files_per_iteration` are truncated).
 - No-op/empty output is **not supported**: if no file entries are present, the backend raises an error.
+- The coder now auto-retries up to 3 attempts when JSON parsing fails or no files are found.
+  If it still fails, the error includes a short diagnostic (`invalid JSON`, `files missing`, `files empty`),
+  a 400-character response preview, and the model/provider identifiers when available.
 
 **Minimal valid example (one file):**
 

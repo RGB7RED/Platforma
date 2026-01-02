@@ -770,95 +770,149 @@ class AICoder(AIAgent):
                 self._log_action("llm_failed", {"error": str(exc)})
                 raise
         else:
-            try:
-                response = await generate_with_retry(
-                    provider,
-                    messages,
-                    settings,
-                    require_json=True,
-                    max_tokens_override=settings.max_tokens_coder,
+            max_attempts = 3
+            parsed = None
+            files: List[Dict[str, Any]] = []
+            last_response_text = ""
+            last_finish_reason = None
+            last_parse_error: Optional[str] = None
+            for attempt in range(1, max_attempts + 1):
+                correction = self._build_correction_prompt() if attempt > 1 else None
+                attempt_messages = self._build_messages(
+                    task=task,
+                    container=container,
+                    rules=rules,
+                    allowed_paths=allowed_paths,
+                    correction_prompt=correction,
                 )
-            except LLMOutputTruncatedError as exc:
-                if exc.usage:
-                    tokens_in = int(exc.usage.get("input_tokens", 0) or 0)
-                    tokens_out = int(exc.usage.get("output_tokens", 0) or 0)
-                    container.record_llm_usage(
-                        stage="implementation",
-                        provider=provider.name,
-                        model=settings.model,
-                        tokens_in=tokens_in,
-                        tokens_out=tokens_out,
-                        metadata={
-                            "task_type": task_type,
-                            "task_description": task.get("description"),
-                            "finish_reason": exc.finish_reason,
-                        },
+                try:
+                    response = await generate_with_retry(
+                        provider,
+                        attempt_messages,
+                        settings,
+                        require_json=True,
+                        max_tokens_override=settings.max_tokens_coder,
                     )
-                self._log_action("llm_failed", {"error": str(exc)})
-                raise
-            except LLMProviderError as exc:
-                self._log_action("llm_failed", {"error": str(exc)})
-                raise
+                except LLMOutputTruncatedError as exc:
+                    if exc.usage:
+                        tokens_in = int(exc.usage.get("input_tokens", 0) or 0)
+                        tokens_out = int(exc.usage.get("output_tokens", 0) or 0)
+                        container.record_llm_usage(
+                            stage="implementation",
+                            provider=provider.name,
+                            model=settings.model,
+                            tokens_in=tokens_in,
+                            tokens_out=tokens_out,
+                            metadata={
+                                "task_type": task_type,
+                                "task_description": task.get("description"),
+                                "finish_reason": exc.finish_reason,
+                                "attempt": attempt,
+                            },
+                        )
+                    self._log_action("llm_failed", {"error": str(exc)})
+                    raise
+                except LLMProviderError as exc:
+                    self._log_action("llm_failed", {"error": str(exc)})
+                    raise
+                request_finished_at = datetime.now().isoformat()
+                response_text = response.get("text", "")
+                usage = response.get("usage", {}) or {}
+                tokens_in = int(usage.get("input_tokens", 0) or 0)
+                tokens_out = int(usage.get("output_tokens", 0) or 0)
+                finish_reason = response.get("finish_reason")
+                metadata = {
+                    "task_type": task_type,
+                    "task_description": task.get("description"),
+                    "finish_reason": finish_reason,
+                    "attempt": attempt,
+                }
+                container.record_llm_usage(
+                    stage="implementation",
+                    provider=provider.name,
+                    model=settings.model,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    metadata=metadata,
+                )
+                try:
+                    parsed = self._parse_llm_response(response_text)
+                except LLMResponseParseError as exc:
+                    last_response_text = response_text
+                    last_finish_reason = finish_reason
+                    last_parse_error = f"invalid JSON: {exc.error or str(exc)}"
+                    if attempt < max_attempts:
+                        continue
+                    preview = self._sanitize_llm_preview(response_text)
+                    error_details = (
+                        f"{last_parse_error}; response_preview={preview!r}; "
+                        f"provider={provider.name}; model={settings.model}"
+                    )
+                    truncated_raw = exc.truncated_raw
+                    raw_truncated = len(exc.raw_text) > len(truncated_raw)
+                    container.add_artifact(
+                        "llm_invalid_json",
+                        {
+                            "reason": exc.reason,
+                            "error": error_details,
+                            "truncated_raw": truncated_raw,
+                            "raw_llm_output": truncated_raw,
+                            "raw_llm_output_truncated": raw_truncated,
+                            "finish_reason": last_finish_reason,
+                        },
+                        self.role_name,
+                    )
+                    raise LLMResponseParseError(
+                        "llm_invalid_json",
+                        raw_text=response_text,
+                        error=error_details,
+                    ) from exc
+                files = self._collect_files_from_parsed(parsed, filepath)
+                if files:
+                    break
+                last_response_text = response_text
+                last_finish_reason = finish_reason
+                last_parse_error = self._files_diagnostic(parsed, files)
+                if attempt < max_attempts:
+                    continue
+                preview = self._sanitize_llm_preview(last_response_text)
+                error_details = (
+                    f"{last_parse_error}; response_preview={preview!r}; "
+                    f"provider={provider.name}; model={settings.model}"
+                )
+                raise ValueError(
+                    "LLM response did not include any files to write. "
+                    f"{error_details}"
+                )
         request_finished_at = datetime.now().isoformat()
 
         response_text = response.get("text", "")
-        usage = response.get("usage", {}) or {}
-        tokens_in = int(usage.get("input_tokens", 0) or 0)
-        tokens_out = int(usage.get("output_tokens", 0) or 0)
-        finish_reason = response.get("finish_reason")
-        metadata = {
-            "task_type": task_type,
-            "task_description": task.get("description"),
-            "finish_reason": finish_reason,
-        }
         if use_chunking:
-            metadata["chunking"] = True
-            metadata["chunk_count"] = response.get("chunks")
-        container.record_llm_usage(
-            stage="implementation",
-            provider=provider.name,
-            model=settings.model,
-            tokens_in=tokens_in,
-            tokens_out=tokens_out,
-            metadata=metadata,
-        )
-        if use_chunking:
+            usage = response.get("usage", {}) or {}
+            tokens_in = int(usage.get("input_tokens", 0) or 0)
+            tokens_out = int(usage.get("output_tokens", 0) or 0)
+            container.record_llm_usage(
+                stage="implementation",
+                provider=provider.name,
+                model=settings.model,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                metadata={
+                    "task_type": task_type,
+                    "task_description": task.get("description"),
+                    "finish_reason": response.get("finish_reason"),
+                    "chunking": True,
+                    "chunk_count": response.get("chunks"),
+                },
+            )
             parsed = {
                 "files": [{"path": filepath, "content": response_text}],
                 "artifacts": {"code_summary": f"Updated file: {filepath}"},
             }
-        else:
-            try:
-                parsed = self._parse_llm_response(response_text)
-            except LLMResponseParseError as exc:
-                truncated_raw = exc.truncated_raw
-                raw_truncated = len(exc.raw_text) > len(truncated_raw)
-                container.add_artifact(
-                    "llm_invalid_json",
-                    {
-                        "reason": exc.reason,
-                        "error": exc.error or str(exc),
-                        "truncated_raw": truncated_raw,
-                        "raw_llm_output": truncated_raw,
-                        "raw_llm_output_truncated": raw_truncated,
-                        "finish_reason": finish_reason,
-                    },
-                    self.role_name,
-                )
-                raise
-
-        files = parsed.get("files", [])
-        if isinstance(parsed.get("file"), dict):
-            files.append(parsed["file"])
-        elif isinstance(parsed.get("file"), str) and parsed.get("content"):
-            files.append({"path": parsed["file"], "content": parsed["content"]})
-        if isinstance(parsed.get("path"), str) and parsed.get("content"):
-            files.append({"path": parsed["path"], "content": parsed["content"]})
-        if parsed.get("content") and filepath:
-            files.append({"path": filepath, "content": parsed["content"]})
-
-        if not files:
-            raise ValueError("LLM response did not include any files to write.")
+            files = self._collect_files_from_parsed(parsed, filepath)
+        elif parsed is None:
+            parsed = {}
+            files = []
 
         if len(files) > max_files:
             files = files[:max_files]
@@ -996,10 +1050,10 @@ class AICoder(AIAgent):
         user_prompt = f"{json.dumps(user_payload, ensure_ascii=False, indent=2)}"
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
         ]
         if correction_prompt:
             messages.append({"role": "user", "content": correction_prompt})
+        messages.append({"role": "user", "content": user_prompt})
         return messages
 
     def _build_chunk_messages(
@@ -1145,26 +1199,25 @@ class AICoder(AIAgent):
     def _parse_llm_response(self, text: str) -> Dict[str, Any]:
         """Parse JSON response, handling optional code fences."""
         cleaned = text.strip()
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            stripped = self._strip_markdown_fences(cleaned)
-            if stripped != cleaned:
-                try:
-                    return json.loads(stripped)
-                except json.JSONDecodeError:
-                    pass
-            candidate = self._extract_first_json_payload(stripped)
-            if candidate:
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError as nested_exc:
-                    raise LLMResponseParseError(
-                        "llm_invalid_json",
-                        raw_text=text,
-                        error=str(nested_exc),
-                    ) from nested_exc
-            raise LLMResponseParseError("llm_invalid_json", raw_text=text, error=str(exc)) from exc
+        candidates: List[str] = [cleaned]
+        fenced = self._extract_fenced_json_payload(cleaned)
+        if fenced:
+            candidates.append(fenced)
+        stripped = self._strip_markdown_fences(cleaned)
+        if stripped != cleaned:
+            candidates.append(stripped)
+        embedded = self._extract_first_json_payload(stripped)
+        if embedded:
+            candidates.append(embedded)
+        last_error: Optional[json.JSONDecodeError] = None
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                continue
+        error_message = str(last_error) if last_error else "Invalid JSON payload"
+        raise LLMResponseParseError("llm_invalid_json", raw_text=text, error=error_message)
 
     @staticmethod
     def _strip_markdown_fences(text: str) -> str:
@@ -1209,6 +1262,55 @@ class AICoder(AIAgent):
                 if not stack and start_index is not None:
                     return text[start_index : index + 1]
         return None
+
+    @staticmethod
+    def _extract_fenced_json_payload(text: str) -> Optional[str]:
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if not match:
+            return None
+        return match.group(1).strip()
+
+    @staticmethod
+    def _sanitize_llm_preview(text: str, limit: int = 400) -> str:
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+        return cleaned[:limit]
+
+    @staticmethod
+    def _collect_files_from_parsed(parsed: Dict[str, Any], filepath: str) -> List[Dict[str, Any]]:
+        files: List[Dict[str, Any]] = []
+        files_value = parsed.get("files")
+        if isinstance(files_value, list):
+            files.extend(files_value)
+        if isinstance(parsed.get("file"), dict):
+            files.append(parsed["file"])
+        elif isinstance(parsed.get("file"), str) and parsed.get("content"):
+            files.append({"path": parsed["file"], "content": parsed["content"]})
+        if isinstance(parsed.get("path"), str) and parsed.get("content"):
+            files.append({"path": parsed["path"], "content": parsed["content"]})
+        if parsed.get("content") and filepath:
+            files.append({"path": filepath, "content": parsed["content"]})
+        return files
+
+    @staticmethod
+    def _files_diagnostic(parsed: Dict[str, Any], files: List[Dict[str, Any]]) -> str:
+        if "files" not in parsed:
+            return "files missing"
+        if isinstance(parsed.get("files"), list) and not parsed.get("files"):
+            return "files empty"
+        if not files:
+            return "files missing"
+        return "files missing"
+
+    def _build_correction_prompt(self) -> str:
+        return (
+            "Return ONLY valid JSON. Must include files array with at least one item. "
+            "No markdown. No explanations.\n"
+            "Example:\n"
+            "{\n"
+            "  \"files\": [{\"path\": \"example.txt\", \"content\": \"...\"}],\n"
+            "  \"artifacts\": {\"code_summary\": \"Updated example.txt\"}\n"
+            "}\n"
+        )
 
     def _assert_safe_path(self, path: str, allowed_paths: List[str]) -> None:
         pure_path = PurePosixPath(path)
