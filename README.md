@@ -216,6 +216,55 @@
 }
 ```
 
+### LLM Output Format: Files To Write (Required)
+
+**Exact required format (JSON only):**
+
+```json
+{
+  "files": [
+    { "path": "relative/path.txt", "content": "file contents as a JSON string" }
+  ],
+  "artifacts": {
+    "code_summary": "Optional summary string (or implementation_plan)"
+  }
+}
+```
+
+**Rules (enforced by backend parsing in `ai-platform/backend/app/agents.py`):**
+
+- Output must be valid JSON. The parser accepts raw JSON, JSON inside a single markdown fence, or the first JSON payload embedded in the response.
+- **Required**: at least one file entry. Each file entry must include:
+  - `path`: relative path (no leading `/`, no `..`, no `~`)
+  - `content`: full file contents as a JSON string (newlines preserved)
+- Multiple files are supported via the `files` array (extra entries beyond `max_files_per_iteration` are truncated).
+- No-op/empty output is **not supported**: if no file entries are present, the backend raises an error.
+
+**Minimal valid example (one file):**
+
+```json
+{
+  "files": [
+    { "path": "RadJab.txt", "content": "Moama" }
+  ],
+  "artifacts": { "code_summary": "Added RadJab.txt" }
+}
+```
+
+**Two-file example:**
+
+```json
+{
+  "files": [
+    { "path": "RadJab.txt", "content": "Moama" },
+    { "path": "Notes.txt", "content": "Second file" }
+  ],
+  "artifacts": { "code_summary": "Added RadJab.txt and Notes.txt" }
+}
+```
+
+**No-op guidance:** not supported — always return at least one file entry. If the model returns normal text without this format, the platform will raise: `LLM response did not include any files to write.`
+
 #### Reviewer (`AIReviewer.execute`)
 
 Выполняет проверки кода, архитектуры и тестов.
