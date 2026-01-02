@@ -688,14 +688,6 @@ class AICoder(AIAgent):
         max_files = rules.get("parameters", {}).get("max_files_per_iteration", 5)
 
         use_chunking = bool(settings.chunking_enabled and filepath)
-        messages = self._build_messages(
-            task=task,
-            container=container,
-            rules=rules,
-            allowed_paths=allowed_paths,
-            correction_prompt=correction_prompt,
-        )
-
         owner_key_hash = container.metadata.get("owner_key_hash")
         max_tokens_per_day = _parse_int_env(os.getenv("MAX_TOKENS_PER_DAY"))
         max_command_runs_per_day = _parse_int_env(os.getenv("MAX_COMMAND_RUNS_PER_DAY"))
