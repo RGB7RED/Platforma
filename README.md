@@ -120,6 +120,134 @@
 5. Статус, события и артефакты сохраняются в памяти/БД и стримятся через WebSocket.
 6. Клиент периодически опрашивает или получает WebSocket-обновления.
 
+### 4.1 Последовательность ролей и границы ответственности
+
+Порядок стадий определяется `ai-platform/backend/app/orchestrator.py` и кодексом
+`ai-platform/backend/app/codex.json`:
+
+1. **research** → `AIResearcher`
+2. **design** → `AIDesigner`
+3. **implementation** → `AICoder`
+4. **review** → `AIReviewer`
+
+Кодекс задаёт рамки каждой роли (см. `codex.json`):
+
+- **Researcher**
+  - Цель: анализ задачи и формирование требований.
+  - Ограничения: не предлагает архитектуру и не пишет код.
+  - Артефакты: `requirements.md`, `user_stories.md`.
+- **Designer**
+  - Цель: архитектура на основе требований.
+  - Ограничения: не меняет требования, не оптимизирует преждевременно.
+  - Артефакты: `architecture.md`, `implementation_plan.md`.
+- **Coder**
+  - Цель: реализация по архитектуре.
+  - Ограничения: следует style guide, не меняет архитектуру, пишет тесты.
+  - Артефакты: записи о сгенерированном коде + `code_summary` или `implementation_plan`.
+- **Reviewer**
+  - Цель: контроль качества и соответствия правилам.
+  - Ограничения: не вносит изменения, не добавляет фичи.
+  - Артефакты: `review_report` (детальный отчёт ревью).
+
+### 4.2 Что возвращает каждая роль (внутренний формат)
+
+Ниже — фактические структуры, которые генерируют агенты в `app/agents.py`
+и которые затем записываются в контейнер (артефакты и файлы).
+
+#### Researcher (`AIResearcher.execute`)
+
+Возвращает объект требований и одновременно сохраняет:
+
+- `requirements.md`
+- `user_stories.md`
+
+Пример структуры результата (упрощено):
+
+```json
+{
+  "user_task": "...",
+  "requirements": [{"id": "REQ-001", "description": "..."}],
+  "user_stories": ["...", "..."],
+  "questions_to_user": ["..."],
+  "technical_constraints": ["..."]
+}
+```
+
+#### Designer (`AIDesigner.execute`)
+
+Возвращает архитектуру и сохраняет:
+
+- `architecture.md`
+- `implementation_plan.md`
+
+Пример структуры результата:
+
+```json
+{
+  "components": [
+    {"name": "API Layer", "files": ["api/routes.py", "..."]}
+  ],
+  "api_endpoints": [{"method": "GET", "path": "/todos"}],
+  "data_model": {"Todo": {"id": "int", "title": "str"}},
+  "progress_metrics": {"expected_files": 12}
+}
+```
+
+#### Coder (`AICoder.execute`)
+
+Запрашивает LLM, ожидает **строго JSON** и пишет файлы в контейнер.
+Ответ LLM должен иметь формат:
+
+```json
+{
+  "files": [{"path": "path/to/file.py", "content": "..."}],
+  "artifacts": {"code_summary": "Updated files: ..."}
+}
+```
+
+После записи файлов кодер возвращает метаданные выполнения:
+
+```json
+{
+  "file": "path/to/file.py",
+  "files": ["path/to/file.py", "..."],
+  "artifact_type": "code_summary",
+  "llm_usage": {"tokens_in": 123, "tokens_out": 456}
+}
+```
+
+#### Reviewer (`AIReviewer.execute`)
+
+Выполняет проверки кода, архитектуры и тестов.
+Возвращает объект отчёта вида:
+
+```json
+{
+  "status": "approved|approved_with_warnings|rejected",
+  "passed": true,
+  "issues": ["..."],
+  "warnings": ["..."],
+  "ruff": {"ran": true, "exit_code": 0},
+  "pytest": {"ran": true, "exit_code": 0}
+}
+```
+
+### 4.3 Итеративный цикл внутри implementation
+
+Во время **implementation** оркестратор повторяет цикл:
+
+1. Планировщик выбирает следующий шаг (`_get_next_task`).
+2. `AICoder` генерирует/обновляет файлы.
+3. `AIReviewer` валидирует изменения.
+4. Если ревью не прошло, оркестратор создаёт исправляющую задачу
+   (`_build_fix_task`) и запускает новый виток.
+
+Ограничения итераций и времени задаются в `codex.json` и env-переменными:
+
+- `workflow.max_iterations`
+- `LLM_MAX_CALLS_PER_TASK`
+- `LLM_MAX_RETRIES_PER_STEP`
+
 ## 5. Где смотреть ключевую логику
 
 | Область | Ключевые файлы |
