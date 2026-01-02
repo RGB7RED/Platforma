@@ -20,9 +20,17 @@ class TodoRepository:
         todos = list(self._todos.values())
         return todos[skip : skip + limit]
 
+    def get_all_todos(self, *, skip: int = 0, limit: int = 100) -> List[Todo]:
+        """Get all todos with pagination."""
+        return self.get_all(skip=skip, limit=limit)
+
     def get_by_id(self, todo_id: int) -> Optional[Todo]:
         """Get todo by ID."""
         return self._todos.get(todo_id)
+
+    def get_todo_by_id(self, todo_id: int) -> Optional[Todo]:
+        """Get todo by ID."""
+        return self.get_by_id(todo_id)
 
     def create(self, todo_data: TodoCreate) -> Todo:
         """Create a new todo."""
@@ -43,6 +51,10 @@ class TodoRepository:
         """Save a new todo (alias for create)."""
         return self.create(todo_data)
 
+    def add_todo(self, todo_data: TodoCreate) -> Todo:
+        """Add a new todo (alias for create)."""
+        return self.create(todo_data)
+
     def update(self, todo_id: int, todo_data: TodoUpdate) -> Optional[Todo]:
         """Update an existing todo."""
         todo = self._todos.get(todo_id)
@@ -54,12 +66,20 @@ class TodoRepository:
         todo.updated_at = datetime.now()
         return todo
 
+    def update_todo(self, todo_id: int, todo_data: TodoUpdate) -> Optional[Todo]:
+        """Update an existing todo."""
+        return self.update(todo_id, todo_data)
+
     def delete(self, todo_id: int) -> bool:
         """Delete a todo."""
         if todo_id in self._todos:
             del self._todos[todo_id]
             return True
         return False
+
+    def delete_todo(self, todo_id: int) -> bool:
+        """Delete a todo."""
+        return self.delete(todo_id)
 
     def clear(self) -> None:
         """Clear all stored todos (testing helper)."""
