@@ -167,6 +167,20 @@ class TestAIAgents:
         
         # Проверяем, что ревью добавлен в артефакты
         assert len(container.artifacts["review_report"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_reviewer_skips_quality_checks_for_non_code_changes(self, codex, container):
+        """Ревьюер пропускает ruff/pytest если нет изменений в коде."""
+        container.add_file("RadJab.txt", "non-code update")
+        container.metadata["files_written"] = ["RadJab.txt"]
+
+        reviewer = AIReviewer(codex)
+        result = await reviewer.execute(container)
+
+        assert result["passed"] is True
+        assert result["status"] == "approved_with_warnings"
+        assert result["skipped_checks"] == ["ruff", "pytest"]
+        assert result["changed_files"] == ["RadJab.txt"]
     
     def test_reviewer_file_review(self, codex):
         """Тест проверки файла"""
