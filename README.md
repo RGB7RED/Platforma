@@ -383,3 +383,29 @@ Frontend будет доступен на `http://localhost`, backend — на `
 Если требуется уточнение по конкретному модулю или расширение описания
 (например, добавление диаграмм взаимодействия или описания API эндпоинтов),
 можно расширить этот README дополнительными секциями.
+
+## Diagnostics (ruff/pytest)
+
+Во время расследования выяснилось, что падения "Final review failed" были вызваны
+тем, что проверки запускались из корня репозитория и попадали на демо-код на
+уровне `/api`, `/models`, `/services`, `/tests`, вместо фактического проекта в
+`ai-platform/`. Из-за этого ruff и pytest линтовали/собирали не те модули.
+
+Подтверждённые локации и экспорты:
+
+- `ai-platform/models/todo.py` содержит `Todo`, `TodoCreate`, `TodoUpdate`.
+- `ai-platform/api/routes.py` импортирует `Todo`, `TodoCreate`, `TodoUpdate`.
+- `TodoRepository` находится в `ai-platform/repositories/todo_repository.py`.
+- `ai-platform/services/todo_service.py` экспортирует `TodoService` и модульные CRUD-функции
+  через `__all__`.
+- `ai-platform/pytest.ini` задаёт `testpaths = tests`.
+
+Применённое исправление: запускать ruff/pytest из `ai-platform/`.
+
+Команды для валидации:
+
+```bash
+cd ai-platform
+ruff check .
+python -m pytest -q
+```

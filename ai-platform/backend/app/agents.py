@@ -2438,6 +2438,9 @@ class AIReviewer(AIAgent):
         files: Dict[str, str],
         command_runner: SafeCommandRunner,
     ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], List[str], List[str]]:
+        project_root = workspace_path / "ai-platform"
+        if not project_root.is_dir():
+            project_root = workspace_path
         ruff_report = {
             "ran": False,
             "command": None,
@@ -2468,7 +2471,7 @@ class AIReviewer(AIAgent):
                 self._write_container_files(workspace_path, files)
                 ruff_report = await command_runner.run(
                     ["ruff", "check", "."],
-                    cwd=workspace_path,
+                    cwd=project_root,
                     purpose="ruff",
                 )
                 if ruff_report.get("error"):
@@ -2496,9 +2499,9 @@ class AIReviewer(AIAgent):
                 self._write_container_files(workspace_path, files)
                 pytest_report = await command_runner.run(
                     [sys.executable, "-m", "pytest", "-q"],
-                    cwd=workspace_path,
+                    cwd=project_root,
                     purpose="pytest",
-                    env={"PYTHONPATH": str(workspace_path)},
+                    env={"PYTHONPATH": str(project_root)},
                 )
                 if pytest_report.get("error"):
                     errors.append(f"pytest error: {pytest_report['error']}")

@@ -39,13 +39,13 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        working-directory: ai-platform/backend
-        run: pip install -r requirements.txt
+        working-directory: ai-platform
+        run: pip install -r backend/requirements.txt
 
       - name: Ruff
-        working-directory: ai-platform/backend
+        working-directory: ai-platform
         run: ruff check .
 
       - name: Pytest
-        working-directory: ai-platform/backend
-        run: pytest -q
+        working-directory: ai-platform
+        run: python -m pytest -q
