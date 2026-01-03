@@ -68,3 +68,24 @@ Postgres. Read-only endpoints:
 - **ModuleNotFoundError:** confirm Railway root directory is `ai-platform/backend`.
 - **Port binding errors:** ensure the start command uses `$PORT`.
 - **Database connection errors:** verify `DATABASE_URL` and network access to the database.
+
+## Diagnostics (ruff/pytest)
+
+Quick read-only sweep of the todo demo app revealed the following locations:
+
+- **API routes:** `api/routes.py` (FastAPI router using `Todo`, `TodoCreate`, `TodoUpdate`).
+- **Todo model:** `models/todo.py` (Pydantic models: `TodoBase`, `TodoCreate`, `TodoUpdate`, `Todo`).
+- **Service functions:** `services/todo_service.py` (exports `create_todo`, `get_todos`,
+  `get_todo_by_id`, `update_todo`, `delete_todo` plus `TodoService` and helpers).
+- **Repository:** `repositories/todo_repository.py` (`TodoRepository` in-memory store).
+- **App entrypoint:** `todo_main.py` (FastAPI `app` with `/` and `/api` routes).
+- **Tests:** `tests/test_api.py`, `tests/test_services.py`, and `tests/conftest.py`.
+- **Not present:** `api/models.py` and `main.py` do not exist in the current tree (todo models and
+  app entrypoint live at the paths above).
+
+Validation commands (from the `ai-platform` directory):
+
+```bash
+ruff check .
+python -m pytest -q
+```
