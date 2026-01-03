@@ -7,7 +7,17 @@ from typing import List, Optional
 from models.todo import Todo, TodoCreate, TodoUpdate
 from repositories.todo_repository import TodoRepository
 
-__all__ = ["TodoService"]
+__all__ = [
+    "TodoService",
+    "create_todo",
+    "delete_todo",
+    "get_default_repository",
+    "get_default_service",
+    "get_todo_by_id",
+    "get_todos",
+    "search_todos",
+    "update_todo",
+]
 
 
 class TodoService:
@@ -70,3 +80,47 @@ class TodoService:
     def search(self, query: str) -> List[Todo]:
         """Alias for search_todos."""
         return self.search_todos(query)
+
+
+_repository = TodoRepository()
+_service = TodoService(_repository)
+
+
+def get_default_repository() -> TodoRepository:
+    """Return the default in-memory repository instance."""
+    return _repository
+
+
+def get_default_service() -> TodoService:
+    """Return the default todo service instance."""
+    return _service
+
+
+def create_todo(todo_data: TodoCreate) -> Todo:
+    """Create a new todo item."""
+    return _service.create_todo(todo_data)
+
+
+def get_todos(*, skip: int = 0, limit: int = 100) -> List[Todo]:
+    """Get all todo items with pagination."""
+    return _service.get_todos(skip=skip, limit=limit)
+
+
+def get_todo_by_id(todo_id: int) -> Optional[Todo]:
+    """Get a specific todo by ID."""
+    return _service.get_todo_by_id(todo_id)
+
+
+def update_todo(todo_id: int, todo_data: TodoUpdate) -> Optional[Todo]:
+    """Update an existing todo item."""
+    return _service.update_todo(todo_id, todo_data)
+
+
+def delete_todo(todo_id: int) -> bool:
+    """Delete a todo item."""
+    return _service.delete_todo(todo_id)
+
+
+def search_todos(query: str) -> List[Todo]:
+    """Search todos by title or description."""
+    return _service.search_todos(query)
