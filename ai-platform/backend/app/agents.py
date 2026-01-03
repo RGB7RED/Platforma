@@ -980,16 +980,29 @@ class AICoder(AIAgent):
         )
         
         self.files_created += 1
-        self._log_action("coding_completed", {
-            "files": written_files,
-            "task": task_type,
-            "files_created": self.files_created
-        })
+        existing_files = task.get("files_written") or container.metadata.get("files_written")
+        tracked_files = None
+        if isinstance(existing_files, list) and existing_files:
+            tracked_files = [str(path) for path in existing_files if path]
+        else:
+            tracked_files = list(written_files)
+        if tracked_files is not None:
+            container.metadata["files_written"] = tracked_files
+            self._log_action("files_written", {"files": tracked_files})
+
+        self._log_action(
+            "coding_completed",
+            {
+                "files": tracked_files,
+                "task": task_type,
+                "files_created": self.files_created,
+            },
+        )
         
         primary_file = written_files[0] if written_files else None
         return {
             "file": primary_file,
-            "files": written_files,
+            "files": tracked_files,
             "size": file_sizes.get(primary_file, 0),
             "artifact_type": artifact_type,
             "llm_usage": usage_report,
@@ -2098,6 +2111,27 @@ def sample_todo_update():
 
 class AIReviewer(AIAgent):
     """ИИ-ревьюер: проверяет качество и соответствие"""
+
+    CODE_FILE_EXTENSIONS = {
+        ".py",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".java",
+        ".go",
+        ".rb",
+        ".rs",
+        ".php",
+        ".cs",
+        ".cpp",
+        ".c",
+        ".h",
+        ".hpp",
+        ".swift",
+        ".kt",
+        ".kts",
+    }
     
     def __init__(self, codex: Dict[str, Any]):
         super().__init__(codex, "reviewer")
@@ -2181,6 +2215,16 @@ class AIReviewer(AIAgent):
         }
         tool_warnings: List[str] = []
         tool_errors: List[str] = []
+        skipped_checks: List[str] = []
+        skip_reason = None
+        changed_files = self._get_changed_files(container)
+        if changed_files:
+            if not self._has_code_changes(changed_files):
+                skipped_checks = ["ruff", "pytest"]
+                skip_reason = "No code files changed in this iteration."
+                tool_warnings.append(
+                    "Skipped ruff/pytest: no code files changed in this iteration"
+                )
 
         compileall_report = {
             "ran": False,
@@ -2189,7 +2233,7 @@ class AIReviewer(AIAgent):
             "stdout": "",
             "stderr": "",
         }
-        if container.files:
+        if container.files and not skipped_checks:
             if workspace_path is None:
                 with tempfile.TemporaryDirectory() as workspace:
                     workspace_path = Path(workspace)
@@ -2220,6 +2264,10 @@ class AIReviewer(AIAgent):
                     container.files,
                     runner,
                 )
+        elif skipped_checks:
+            ruff_report["skipped"] = True
+            pytest_report["skipped"] = True
+            compileall_report["skipped"] = True
         else:
             tool_warnings.append("No files available for quality checks")
 
@@ -2232,7 +2280,11 @@ class AIReviewer(AIAgent):
             if isinstance(report, dict)
         )
         passed = len(errors) == 0 and not timed_out
-        if passed and warnings:
+        if skipped_checks:
+            passed = True
+            status = "approved_with_warnings"
+            message = "Approved with warnings (quality checks skipped)"
+        elif passed and warnings:
             status = "approved_with_warnings"
             message = f"Approved with {len(warnings)} warnings"
         elif passed:
@@ -2265,6 +2317,11 @@ class AIReviewer(AIAgent):
                 "progress": container.progress,
             },
         }
+        if skipped_checks:
+            review_result["skipped_checks"] = skipped_checks
+            review_result["skip_reason"] = skip_reason
+            review_result["reason"] = skip_reason
+            review_result["changed_files"] = changed_files
         missing_files = _extract_missing_files_from_issues(issues)
         if missing_files:
             review_result["missing_files"] = missing_files
@@ -2284,6 +2341,19 @@ class AIReviewer(AIAgent):
         })
 
         return review_result
+
+    def _get_changed_files(self, container: Container) -> List[str]:
+        files_written = container.metadata.get("files_written")
+        if isinstance(files_written, list):
+            return [str(path) for path in files_written if path]
+        return []
+
+    def _has_code_changes(self, changed_files: List[str]) -> bool:
+        for path in changed_files:
+            suffix = Path(path).suffix.lower()
+            if suffix in self.CODE_FILE_EXTENSIONS:
+                return True
+        return False
 
     def _resolve_template_id(self, container: Container) -> Optional[str]:
         template_id = container.metadata.get("template_id")
