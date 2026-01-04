@@ -29,6 +29,12 @@ from .llm import (
     get_llm_provider,
     load_llm_settings,
 )
+from .planning import (
+    OutputContract,
+    OutputContractViolation,
+    build_contract_repair_prompt,
+    validate_output_contract,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -686,8 +692,19 @@ class AICoder(AIAgent):
         if not isinstance(allowed_paths, list):
             allowed_paths = []
         max_files = rules.get("parameters", {}).get("max_files_per_iteration", 5)
+        contract_payload = task.get("output_contract") or container.metadata.get("output_contract")
+        contract: Optional[OutputContract] = None
+        if isinstance(contract_payload, OutputContract):
+            contract = contract_payload
+        elif isinstance(contract_payload, dict):
+            try:
+                contract = OutputContract.model_validate(contract_payload)
+            except Exception:
+                contract = None
 
         use_chunking = bool(settings.chunking_enabled and filepath)
+        if contract and contract.exact_json_only:
+            use_chunking = False
         owner_key_hash = container.metadata.get("owner_key_hash")
         max_tokens_per_day = _parse_int_env(os.getenv("MAX_TOKENS_PER_DAY"))
         max_command_runs_per_day = _parse_int_env(os.getenv("MAX_COMMAND_RUNS_PER_DAY"))
@@ -765,20 +782,21 @@ class AICoder(AIAgent):
                 self._log_action("llm_failed", {"error": str(exc)})
                 raise
         else:
-            max_attempts = 3
+            contract_repair_attempts = _parse_int_env(os.getenv("ORCH_CONTRACT_REPAIR_ATTEMPTS")) or 2
+            max_attempts = contract_repair_attempts + 1 if contract else 3
             parsed = None
             files: List[Dict[str, Any]] = []
             last_response_text = ""
             last_finish_reason = None
             last_parse_error: Optional[str] = None
+            correction_prompt_override = correction_prompt
             for attempt in range(1, max_attempts + 1):
-                correction = self._build_correction_prompt() if attempt > 1 else None
                 attempt_messages = self._build_messages(
                     task=task,
                     container=container,
                     rules=rules,
                     allowed_paths=allowed_paths,
-                    correction_prompt=correction,
+                    correction_prompt=correction_prompt_override,
                 )
                 try:
                     response = await generate_with_retry(
@@ -837,6 +855,7 @@ class AICoder(AIAgent):
                     last_finish_reason = finish_reason
                     last_parse_error = f"invalid JSON: {exc.error or str(exc)}"
                     if attempt < max_attempts:
+                        correction_prompt_override = self._build_correction_prompt()
                         continue
                     preview = self._sanitize_llm_preview(response_text)
                     error_details = (
@@ -863,21 +882,65 @@ class AICoder(AIAgent):
                         error=error_details,
                     ) from exc
                 files = self._collect_files_from_parsed(parsed, filepath)
+                if contract:
+                    try:
+                        validate_output_contract(contract, response_text, parsed)
+                    except OutputContractViolation as exc:
+                        last_response_text = response_text
+                        last_finish_reason = finish_reason
+                        last_parse_error = "; ".join(exc.violations)
+                        if attempt < max_attempts:
+                            correction_prompt_override = build_contract_repair_prompt(
+                                contract, exc.violations
+                            )
+                            continue
+                        preview = self._sanitize_llm_preview(response_text)
+                        error_details = (
+                            f"contract_violation: {last_parse_error}; response_preview={preview!r}; "
+                            f"provider={provider.name}; model={settings.model}"
+                        )
+                        container.add_artifact(
+                            "contract_violation",
+                            {
+                                "reason": "contract_violation",
+                                "error": error_details,
+                                "violations": exc.violations,
+                                "raw_llm_output": response_text[: LLMResponseParseError.MAX_RAW_LLM_OUTPUT_CHARS],
+                                "finish_reason": last_finish_reason,
+                            },
+                            self.role_name,
+                        )
+                        raise LLMResponseParseError(
+                            "contract_violation",
+                            raw_text=response_text,
+                            error=error_details,
+                        ) from exc
                 if files:
                     break
                 last_response_text = response_text
                 last_finish_reason = finish_reason
                 last_parse_error = self._files_diagnostic(parsed, files)
                 if attempt < max_attempts:
+                    if contract:
+                        correction_prompt_override = build_contract_repair_prompt(
+                            contract,
+                            ["files missing or empty"],
+                        )
+                    else:
+                        correction_prompt_override = self._build_correction_prompt()
                     continue
                 preview = self._sanitize_llm_preview(last_response_text)
                 error_details = (
                     f"{last_parse_error}; response_preview={preview!r}; "
                     f"provider={provider.name}; model={settings.model}"
                 )
-                raise ValueError(
-                    "LLM response did not include any files to write. "
-                    f"{error_details}"
+                raise LLMResponseParseError(
+                    "missing_files",
+                    raw_text=last_response_text,
+                    error=(
+                        "LLM response did not include any files to write. "
+                        f"{error_details}"
+                    ),
                 )
         request_finished_at = datetime.now().isoformat()
 
@@ -1035,12 +1098,29 @@ class AICoder(AIAgent):
                 "Only import modules that exist in the generated files; "
                 "do not import api.* unless an api/ package is created."
             )
-        system_prompt = (
-            "You are the Coder agent. Follow the codex rules strictly.\n"
-            "Return JSON only with fields: files (list of {path, content}), "
-            "artifacts (object with implementation_plan or code_summary).\n"
-            "Do not include secrets or API keys in outputs."
-        )
+        contract_payload = task.get("output_contract")
+        contract = None
+        if isinstance(contract_payload, OutputContract):
+            contract = contract_payload
+        elif isinstance(contract_payload, dict):
+            try:
+                contract = OutputContract.model_validate(contract_payload)
+            except Exception:
+                contract = None
+        if contract and (contract.exact_json_only or contract.no_extra_text_outside_json):
+            system_prompt = (
+                "You are the Coder agent. Follow the codex rules strictly.\n"
+                "Return ONLY a JSON object with a top-level 'files' array of "
+                "{path, content}. No artifacts, no extra keys, no markdown.\n"
+                "Do not include secrets or API keys in outputs."
+            )
+        else:
+            system_prompt = (
+                "You are the Coder agent. Follow the codex rules strictly.\n"
+                "Return JSON only with fields: files (list of {path, content}), "
+                "artifacts (object with implementation_plan or code_summary).\n"
+                "Do not include secrets or API keys in outputs."
+            )
         existing_files = self._select_existing_files(review_report, context.get("files", []))
         user_payload = {
             "Task": task_description,
@@ -1055,6 +1135,7 @@ class AICoder(AIAgent):
             "Review errors": review_errors,
             "Review warnings": review_warnings,
             "Constraints": constraints,
+            "Output contract": contract.model_dump() if contract else None,
         }
         user_prompt = f"{json.dumps(user_payload, ensure_ascii=False, indent=2)}"
         messages = [

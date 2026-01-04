@@ -230,6 +230,38 @@ class TestAIOrchestrator:
         assert result["iterations"] == 2
         assert orchestrator.container.metadata["iterations"] == 2
         assert mock_agents["coder"].execute.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_micro_task_skips_project_stages(self, monkeypatch):
+        """Micro задачи должны обходить research/design/review стадии."""
+        monkeypatch.setenv("LLM_PROVIDER", "mock")
+        monkeypatch.setenv("ORCH_MICRO_MAX_ITERATIONS", "2")
+        task_text = (
+            "Return EXACTLY this JSON: "
+            "{\"files\":[{\"path\":\"micro.txt\",\"content\":\"hello\"}]}"
+        )
+
+        with patch("app.orchestrator.AIResearcher") as MockResearcher, \
+             patch("app.orchestrator.AIDesigner") as MockDesigner, \
+             patch("app.orchestrator.AIReviewer") as MockReviewer:
+            mock_researcher = AsyncMock()
+            mock_designer = AsyncMock()
+            mock_reviewer = AsyncMock()
+            MockResearcher.return_value = mock_researcher
+            MockDesigner.return_value = mock_designer
+            MockReviewer.return_value = mock_reviewer
+
+            orchestrator = AIOrchestrator()
+            orchestrator.initialize_project("Micro Test")
+
+            result = await orchestrator.process_task(task_text)
+
+            assert result["status"] == "completed"
+            assert result["files_count"] == 1
+            assert orchestrator.container.metadata["iterations"] <= 2
+            mock_researcher.execute.assert_not_called()
+            mock_designer.execute.assert_not_called()
+            mock_reviewer.execute.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_get_next_task(self, orchestrator):

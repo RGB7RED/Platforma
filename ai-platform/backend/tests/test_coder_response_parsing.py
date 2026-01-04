@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from app.agents import AICoder
+from app.agents import AICoder, ParseError
 from app.llm import MockProvider
 from app.models import Container
 
@@ -114,12 +114,12 @@ async def test_coder_fails_after_empty_files(monkeypatch):
     container = Container("test-project")
     task = {"type": "implement_component", "file": "main.py", "description": "Test"}
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(ParseError) as excinfo:
         await coder.execute(task, container)
 
-    message = str(excinfo.value)
-    assert "files empty" in message
-    assert "response_preview=" in message
-    assert "provider=mock" in message
-    assert "model=test-model" in message
+    error_detail = getattr(excinfo.value, "error", str(excinfo.value))
+    assert "files empty" in error_detail
+    assert "response_preview=" in error_detail
+    assert "provider=mock" in error_detail
+    assert "model=test-model" in error_detail
     assert calls["count"] == 3

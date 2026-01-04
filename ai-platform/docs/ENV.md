@@ -133,6 +133,30 @@ Open `http://localhost` in your browser.
 - **Required in production?:** Optional
 - **Notes:** Defaults to `false`. Can be overridden per task via the `manual_step` request flag.
 
+### ORCH_ENABLE_TRIAGE
+- **Purpose:** Enables orchestrator triage/planning to select micro vs project workflows.
+- **Example:** `ORCH_ENABLE_TRIAGE=true`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `true`. When disabled, the orchestrator always uses the codex workflow.
+
+### ORCH_MICRO_MAX_ITERATIONS
+- **Purpose:** Max iterations for micro-file tasks.
+- **Example:** `ORCH_MICRO_MAX_ITERATIONS=3`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `3` when unset.
+
+### ORCH_PLAN_MAX_TOKENS
+- **Purpose:** Token cap for the optional LLM plan classifier.
+- **Example:** `ORCH_PLAN_MAX_TOKENS=256`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `256` when unset.
+
+### ORCH_CONTRACT_REPAIR_ATTEMPTS
+- **Purpose:** Max repair attempts for output contract violations.
+- **Example:** `ORCH_CONTRACT_REPAIR_ATTEMPTS=2`
+- **Required in production?:** Optional
+- **Notes:** Defaults to `2` when unset.
+
 ### CODEX_PATH
 - **Purpose:** Override the JSON codex loaded by the orchestrator.
 - **Example:** `CODEX_PATH=ai-platform/backend/app/codex.json`
