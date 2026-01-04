@@ -14,6 +14,7 @@ from typing import Dict, Any, Optional, List, Callable
 from datetime import datetime
 
 from .models import Container, ProjectState
+from .planning import TaskMode, build_default_plan, build_task_plan
 from .logging_utils import configure_logging
 from .agents import (
     AIResearcher,
@@ -183,6 +184,10 @@ class AIOrchestrator:
                 return metadata_value
         env_value = self._get_bool_env("MANUAL_STEP_ENABLED")
         return bool(env_value) if env_value is not None else False
+
+    def _is_triage_enabled(self) -> bool:
+        env_value = self._get_bool_env("ORCH_ENABLE_TRIAGE")
+        return True if env_value is None else bool(env_value)
 
     def _get_task_token_usage(self, task_description: Optional[str]) -> int:
         if not task_description:
@@ -369,11 +374,22 @@ class AIOrchestrator:
             self.container.metadata["manual_step_enabled"] = manual_step_enabled
         if resume_payload is not None:
             self.container.metadata["resume_payload"] = resume_payload
+        triage_enabled = self._is_triage_enabled()
+        if triage_enabled:
+            plan = await build_task_plan(user_task, self.codex, allow_llm=True)
+        else:
+            plan = build_default_plan(self.codex)
+        self.container.metadata["task_plan"] = plan.model_dump()
+        if plan.mode == TaskMode.micro_file:
+            if plan.contract.allowed_paths:
+                self.container.metadata["allowed_paths"] = plan.contract.allowed_paths
+            self.container.metadata["output_contract"] = plan.contract.model_dump()
 
-        stages = ["research", "design", "implementation", "review"]
+        stages = plan.stages
+        stage_indexes = {stage: idx for idx, stage in enumerate(stages)}
         start_index = 0
-        if resume_from_stage in stages:
-            start_index = stages.index(resume_from_stage)
+        if resume_from_stage in stage_indexes:
+            start_index = stage_indexes[resume_from_stage]
         
         logger.info(f"Starting processing of task: {user_task[:50]}...")
         await self._run_hook(
@@ -387,7 +403,7 @@ class AIOrchestrator:
         
         try:
             # Фаза 1: Исследование
-            if start_index <= stages.index("research"):
+            if "research" in stage_indexes and start_index <= stage_indexes["research"]:
                 logger.info("Phase 1: Research")
                 await self._run_hook(
                     callbacks.get("stage_started") if callbacks else None,
@@ -411,7 +427,7 @@ class AIOrchestrator:
                 )
             
             # Фаза 2: Проектирование
-            if start_index <= stages.index("design"):
+            if "design" in stage_indexes and start_index <= stage_indexes["design"]:
                 logger.info("Phase 2: Design")
                 await self._run_hook(
                     callbacks.get("stage_started") if callbacks else None,
@@ -434,13 +450,15 @@ class AIOrchestrator:
                     "designer"
                 )
 
-            if start_index <= stages.index("implementation"):
+            if "implementation" in stage_indexes and start_index <= stage_indexes["implementation"]:
                 template_manifest = self.container.metadata.get("template_manifest")
-                clarification_questions = self._plan_clarification_questions(
-                    user_task,
-                    template_manifest=template_manifest if isinstance(template_manifest, dict) else None,
-                    provided_answers=self.container.metadata.get("provided_answers"),
-                )
+                clarification_questions = []
+                if plan.mode == TaskMode.project:
+                    clarification_questions = self._plan_clarification_questions(
+                        user_task,
+                        template_manifest=template_manifest if isinstance(template_manifest, dict) else None,
+                        provided_answers=self.container.metadata.get("provided_answers"),
+                    )
                 if clarification_questions:
                     requested_at = datetime.now().isoformat()
                     resume_stage = "implementation"
@@ -465,7 +483,7 @@ class AIOrchestrator:
                     }
             
             # Фаза 3: Итеративная реализация
-            if start_index <= stages.index("implementation"):
+            if "implementation" in stage_indexes and start_index <= stage_indexes["implementation"]:
                 logger.info("Phase 3: Implementation")
                 await self._run_hook(
                     callbacks.get("stage_started") if callbacks else None,
@@ -474,8 +492,8 @@ class AIOrchestrator:
                 self.container.update_state(ProjectState.IMPLEMENTATION, "Implementing solution")
             
             iteration = 0
-            max_iterations = self.codex.get("workflow", {}).get("max_iterations", 15)
-            logger.info("Codex max_iterations=%s", max_iterations)
+            max_iterations = plan.max_iterations
+            logger.info("Plan mode=%s max_iterations=%s", plan.mode.value, max_iterations)
             failure_reason: Optional[str] = None
             failure_stage: Optional[str] = None
             next_task_override: Optional[Dict[str, Any]] = None
@@ -488,8 +506,18 @@ class AIOrchestrator:
             self.container.metadata.setdefault("llm_calls", 0)
             self.container.metadata.setdefault("llm_retries", 0)
             self.container.metadata["iterations"] = iteration
+            if plan.mode == TaskMode.micro_file:
+                micro_task = {
+                    "type": "micro_file",
+                    "description": user_task,
+                    "allowed_paths": plan.contract.allowed_paths or [],
+                    "output_contract": plan.contract.model_dump(),
+                }
+                if plan.contract.allowed_paths and len(plan.contract.allowed_paths) == 1:
+                    micro_task["file"] = plan.contract.allowed_paths[0]
+                next_task_override = micro_task
 
-            if start_index <= stages.index("implementation"):
+            if "implementation" in stage_indexes and start_index <= stage_indexes["implementation"]:
                 while not self.container.is_complete() and iteration < max_iterations:
                     iteration += 1
                     self.container.metadata["iterations"] = iteration
@@ -599,18 +627,19 @@ class AIOrchestrator:
                                     "Must be a single JSON object."
                                 )
                                 continue
-                            reason_detail = (exc.error or "invalid JSON").strip()
+                            reason_label = exc.reason or "llm_invalid_json"
+                            reason_detail = (exc.error or reason_label).strip()
                             if len(reason_detail) > 200:
                                 reason_detail = f"{reason_detail[:200].rstrip()}..."
                             await self._run_hook(
                                 callbacks.get("stage_failed") if callbacks else None,
                                 {
                                     "stage": "implementation",
-                                    "reason": "llm_invalid_json",
+                                    "reason": reason_label,
                                     "error": exc.error or str(exc),
                                 },
                             )
-                            self.container.update_state(ProjectState.ERROR, "llm_invalid_json")
+                            self.container.update_state(ProjectState.ERROR, reason_label)
                             return {
                                 "status": "failed",
                                 "container_id": self.container.project_id,
@@ -623,7 +652,7 @@ class AIOrchestrator:
                                 "iterations": iteration,
                                 "max_iterations": max_iterations,
                                 "history": self.task_history[-5:],
-                                "failure_reason": f"llm_invalid_json: {reason_detail}",
+                                "failure_reason": f"{reason_label}: {reason_detail}",
                             }
                         except BudgetExceededError:
                             await self._run_hook(
@@ -727,60 +756,96 @@ class AIOrchestrator:
                         {"task": next_task, "result": coder_result, "iteration": iteration},
                     )
 
-                    # 3.3 Ревьюер проверяет результат
-                    self.container.metadata["active_role"] = "reviewer"
-                    await self._run_hook(
-                        callbacks.get("review_started") if callbacks else None,
-                        {"kind": "iteration", "iteration": iteration},
-                    )
-                    review_result = await self.roles["reviewer"].execute(
-                        self.container,
-                        workspace_path=workspace_path,
-                        command_runner=command_runner,
-                    )
-                    await self._run_hook(
-                        callbacks.get("review_finished") if callbacks else None,
-                        {"result": review_result, "kind": "iteration", "iteration": iteration},
-                    )
-                    await self._run_hook(
-                        callbacks.get("review_result") if callbacks else None,
-                        {"result": review_result, "kind": "iteration", "iteration": iteration},
-                    )
-
-                    if review_result.get("command_timeout"):
-                        failure_reason = "command_timeout"
-                        failure_stage = "implementation"
-                        logger.warning("Iteration %s halted due to command timeout", iteration)
+                    if plan.mode == TaskMode.micro_file:
+                        self.container.update_state(ProjectState.COMPLETE, "Micro task completed")
+                        self.container.update_progress(1.0)
                         break
-                    if review_result.get("passed"):
-                        logger.info(f"Iteration {iteration} approved")
-                        self.container.update_progress(iteration / max_iterations)
-                    else:
-                        logger.warning(f"Iteration {iteration} rejected: {review_result.get('issues', [])}")
-                        next_task_override = self._build_fix_task(next_task, review_result)
-                    next_task_preview = self._preview_task(next_task_override or self._get_next_task())
-                    next_actions = self._build_next_actions(
-                        stage="implementation",
-                        iteration=iteration,
-                        review_result=review_result,
-                        next_task_preview=next_task_preview,
-                    )
-                    self.container.add_artifact("next_actions", next_actions, "orchestrator")
-                    await self._run_hook(
-                        callbacks.get("next_actions") if callbacks else None,
-                        {"payload": next_actions},
-                    )
-                    manual_stage = "post_iteration_review"
-                    if self._manual_step_enabled(manual_step_enabled) and manual_stage != skip_manual_stage:
-                        last_review_status = (
-                            review_result.get("status") if isinstance(review_result, dict) else None
+
+                    if plan.use_review:
+                        # 3.3 Ревьюер проверяет результат
+                        self.container.metadata["active_role"] = "reviewer"
+                        await self._run_hook(
+                            callbacks.get("review_started") if callbacks else None,
+                            {"kind": "iteration", "iteration": iteration},
                         )
-                        self.container.metadata.update(
-                            {
+                        review_result = await self.roles["reviewer"].execute(
+                            self.container,
+                            workspace_path=workspace_path,
+                            command_runner=command_runner,
+                        )
+                        await self._run_hook(
+                            callbacks.get("review_finished") if callbacks else None,
+                            {"result": review_result, "kind": "iteration", "iteration": iteration},
+                        )
+                        await self._run_hook(
+                            callbacks.get("review_result") if callbacks else None,
+                            {"result": review_result, "kind": "iteration", "iteration": iteration},
+                        )
+
+                        if review_result.get("command_timeout"):
+                            failure_reason = "command_timeout"
+                            failure_stage = "implementation"
+                            logger.warning("Iteration %s halted due to command timeout", iteration)
+                            break
+                        if review_result.get("passed"):
+                            logger.info(f"Iteration {iteration} approved")
+                            self.container.update_progress(iteration / max_iterations)
+                        else:
+                            logger.warning(
+                                f"Iteration {iteration} rejected: {review_result.get('issues', [])}"
+                            )
+                            next_task_override = self._build_fix_task(next_task, review_result)
+                        next_task_preview = self._preview_task(
+                            next_task_override or self._get_next_task()
+                        )
+                        next_actions = self._build_next_actions(
+                            stage="implementation",
+                            iteration=iteration,
+                            review_result=review_result,
+                            next_task_preview=next_task_preview,
+                        )
+                        self.container.add_artifact("next_actions", next_actions, "orchestrator")
+                        await self._run_hook(
+                            callbacks.get("next_actions") if callbacks else None,
+                            {"payload": next_actions},
+                        )
+                        manual_stage = "post_iteration_review"
+                        if (
+                            self._manual_step_enabled(manual_step_enabled)
+                            and manual_stage != skip_manual_stage
+                        ):
+                            last_review_status = (
+                                review_result.get("status")
+                                if isinstance(review_result, dict)
+                                else None
+                            )
+                            self.container.metadata.update(
+                                {
+                                    "awaiting_manual_step": True,
+                                    "manual_step_stage": manual_stage,
+                                    "manual_step_options": ["continue", "stop", "retry"],
+                                    "last_review_status": last_review_status,
+                                    "next_task_preview": next_task_preview,
+                                    "resume_phase": "implementation",
+                                    "resume_iteration": iteration,
+                                    "resume_payload": {
+                                        "next_task_override": next_task_override,
+                                        "next_task_preview": next_task_preview,
+                                    },
+                                }
+                            )
+                            return {
+                                "status": "needs_input",
+                                "container_id": self.container.project_id,
+                                "state": self.container.state.value,
+                                "progress": self.container.progress,
                                 "awaiting_manual_step": True,
                                 "manual_step_stage": manual_stage,
                                 "manual_step_options": ["continue", "stop", "retry"],
                                 "last_review_status": last_review_status,
+                                "last_review_report_artifact_id": self.container.metadata.get(
+                                    "last_review_report_artifact_id"
+                                ),
                                 "next_task_preview": next_task_preview,
                                 "resume_phase": "implementation",
                                 "resume_iteration": iteration,
@@ -789,27 +854,6 @@ class AIOrchestrator:
                                     "next_task_preview": next_task_preview,
                                 },
                             }
-                        )
-                        return {
-                            "status": "needs_input",
-                            "container_id": self.container.project_id,
-                            "state": self.container.state.value,
-                            "progress": self.container.progress,
-                            "awaiting_manual_step": True,
-                            "manual_step_stage": manual_stage,
-                            "manual_step_options": ["continue", "stop", "retry"],
-                            "last_review_status": last_review_status,
-                            "last_review_report_artifact_id": self.container.metadata.get(
-                                "last_review_report_artifact_id"
-                            ),
-                            "next_task_preview": next_task_preview,
-                            "resume_phase": "implementation",
-                            "resume_iteration": iteration,
-                            "resume_payload": {
-                                "next_task_override": next_task_override,
-                                "next_task_preview": next_task_preview,
-                            },
-                        }
             else:
                 iteration = self.container.metadata.get("iterations", 0) or 0
 
@@ -879,11 +923,8 @@ class AIOrchestrator:
                 }
             
             # Фаза 4: Финальное ревью
-            review_required = self.codex.get("workflow", {}).get(
-                "review_required",
-                self.codex.get("workflow", {}).get("require_review", True),
-            )
-            if review_required and start_index <= stages.index("review"):
+            review_required = plan.use_review
+            if review_required and "review" in stage_indexes and start_index <= stage_indexes["review"]:
                 manual_stage = "pre_final_review"
                 if self._manual_step_enabled(manual_step_enabled) and manual_stage != skip_manual_stage:
                     self.container.metadata.update(

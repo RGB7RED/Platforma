@@ -125,10 +125,14 @@ class MockProvider:
         )
         path = "generated.py"
         task_line = "Implement requested changes."
+        exact_json_only = False
         try:
             payload = json.loads(prompt)
             path = payload.get("Target file") or payload.get("Target file", path)
             task_line = payload.get("Task", task_line)
+            contract_payload = payload.get("Output contract") or {}
+            if isinstance(contract_payload, dict):
+                exact_json_only = bool(contract_payload.get("exact_json_only"))
         except json.JSONDecodeError:
             path = _extract_between(prompt, "Target file:", "\n") or path
             task_line = _extract_between(prompt, "Task:", "\n") or task_line
@@ -152,6 +156,8 @@ def placeholder():
                 )
             },
         }
+        if exact_json_only:
+            response = {"files": [{"path": path.strip(), "content": content}]}
         if expects_chunk:
             response = {
                 "status": "complete",
