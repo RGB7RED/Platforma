@@ -148,7 +148,35 @@
                         </div>
                     </div>
 
-                    <div class="form-group">
+                    <div class="form-group hidden" id="interactiveDisabledHint">
+                        <div class="task-lookup-hint warning-message">
+                            Interactive research disabled. Switch to the classic prompt flow to start processing.
+                        </div>
+                    </div>
+
+                    <div class="intake-chat-panel" id="intakeChatPanel">
+                        <div class="intake-chat-header">
+                            <label class="intake-chat-title">Intake Chat</label>
+                            <span class="intake-chat-status" id="intakeChatStatus">Intake: waiting</span>
+                        </div>
+                        <p class="task-lookup-hint" id="intakeChatHint">
+                            Опишите задачу. Я задам 3 уточняющих вопроса…
+                        </p>
+                        <div class="chat-history" id="intakeChatHistory"></div>
+                        <div class="intake-chat-input-row">
+                            <textarea
+                                id="intakeChatInput"
+                                class="task-description-input intake-chat-input"
+                                rows="3"
+                                placeholder="Опишите задачу. Я задам 3 уточняющих вопроса…"
+                            ></textarea>
+                            <button class="primary-btn intake-chat-send" id="intakeChatSendBtn" type="button">
+                                Send
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="form-group hidden" id="legacyPromptGroup">
                         <label for="taskDescription">Chat with AI</label>
                         <textarea 
                             id="taskDescription" 
@@ -274,7 +302,13 @@
                         <strong>Debug API base URL:</strong> <span id="debugApiBaseUrl">-</span>
                     </div>
                     <div class="status-row">
+                        <strong>Task id:</strong> <span id="debugTaskId">-</span>
+                    </div>
+                    <div class="status-row">
                         <strong>Task status:</strong> <span id="debugTaskStatus">-</span>
+                    </div>
+                    <div class="status-row">
+                        <strong>can_start:</strong> <span id="debugCanStart">-</span>
                     </div>
                     <div class="status-row">
                         <strong>Task stage:</strong> <span id="debugTaskStage">-</span>

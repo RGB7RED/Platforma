@@ -243,15 +243,19 @@ body {
     border-radius: var(--radius-md);
     background: var(--surface-color);
     border: 1px solid var(--border-color);
+    max-width: 85%;
+    box-shadow: var(--shadow-sm);
 }
 
 .chat-message.user {
     border-color: rgba(99, 102, 241, 0.4);
     background: rgba(99, 102, 241, 0.08);
+    align-self: flex-end;
 }
 
 .chat-message.assistant {
     border-color: rgba(15, 23, 42, 0.12);
+    align-self: flex-start;
 }
 
 .chat-meta {
@@ -289,6 +293,57 @@ body {
     font-family: inherit;
     resize: vertical;
     min-height: 150px;
+}
+
+.intake-chat-panel {
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    padding: 20px;
+    background: var(--background-color);
+    margin-bottom: 24px;
+}
+
+.intake-chat-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.intake-chat-title {
+    font-weight: 600;
+    font-size: 1rem;
+    color: var(--text-primary);
+}
+
+.intake-chat-status {
+    font-size: 0.85rem;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(99, 102, 241, 0.12);
+    color: var(--primary-dark);
+    font-weight: 600;
+}
+
+.intake-chat-input-row {
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+}
+
+.intake-chat-input {
+    min-height: 110px;
+}
+
+.intake-chat-send {
+    height: 46px;
+    padding: 0 20px;
+}
+
+.warning-message {
+    color: var(--warning-color);
+    font-weight: 600;
 }
 
 .task-description-input:focus {
