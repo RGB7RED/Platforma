@@ -71,6 +71,26 @@ class DummyCoder:
         return {"files": []}
 
 
+class DummyPlanner:
+    def __init__(self, codex):
+        self.codex = codex
+
+    async def execute(self, container):
+        return {
+            "plan_version": 1,
+            "steps": [
+                {
+                    "id": "create_structure",
+                    "goal": "Create structure",
+                    "files": [],
+                    "acceptance_criteria": ["Structure exists"],
+                    "commands": ["pytest"],
+                }
+            ],
+            "order": ["create_structure"],
+        }
+
+
 class DummyReviewer:
     def __init__(self, codex):
         self.codex = codex
@@ -83,6 +103,7 @@ def test_interactive_research_chat_flow(monkeypatch) -> None:
     monkeypatch.setenv("ORCH_INTERACTIVE_RESEARCH", "true")
     monkeypatch.setenv("ORCH_ENABLE_TRIAGE", "false")
     monkeypatch.setattr(orchestrator_module, "AIDesigner", DummyDesigner)
+    monkeypatch.setattr(orchestrator_module, "AIPlanner", DummyPlanner)
     monkeypatch.setattr(orchestrator_module, "AICoder", DummyCoder)
     monkeypatch.setattr(orchestrator_module, "AIReviewer", DummyReviewer)
 

@@ -807,6 +807,145 @@ class AIDesigner(AIAgent):
         return md
 
 
+class AIPlanner(AIAgent):
+    """ИИ-планировщик: готовит пошаговый план реализации."""
+
+    def __init__(self, codex: Dict[str, Any]):
+        super().__init__(codex, "planner")
+
+    async def execute(self, container: Container) -> Dict[str, Any]:
+        self._log_action("start_planning", {})
+
+        requirements = self._latest_artifact(container, "requirements")
+        architecture = self._latest_artifact(container, "architecture") or container.target_architecture
+        review_report = self._latest_artifact(container, "review_report")
+
+        plan_version = int(container.metadata.get("plan_version", 0) or 0) + 1
+        plan = self._build_plan(
+            requirements=requirements,
+            architecture=architecture,
+            review_report=review_report,
+            plan_version=plan_version,
+        )
+
+        container.metadata["plan_version"] = plan_version
+        container.metadata["plan_step_index"] = 0
+
+        self._log_action(
+            "planning_completed",
+            {
+                "plan_version": plan_version,
+                "steps": len(plan.get("steps", [])),
+            },
+        )
+        return plan
+
+    @staticmethod
+    def _latest_artifact(container: Container, key: str) -> Optional[Dict[str, Any]]:
+        artifacts = container.artifacts.get(key) or []
+        if not artifacts:
+            return None
+        latest = artifacts[-1]
+        return latest.content if hasattr(latest, "content") else latest
+
+    @staticmethod
+    def _collect_expected_files(architecture: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(architecture, dict):
+            return []
+        components = architecture.get("components") if isinstance(architecture.get("components"), list) else []
+        files: List[str] = []
+        for component in components:
+            for path in component.get("files", []) if isinstance(component, dict) else []:
+                if path:
+                    files.append(str(path))
+        return list(dict.fromkeys(files))
+
+    def _build_plan(
+        self,
+        *,
+        requirements: Optional[Dict[str, Any]],
+        architecture: Optional[Dict[str, Any]],
+        review_report: Optional[Dict[str, Any]],
+        plan_version: int,
+    ) -> Dict[str, Any]:
+        expected_files = self._collect_expected_files(architecture)
+        review_errors = (
+            review_report.get("errors")
+            if isinstance(review_report, dict)
+            else None
+        )
+        review_summary = (
+            review_report.get("summary") or review_report.get("message")
+            if isinstance(review_report, dict)
+            else None
+        )
+
+        steps: List[Dict[str, Any]] = []
+        order: List[str] = []
+
+        structure_step = {
+            "id": "create_structure",
+            "goal": "Создать базовую структуру проекта и каркас файлов",
+            "files": expected_files,
+            "acceptance_criteria": [
+                "Создана структура директорий",
+                "Базовые файлы существуют и доступны",
+            ],
+            "commands": ["python -m compileall ."],
+        }
+        steps.append(structure_step)
+        order.append(structure_step["id"])
+
+        pages_step = {
+            "id": "generate_pages",
+            "goal": "Сгенерировать страницы и основные компоненты интерфейса",
+            "files": [path for path in expected_files if Path(path).suffix in {".html", ".tsx", ".jsx", ".js", ".css"}]
+            or expected_files,
+            "acceptance_criteria": [
+                "Страницы и компоненты сгенерированы",
+                "Маршрутизация/шаблоны работают корректно",
+            ],
+            "commands": ["ruff .", "pytest"],
+        }
+        steps.append(pages_step)
+        order.append(pages_step["id"])
+
+        if isinstance(review_errors, list) and review_errors:
+            fix_step = {
+                "id": "fix_review_findings",
+                "goal": "Исправить замечания ревью",
+                "files": expected_files,
+                "acceptance_criteria": review_errors,
+                "commands": ["ruff .", "pytest"],
+            }
+            steps.append(fix_step)
+            order.append(fix_step["id"])
+
+        checks_step = {
+            "id": "verify_quality",
+            "goal": "Проверить линтеры и тесты",
+            "files": expected_files,
+            "acceptance_criteria": [
+                "Линтеры проходят без ошибок",
+                "Тесты проходят успешно",
+            ],
+            "commands": ["ruff .", "pytest"],
+        }
+        steps.append(checks_step)
+        order.append(checks_step["id"])
+
+        return {
+            "plan_version": plan_version,
+            "inputs": {
+                "requirements": requirements,
+                "architecture": architecture,
+                "review_summary": review_summary,
+            },
+            "steps": steps,
+            "order": order,
+        }
+
+
 class AICoder(AIAgent):
     """ИИ-кодер: реализует код согласно архитектуре"""
     
@@ -2517,14 +2656,22 @@ class AIReviewer(AIAgent):
             status = "rejected"
             message = f"Found {len(errors)} critical issues"
 
+        commands = []
+        for report in (ruff_report, pytest_report, compileall_report):
+            command_value = report.get("command") if isinstance(report, dict) else None
+            if command_value:
+                commands.append(command_value)
+
         review_result = {
             "status": status,
             "passed": passed,
             "message": message,
+            "summary": message,
             "timestamp": datetime.now().isoformat(),
             "issues": issues,
             "warnings": warnings,
             "errors": errors,
+            "commands": commands,
             "passed_checks": passed_checks,
             "files_reviewed": len(container.files),
             "checklist_used": checklist,
@@ -2532,7 +2679,7 @@ class AIReviewer(AIAgent):
             "pytest": pytest_report,
             "compileall": compileall_report,
             "command_timeout": timed_out,
-            "summary": {
+            "summary_details": {
                 "total_files": len(container.files),
                 "total_issues": len(issues),
                 "total_warnings": len(warnings),

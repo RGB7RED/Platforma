@@ -46,6 +46,24 @@
         "technology_stack": ["python", "fastapi", "react"]
       }
     },
+
+    "planner": {
+      "purpose": "Построение пошагового плана реализации",
+      "responsibilities": [
+        "Сформировать план реализации на основе требований и архитектуры",
+        "Учитывать замечания ревью при повторном запуске",
+        "Определить порядок шагов и критерии приёмки"
+      ],
+      "constraints": [
+        "Не менять требования и архитектуру",
+        "Не писать код"
+      ],
+      "required_outputs": ["implementation_plan"],
+      "success_criteria": "План покрывает требования и устраняет замечания ревью",
+      "parameters": {
+        "min_steps": 3
+      }
+    },
     
     "coder": {
       "purpose": "Реализация системы согласно архитектуре",
@@ -123,7 +141,7 @@
   },
   
   "workflow": {
-    "stages": ["research", "design", "implementation", "review"],
+    "stages": ["research", "design", "planning", "implementation", "review"],
     "max_iterations": 12,
     "require_review": true,
     "review_required": true,

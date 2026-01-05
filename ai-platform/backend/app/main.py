@@ -3848,12 +3848,14 @@ async def process_task_background(
         stage_progress = {
             "research": 0.2,
             "design": 0.4,
+            "planning": 0.5,
             "implementation": 0.6,
             "review": 0.9,
         }
         stage_role = {
             "research": "researcher",
             "design": "designer",
+            "planning": "planner",
             "implementation": "coder",
             "review": "reviewer",
         }
@@ -3914,6 +3916,21 @@ async def process_task_background(
                 normalize_payload({"type": "architecture"}),
             )
             await persist_all_container_files(task_id, container)
+            await persist_container_snapshot(task_id, container)
+
+        async def handle_planning_complete(payload: Dict[str, Any]) -> None:
+            result = payload.get("result")
+            await record_artifact(
+                task_id,
+                "implementation_plan",
+                normalize_payload(result),
+                produced_by="planner",
+            )
+            await record_event(
+                task_id,
+                "ArtifactAdded",
+                normalize_payload({"type": "implementation_plan"}),
+            )
             await persist_container_snapshot(task_id, container)
 
         async def handle_review_started(payload: Dict[str, Any]) -> None:
@@ -3993,6 +4010,20 @@ async def process_task_background(
                 normalize_payload({"stage": actions_payload.get("stage")}),
             )
             await persist_container_snapshot(task_id, container)
+
+        async def handle_plan_step_started(payload: Dict[str, Any]) -> None:
+            await record_event(
+                task_id,
+                "PlanStepStarted",
+                normalize_payload(payload),
+            )
+
+        async def handle_plan_step_finished(payload: Dict[str, Any]) -> None:
+            await record_event(
+                task_id,
+                "PlanStepFinished",
+                normalize_payload(payload),
+            )
 
         async def handle_codex_loaded(payload: Dict[str, Any]) -> None:
             await record_event(
@@ -4115,11 +4146,14 @@ async def process_task_background(
                 "stage_started": handle_stage_started,
                 "research_complete": handle_research_complete,
                 "design_complete": handle_design_complete,
+                "planning_complete": handle_planning_complete,
                 "coder_finished": handle_coder_finished,
                 "review_started": handle_review_started,
                 "review_finished": handle_review_finished,
                 "review_result": handle_review_result,
                 "next_actions": handle_next_actions,
+                "plan_step_started": handle_plan_step_started,
+                "plan_step_finished": handle_plan_step_finished,
                 "codex_loaded": handle_codex_loaded,
                 "llm_usage": handle_llm_usage,
                 "llm_error": handle_llm_error,

@@ -22,12 +22,14 @@ class TestAIOrchestrator:
         """Фикстура моков агентов"""
         with patch('app.orchestrator.AIResearcher') as MockResearcher, \
              patch('app.orchestrator.AIDesigner') as MockDesigner, \
+             patch('app.orchestrator.AIPlanner') as MockPlanner, \
              patch('app.orchestrator.AICoder') as MockCoder, \
              patch('app.orchestrator.AIReviewer') as MockReviewer:
             
             # Создаем мок-агентов
             mock_researcher = AsyncMock()
             mock_designer = AsyncMock()
+            mock_planner = AsyncMock()
             mock_coder = AsyncMock()
             mock_reviewer = AsyncMock()
 
@@ -40,21 +42,42 @@ class TestAIOrchestrator:
             mock_designer.execute.return_value = {
                 "components": [{"name": "Test", "files": ["test.py"]}]
             }
+            async def _planner_execute(container):
+                plan_version = int(container.metadata.get("plan_version", 0) or 0) + 1
+                container.metadata["plan_version"] = plan_version
+                container.metadata["plan_step_index"] = 0
+                return {
+                    "plan_version": plan_version,
+                    "steps": [
+                        {
+                            "id": "create_structure",
+                            "goal": "Create structure",
+                            "files": ["test.py"],
+                            "acceptance_criteria": ["Structure exists"],
+                            "commands": ["pytest"],
+                        }
+                    ],
+                    "order": ["create_structure"],
+                }
+
+            mock_planner.execute.side_effect = _planner_execute
             mock_coder.execute.return_value = {"file": "test.py", "size": 100}
             mock_reviewer.execute.return_value = {"status": "approved", "passed": True}
             
             # Настраиваем классы моков
             MockResearcher.return_value = mock_researcher
             MockDesigner.return_value = mock_designer
+            MockPlanner.return_value = mock_planner
             MockCoder.return_value = mock_coder
             MockReviewer.return_value = mock_reviewer
             
             yield {
                 "researcher": mock_researcher,
                 "designer": mock_designer,
+                "planner": mock_planner,
                 "coder": mock_coder,
                 "reviewer": mock_reviewer,
-                "mocks": [MockResearcher, MockDesigner, MockCoder, MockReviewer]
+                "mocks": [MockResearcher, MockDesigner, MockPlanner, MockCoder, MockReviewer]
             }
     
     @pytest.mark.asyncio
@@ -69,6 +92,7 @@ class TestAIOrchestrator:
             "researcher",
             "interviewer",
             "designer",
+            "planner",
             "coder",
             "reviewer",
         }.issubset(set(orchestrator.roles))
@@ -89,6 +113,7 @@ class TestAIOrchestrator:
         # Проверяем, что агенты были вызваны
         mock_agents["researcher"].execute.assert_called_once()
         mock_agents["designer"].execute.assert_called_once()
+        mock_agents["planner"].execute.assert_called()
         mock_agents["coder"].execute.assert_called()
         mock_agents["reviewer"].execute.assert_called()
     
@@ -132,6 +157,19 @@ class TestAIOrchestrator:
         """Финальное ревью с ошибками должно помечать задачу как failed"""
         orchestrator.initialize_project("Test")
 
+        mock_agents["planner"].execute.return_value = {
+            "plan_version": 1,
+            "steps": [
+                {
+                    "id": "create_structure",
+                    "goal": "Create structure",
+                    "files": ["test.py"],
+                    "acceptance_criteria": ["Structure exists"],
+                    "commands": ["pytest"],
+                }
+            ],
+            "order": ["create_structure"],
+        }
         mock_agents["designer"].execute.return_value = {"components": []}
         mock_agents["reviewer"].execute.return_value = {
             "status": "rejected",
@@ -139,10 +177,46 @@ class TestAIOrchestrator:
             "errors": ["ruff failed"],
         }
 
-        result = await orchestrator.process_task("Create a test API")
+        result = await orchestrator.process_task(
+            "Create a test API",
+            manual_step_enabled=False,
+        )
 
         assert result["status"] == "failed"
         assert orchestrator.container.state == ProjectState.ERROR
+
+    @pytest.mark.asyncio
+    async def test_review_failure_reroutes_to_planning(self, orchestrator, mock_agents, monkeypatch):
+        """Провал финального ревью возвращает на planning и повторяет implementation."""
+        orchestrator.initialize_project("Test")
+        monkeypatch.setenv("ORCH_MAX_REVIEW_CYCLES", "2")
+
+        stages = []
+
+        async def handle_stage_started(payload):
+            stages.append(payload.get("stage"))
+
+        mock_agents["designer"].execute.return_value = {"components": []}
+        mock_agents["coder"].execute.return_value = {"file": "test.py", "size": 100}
+        mock_agents["reviewer"].execute.side_effect = [
+            {"status": "approved", "passed": True},
+            {"status": "rejected", "passed": False, "errors": ["fail"]},
+            {"status": "approved", "passed": True},
+            {"status": "approved", "passed": True},
+        ]
+
+        result = await orchestrator.process_task(
+            "Create a test API",
+            callbacks={"stage_started": handle_stage_started},
+        )
+
+        assert result["status"] == "completed"
+        assert mock_agents["planner"].execute.call_count == 2
+        assert orchestrator.container.metadata.get("plan_version") == 2
+        assert mock_agents["coder"].execute.call_count >= 2
+        assert stages.count("planning") == 2
+        second_planning_index = stages.index("planning", stages.index("planning") + 1)
+        assert "review" in stages[:second_planning_index]
 
     @pytest.mark.asyncio
     async def test_process_task_manual_gate_after_review(self, orchestrator, mock_agents, monkeypatch):
@@ -201,7 +275,7 @@ class TestAIOrchestrator:
         mock_agents["designer"].execute.return_value = {
             "components": [{"name": "Test", "files": ["test.py"]}]
         }
-        task_description = "Implement test.py for Test"
+        task_description = "Create structure"
         orchestrator.container.metadata["llm_usage"] = [
             {
                 "stage": "implementation",

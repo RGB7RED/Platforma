@@ -57,6 +57,8 @@ class Container:
             "git_export": [],
             "repro_manifest": [],
             "usage_report": [],
+            "implementation_plan": [],
+            "plan_step_index": [],
             "clarification_questions": [],
             "next_actions": [],
             "research_chat": [],
@@ -159,10 +161,17 @@ class Container:
                 "existing_architecture": self.target_architecture
             })
         elif role_name == "coder":
+            implementation_plan = None
+            plan_artifacts = self.artifacts.get("implementation_plan") or []
+            if plan_artifacts:
+                latest = plan_artifacts[-1]
+                implementation_plan = latest.content if hasattr(latest, "content") else latest
             context.update({
                 "architecture": self.target_architecture,
                 "files": list(self.files.keys()),
-                "recent_changes": self.history[-5:] if self.history else []
+                "recent_changes": self.history[-5:] if self.history else [],
+                "implementation_plan": implementation_plan,
+                "plan_step_index": self.metadata.get("plan_step_index"),
             })
         elif role_name == "reviewer":
             context.update({
