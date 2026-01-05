@@ -22,35 +22,44 @@ class TestAIOrchestrator:
         """Фикстура моков агентов"""
         with patch('app.orchestrator.AIResearcher') as MockResearcher, \
              patch('app.orchestrator.AIDesigner') as MockDesigner, \
+             patch('app.orchestrator.AIPlanner') as MockPlanner, \
              patch('app.orchestrator.AICoder') as MockCoder, \
              patch('app.orchestrator.AIReviewer') as MockReviewer:
             
             # Создаем мок-агентов
             mock_researcher = AsyncMock()
             mock_designer = AsyncMock()
+            mock_planner = AsyncMock()
             mock_coder = AsyncMock()
             mock_reviewer = AsyncMock()
-            
+
             # Настраиваем возвращаемые значения
-            mock_researcher.execute.return_value = {"requirements": []}
+            async def _researcher_execute(task, container):
+                container.add_artifact("requirements", {"requirements": []}, "researcher")
+                return {"requirements": []}
+
+            mock_researcher.execute.side_effect = _researcher_execute
             mock_designer.execute.return_value = {
                 "components": [{"name": "Test", "files": ["test.py"]}]
             }
+            mock_planner.execute.return_value = {"steps": []}
             mock_coder.execute.return_value = {"file": "test.py", "size": 100}
             mock_reviewer.execute.return_value = {"status": "approved", "passed": True}
             
             # Настраиваем классы моков
             MockResearcher.return_value = mock_researcher
             MockDesigner.return_value = mock_designer
+            MockPlanner.return_value = mock_planner
             MockCoder.return_value = mock_coder
             MockReviewer.return_value = mock_reviewer
             
             yield {
                 "researcher": mock_researcher,
                 "designer": mock_designer,
+                "planner": mock_planner,
                 "coder": mock_coder,
                 "reviewer": mock_reviewer,
-                "mocks": [MockResearcher, MockDesigner, MockCoder, MockReviewer]
+                "mocks": [MockResearcher, MockDesigner, MockPlanner, MockCoder, MockReviewer]
             }
     
     @pytest.mark.asyncio
@@ -61,7 +70,14 @@ class TestAIOrchestrator:
         assert container is not None
         assert container.metadata["project_name"] == "Test Project"
         assert "started_at" in container.metadata
-        assert len(orchestrator.roles) == 4
+        assert {
+            "researcher",
+            "interviewer",
+            "designer",
+            "planner",
+            "coder",
+            "reviewer",
+        }.issubset(set(orchestrator.roles))
     
     @pytest.mark.asyncio
     async def test_process_task_success(self, orchestrator, mock_agents):
@@ -81,6 +97,40 @@ class TestAIOrchestrator:
         mock_agents["designer"].execute.assert_called_once()
         mock_agents["coder"].execute.assert_called()
         mock_agents["reviewer"].execute.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_review_failure_replans(self, orchestrator, mock_agents, monkeypatch):
+        """Failed final review should trigger planning before rerun."""
+        orchestrator.initialize_project("Test")
+        monkeypatch.setenv("ORCH_MAX_REVIEW_CYCLES", "2")
+        orchestrator.container.is_complete = lambda: True
+
+        async def _planner_execute(container):
+            next_version = int(container.metadata.get("plan_version") or 0) + 1
+            container.metadata["plan_version"] = next_version
+            return {"version": next_version, "steps": []}
+
+        mock_agents["planner"].execute.side_effect = _planner_execute
+        review_results = [
+            {"status": "rejected", "passed": False, "errors": ["boom"], "summary": "fail"},
+            {"status": "approved", "passed": True},
+        ]
+
+        async def _review_execute(*args, **kwargs):
+            index = _review_execute.calls
+            _review_execute.calls += 1
+            if index < len(review_results):
+                return review_results[index]
+            return review_results[-1]
+
+        _review_execute.calls = 0
+        mock_agents["reviewer"].execute.side_effect = _review_execute
+
+        result = await orchestrator.process_task("Create a test API")
+
+        assert result["status"] == "completed"
+        assert mock_agents["planner"].execute.call_count == 2
+        assert orchestrator.container.metadata["plan_version"] == 2
     
     @pytest.mark.asyncio
     async def test_process_task_error(self, orchestrator, mock_agents):

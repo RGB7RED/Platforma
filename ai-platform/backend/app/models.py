@@ -14,8 +14,10 @@ class ProjectState(Enum):
     """Состояния проекта в жизненном цикле"""
     RESEARCH = "research"
     DESIGN = "design"
+    PLANNING = "planning"
     IMPLEMENTATION = "implementation"
     REVIEW = "review"
+    AWAITING_USER = "awaiting_user"
     NEEDS_INPUT = "needs_input"
     COMPLETE = "complete"
     ERROR = "error"
@@ -47,6 +49,9 @@ class Container:
         self.artifacts: Dict[str, List[Artifact]] = {
             "requirements": [],
             "architecture": [],
+            "implementation_plan": [],
+            "plan_version": [],
+            "plan_step_index": [],
             "code": [],
             "tests": [],
             "documentation": [],
@@ -58,6 +63,8 @@ class Container:
             "usage_report": [],
             "clarification_questions": [],
             "next_actions": [],
+            "research_chat": [],
+            "research_round": [],
         }
         
         # Уровень 3: История изменений
@@ -84,6 +91,10 @@ class Container:
                 "by_stage": {},
                 "models": {},
             },
+            "research_round": 0,
+            "research_chat": [],
+            "plan_version": 0,
+            "plan_step_index": 0,
         }
         self.file_update_hook: Optional[Callable[[str, Optional[Any]], None]] = None
         
@@ -152,6 +163,12 @@ class Container:
             context.update({
                 "requirements": [a.content for a in self.artifacts.get("requirements", [])],
                 "existing_architecture": self.target_architecture
+            })
+        elif role_name == "planner":
+            context.update({
+                "requirements": [a.content for a in self.artifacts.get("requirements", [])],
+                "architecture": [a.content for a in self.artifacts.get("architecture", [])],
+                "review_report": [a.content for a in self.artifacts.get("review_report", [])],
             })
         elif role_name == "coder":
             context.update({

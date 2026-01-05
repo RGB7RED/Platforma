@@ -32,6 +32,42 @@ async def test_heuristic_micro_file_plan_extracts_path():
     assert plan.contract.no_extra_text_outside_json is True
 
 
+@pytest.mark.asyncio
+async def test_ru_site_request_requires_research_before_design():
+    task_text = "Создай маленький сайт-визитку для локального бизнеса."
+    codex = {
+        "workflow": {
+            "stages": ["design", "implementation", "review"],
+            "max_iterations": 15,
+            "review_required": True,
+        }
+    }
+
+    plan = await build_task_plan(task_text, codex, allow_llm=False)
+
+    assert "design" in plan.stages
+    assert "research" in plan.stages
+    assert plan.stages.index("research") < plan.stages.index("design")
+
+
+@pytest.mark.asyncio
+async def test_en_landing_page_requires_research_before_design():
+    task_text = "Create a landing page for a small business."
+    codex = {
+        "workflow": {
+            "stages": ["design", "implementation", "review"],
+            "max_iterations": 15,
+            "review_required": True,
+        }
+    }
+
+    plan = await build_task_plan(task_text, codex, allow_llm=False)
+
+    assert "design" in plan.stages
+    assert "research" in plan.stages
+    assert plan.stages.index("research") < plan.stages.index("design")
+
+
 def test_output_contract_validator_accepts_json_only():
     contract = OutputContract(
         exact_json_only=True,

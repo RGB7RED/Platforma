@@ -165,6 +165,13 @@ def _heuristic_plan(task_text: str) -> Optional[Dict[str, Any]]:
         "ci",
         "api",
         "rest",
+        "сайт",
+        "лендинг",
+        "визитк",
+        "одностранич",
+        "landing",
+        "страница",
+        "визитка",
     ]
 
     strict_json = any(marker in lowered for marker in json_strict_markers)
@@ -215,7 +222,7 @@ def _finalize_plan(
         max_iterations = _get_int_env("ORCH_MICRO_MAX_ITERATIONS", 3)
         use_review = False
     elif mode == TaskMode.small_code:
-        stages = _filter_stages(default_stages, {"implementation", "review", "design"})
+        stages = _filter_stages(default_stages, {"implementation", "review", "design", "planning"})
         if not stages:
             stages = ["implementation", "review"]
         max_iterations = default_max_iterations
@@ -224,6 +231,8 @@ def _finalize_plan(
         stages = list(default_stages)
         max_iterations = default_max_iterations
         use_review = review_required
+
+    stages = _ensure_research_before_design(stages)
 
     return TaskPlan(
         mode=mode,
@@ -255,6 +264,13 @@ def _extract_create_file_paths(task_text: str) -> List[str]:
 
 def _filter_stages(stages: List[str], allowed: set[str]) -> List[str]:
     return [stage for stage in stages if stage in allowed]
+
+
+def _ensure_research_before_design(stages: List[str]) -> List[str]:
+    if "design" not in stages or "research" in stages:
+        return stages
+    design_index = stages.index("design")
+    return stages[:design_index] + ["research"] + stages[design_index:]
 
 
 def _get_int_env(name: str, default: int) -> int:

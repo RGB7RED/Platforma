@@ -18,7 +18,9 @@ from .planning import TaskMode, build_default_plan, build_task_plan
 from .logging_utils import configure_logging
 from .agents import (
     AIResearcher,
+    AIInterviewer,
     AIDesigner,
+    AIPlanner,
     AICoder,
     AIReviewer,
     BudgetExceededError,
@@ -72,7 +74,7 @@ class AIOrchestrator:
                 "coder": {"testing_required": True}
             },
             "workflow": {
-                "stages": ["research", "design", "implementation", "review"],
+                "stages": ["research", "design", "planning", "implementation", "review"],
                 "max_iterations": 15,
                 "require_review": True,
                 "review_required": True
@@ -144,7 +146,9 @@ class AIOrchestrator:
             return
         self.roles = {
             "researcher": AIResearcher(self.codex),
+            "interviewer": AIInterviewer(self.codex),
             "designer": AIDesigner(self.codex),
+            "planner": AIPlanner(self.codex),
             "coder": AICoder(self.codex),
             "reviewer": AIReviewer(self.codex),
         }
@@ -188,6 +192,10 @@ class AIOrchestrator:
     def _is_triage_enabled(self) -> bool:
         env_value = self._get_bool_env("ORCH_ENABLE_TRIAGE")
         return True if env_value is None else bool(env_value)
+
+    def _is_interactive_research_enabled(self) -> bool:
+        env_value = self._get_bool_env("ORCH_INTERACTIVE_RESEARCH")
+        return bool(env_value) if env_value is not None else False
 
     def _get_task_token_usage(self, task_description: Optional[str]) -> int:
         if not task_description:
@@ -410,11 +418,39 @@ class AIOrchestrator:
                     {"stage": "research"},
                 )
                 self.container.update_state(ProjectState.RESEARCH, "Analyzing requirements")
+                if self._is_interactive_research_enabled():
+                    researcher_result = await self.roles["interviewer"].execute(
+                        user_task,
+                        self.container,
+                    )
+                    if isinstance(researcher_result, dict) and researcher_result.get("status") == "needs_user_input":
+                        message = researcher_result.get("message")
+                        if message:
+                            await self._run_hook(
+                                callbacks.get("chat_message") if callbacks else None,
+                                {
+                                    "role": "assistant",
+                                    "content": message,
+                                    "round": researcher_result.get("round"),
+                                    "questions": researcher_result.get("questions"),
+                                },
+                            )
+                        self.container.update_state(ProjectState.AWAITING_USER, "Awaiting user input")
+                        return {
+                            "status": "awaiting_user",
+                            "container_id": self.container.project_id,
+                            "state": self.container.state.value,
+                            "progress": self.container.progress,
+                            "research_round": researcher_result.get("round"),
+                            "chat_message": message,
+                            "resume_from_stage": "research",
+                        }
+                else:
+                    researcher_result = await self.roles["researcher"].execute(
+                        user_task,
+                        self.container,
+                    )
 
-                researcher_result = await self.roles["researcher"].execute(
-                    user_task,
-                    self.container
-                )
                 await self._run_hook(
                     callbacks.get("research_complete") if callbacks else None,
                     {"result": researcher_result},
@@ -423,12 +459,32 @@ class AIOrchestrator:
                 self.container.add_artifact(
                     "research_summary",
                     researcher_result,
-                    "researcher"
+                    "researcher",
                 )
             
             # Фаза 2: Проектирование
             if "design" in stage_indexes and start_index <= stage_indexes["design"]:
                 logger.info("Phase 2: Design")
+                if not self.container.artifacts.get("requirements"):
+                    logger.warning("Missing requirements before design; running research fallback.")
+                    await self._run_hook(
+                        callbacks.get("stage_started") if callbacks else None,
+                        {"stage": "research"},
+                    )
+                    self.container.update_state(ProjectState.RESEARCH, "Analyzing requirements")
+                    researcher_result = await self.roles["researcher"].execute(
+                        user_task,
+                        self.container,
+                    )
+                    await self._run_hook(
+                        callbacks.get("research_complete") if callbacks else None,
+                        {"result": researcher_result},
+                    )
+                    self.container.add_artifact(
+                        "research_summary",
+                        researcher_result,
+                        "researcher",
+                    )
                 await self._run_hook(
                     callbacks.get("stage_started") if callbacks else None,
                     {"stage": "design"},
@@ -450,7 +506,11 @@ class AIOrchestrator:
                     "designer"
                 )
 
-            if "implementation" in stage_indexes and start_index <= stage_indexes["implementation"]:
+            if (
+                "implementation" in stage_indexes
+                and start_index <= stage_indexes["implementation"]
+                and (resume_from_stage is None or resume_from_stage == "implementation")
+            ):
                 template_manifest = self.container.metadata.get("template_manifest")
                 clarification_questions = []
                 if plan.mode == TaskMode.project:
@@ -481,10 +541,23 @@ class AIOrchestrator:
                         "questions": clarification_questions,
                         "resume_from_stage": resume_stage,
                     }
-            
-            # Фаза 3: Итеративная реализация
+
+            if "planning" in stage_indexes and start_index <= stage_indexes["planning"]:
+                logger.info("Phase 3: Planning")
+                await self._run_hook(
+                    callbacks.get("stage_started") if callbacks else None,
+                    {"stage": "planning"},
+                )
+                self.container.update_state(ProjectState.PLANNING, "Building implementation plan")
+                plan_result = await self.roles["planner"].execute(self.container)
+                await self._run_hook(
+                    callbacks.get("planning_complete") if callbacks else None,
+                    {"result": plan_result},
+                )
+
+            # Фаза 4: Итеративная реализация
             if "implementation" in stage_indexes and start_index <= stage_indexes["implementation"]:
-                logger.info("Phase 3: Implementation")
+                logger.info("Phase 4: Implementation")
                 await self._run_hook(
                     callbacks.get("stage_started") if callbacks else None,
                     {"stage": "implementation"},
@@ -529,6 +602,24 @@ class AIOrchestrator:
                     if not next_task:
                         logger.warning("No tasks to execute")
                         break
+
+                    if next_task.get("type") == "implementation_step":
+                        step_index = int(next_task.get("plan_step_index") or 0)
+                        plan_version = self.container.metadata.get("plan_version")
+                        self.container.metadata["plan_step_index"] = step_index
+                        self.container.add_artifact(
+                            "plan_step_index",
+                            {"index": step_index, "plan_version": plan_version},
+                            "orchestrator",
+                        )
+                        await self._run_hook(
+                            callbacks.get("plan_step") if callbacks else None,
+                            {
+                                "step_index": step_index,
+                                "plan_version": plan_version,
+                                "step": next_task,
+                            },
+                        )
 
                     self.container.current_task = next_task["description"]
                     self.container.metadata["active_role"] = "coder"
@@ -755,6 +846,14 @@ class AIOrchestrator:
                         callbacks.get("coder_finished") if callbacks else None,
                         {"task": next_task, "result": coder_result, "iteration": iteration},
                     )
+                    if next_task.get("type") == "implementation_step":
+                        next_index = int(next_task.get("plan_step_index") or 0) + 1
+                        self.container.metadata["plan_step_index"] = next_index
+                        self.container.add_artifact(
+                            "plan_step_index",
+                            {"index": next_index, "plan_version": self.container.metadata.get("plan_version")},
+                            "orchestrator",
+                        )
 
                     if plan.mode == TaskMode.micro_file:
                         self.container.update_state(ProjectState.COMPLETE, "Micro task completed")
@@ -924,6 +1023,8 @@ class AIOrchestrator:
             
             # Фаза 4: Финальное ревью
             review_required = plan.use_review
+            max_review_cycles = self._get_int_env("ORCH_MAX_REVIEW_CYCLES", 3)
+            review_cycles = int(self.container.metadata.get("review_cycles") or 0)
             if review_required and "review" in stage_indexes and start_index <= stage_indexes["review"]:
                 manual_stage = "pre_final_review"
                 if self._manual_step_enabled(manual_step_enabled) and manual_stage != skip_manual_stage:
@@ -980,6 +1081,25 @@ class AIOrchestrator:
                     self.container.update_progress(1.0)
                     logger.info("Project completed successfully")
                 else:
+                    if review_cycles + 1 < max_review_cycles:
+                        next_cycle = review_cycles + 1
+                        self.container.metadata["review_cycles"] = next_cycle
+                        logger.warning(
+                            "Final review failed; restarting from planning (cycle %s/%s)",
+                            next_cycle,
+                            max_review_cycles,
+                        )
+                        resume_stage = "planning" if "planning" in stage_indexes else "implementation"
+                        return await self.process_task(
+                            user_task,
+                            callbacks=callbacks,
+                            workspace_path=workspace_path,
+                            command_runner=command_runner,
+                            provided_answers=provided_answers,
+                            resume_from_stage=resume_stage,
+                            manual_step_enabled=manual_step_enabled,
+                            resume_payload=resume_payload,
+                        )
                     failure_reason = "Final review failed"
                     issues = final_review.get("issues")
                     await self._run_hook(
@@ -1044,7 +1164,24 @@ class AIOrchestrator:
         """Простой планировщик: определяет следующую задачу"""
         if not self.container or not self.container.target_architecture:
             return None
-        
+
+        plan_payload = self._get_latest_plan()
+        if plan_payload:
+            steps = plan_payload.get("steps") if isinstance(plan_payload, dict) else None
+            if isinstance(steps, list) and steps:
+                step_index = int(self.container.metadata.get("plan_step_index") or 0)
+                if step_index < len(steps):
+                    step = steps[step_index]
+                    return {
+                        "type": "implementation_step",
+                        "description": step.get("goal") or f"Execute {step.get('id')}",
+                        "plan_step_index": step_index,
+                        "plan_step_id": step.get("id"),
+                        "files": step.get("files", []),
+                        "acceptance_criteria": step.get("acceptance_criteria", []),
+                        "checks": step.get("checks", []),
+                    }
+
         # Простая эвристика для MVP
         architecture = self.container.target_architecture
         
@@ -1088,6 +1225,15 @@ class AIOrchestrator:
         
         # Всё сделано
         return None
+
+    def _get_latest_plan(self) -> Optional[Dict[str, Any]]:
+        if not self.container:
+            return None
+        plans = self.container.artifacts.get("implementation_plan", [])
+        if not plans:
+            return None
+        latest = plans[-1]
+        return latest.content if hasattr(latest, "content") else None
 
     @staticmethod
     def _build_fix_task(previous_task: Dict[str, Any], review_result: Dict[str, Any]) -> Dict[str, Any]:

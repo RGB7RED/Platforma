@@ -104,6 +104,10 @@ class FileContentRequest(BaseModel):
     filepath: str
 
 
+class ChatMessageRequest(BaseModel):
+    message: str
+
+
 class GitHubConnectRequest(BaseModel):
     repo_full_name: str
     access_token: str
@@ -3089,6 +3093,95 @@ async def submit_task_input(task_id: str, payload: TaskInputRequest, request: Re
         reset_task_id(task_token)
 
 
+@app.post("/api/tasks/{task_id}/chat")
+async def submit_task_chat(task_id: str, payload: ChatMessageRequest, request: Request):
+    """Submit a chat message for interactive research and resume if needed."""
+    task_token = set_task_id(task_id)
+    try:
+        task_data = await ensure_task_owner(task_id, request)
+        message = (payload.message or "").strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="Message cannot be empty")
+        container = await resolve_container_with_db(task_id)
+        if not container:
+            raise HTTPException(status_code=404, detail="Container not found")
+        round_value = container.metadata.get("research_round")
+        chat_payload = {
+            "role": "user",
+            "content": message,
+            "round": round_value if isinstance(round_value, int) else None,
+        }
+        chat_log = container.metadata.get("research_chat")
+        if not isinstance(chat_log, list):
+            chat_log = []
+        chat_log.append(chat_payload)
+        container.metadata["research_chat"] = chat_log
+        container.add_artifact("research_chat", chat_payload, "user")
+        await record_artifact(
+            task_id,
+            "research_chat",
+            normalize_payload(chat_payload),
+            produced_by="user",
+        )
+        await record_event(
+            task_id,
+            "chat_message",
+            normalize_payload(chat_payload),
+        )
+        await persist_container_snapshot(task_id, container)
+
+        updated_status = task_data.get("status")
+        resume_stage = None
+        if str(task_data.get("status")).lower() == "awaiting_user":
+            resume_stage = "research"
+            update_fields = {
+                "status": "queued",
+                "current_stage": "research",
+                "resume_from_stage": resume_stage,
+                "updated_at": db.now_utc(),
+            }
+            if db.is_enabled():
+                await db.update_task_row(task_id, update_fields)
+            else:
+                task_data.update(update_fields)
+            await record_state(
+                task_id,
+                build_container_state(
+                    status="queued",
+                    progress=task_data.get("progress", 0.0) or 0.0,
+                    current_stage="research",
+                ),
+            )
+            await task_governor.enqueue(
+                QueueItem(
+                    task_id=task_id,
+                    description=task_data.get("description"),
+                    template_id=task_data.get("template_id"),
+                    request_id=task_data.get("request_id"),
+                    resume_from_stage=resume_stage,
+                )
+            )
+            updated_status = "queued"
+
+        assistant_message = None
+        assistant_messages = [
+            artifact.content
+            for artifact in container.artifacts.get("research_chat", [])
+            if isinstance(artifact.content, dict) and artifact.content.get("role") == "assistant"
+        ]
+        if assistant_messages:
+            assistant_message = assistant_messages[-1]
+
+        return {
+            "task_id": task_id,
+            "status": updated_status,
+            "resume_from_stage": resume_stage,
+            "assistant_message": assistant_message,
+        }
+    finally:
+        reset_task_id(task_token)
+
+
 @app.post("/api/tasks/{task_id}/resume", response_model=TaskResumeResponse)
 async def resume_task(task_id: str, request: Request):
     """Resume a task that is waiting for clarification."""
@@ -3755,12 +3848,14 @@ async def process_task_background(
         stage_progress = {
             "research": 0.2,
             "design": 0.4,
+            "planning": 0.5,
             "implementation": 0.6,
             "review": 0.9,
         }
         stage_role = {
             "research": "researcher",
             "design": "designer",
+            "planning": "planner",
             "implementation": "coder",
             "review": "reviewer",
         }
@@ -3821,6 +3916,30 @@ async def process_task_background(
                 normalize_payload({"type": "architecture"}),
             )
             await persist_all_container_files(task_id, container)
+            await persist_container_snapshot(task_id, container)
+
+        async def handle_planning_complete(payload: Dict[str, Any]) -> None:
+            result = payload.get("result")
+            if result:
+                await record_artifact(
+                    task_id,
+                    "implementation_plan",
+                    normalize_payload(result),
+                    produced_by="planner",
+                )
+                await record_event(
+                    task_id,
+                    "ArtifactAdded",
+                    normalize_payload({"type": "implementation_plan"}),
+                )
+            await persist_container_snapshot(task_id, container)
+
+        async def handle_plan_step(payload: Dict[str, Any]) -> None:
+            await record_event(
+                task_id,
+                "plan_step",
+                normalize_payload(payload),
+            )
             await persist_container_snapshot(task_id, container)
 
         async def handle_review_started(payload: Dict[str, Any]) -> None:
@@ -3997,6 +4116,23 @@ async def process_task_background(
                 ),
             )
             await persist_container_snapshot(task_id, container)
+
+        async def handle_chat_message(payload: Dict[str, Any]) -> None:
+            if not isinstance(payload, dict):
+                return
+            message_payload = normalize_payload(payload)
+            await record_artifact(
+                task_id,
+                "research_chat",
+                message_payload,
+                produced_by=payload.get("role") or "assistant",
+            )
+            await record_event(
+                task_id,
+                "chat_message",
+                message_payload,
+            )
+            await persist_container_snapshot(task_id, container)
         
         # Обрабатываем задачу
         result = await orchestrator.process_task(
@@ -4005,6 +4141,7 @@ async def process_task_background(
                 "stage_started": handle_stage_started,
                 "research_complete": handle_research_complete,
                 "design_complete": handle_design_complete,
+                "planning_complete": handle_planning_complete,
                 "coder_finished": handle_coder_finished,
                 "review_started": handle_review_started,
                 "review_finished": handle_review_finished,
@@ -4015,6 +4152,8 @@ async def process_task_background(
                 "llm_error": handle_llm_error,
                 "stage_failed": handle_stage_failed,
                 "clarification_requested": handle_clarification_requested,
+                "chat_message": handle_chat_message,
+                "plan_step": handle_plan_step,
             },
             workspace_path=workspace.path,
             command_runner=command_runner,
@@ -4023,6 +4162,29 @@ async def process_task_background(
             manual_step_enabled=manual_step_enabled if isinstance(manual_step_enabled, bool) else None,
             resume_payload=resume_payload if isinstance(resume_payload, dict) else None,
         )
+
+        if result.get("status") == "awaiting_user":
+            await apply_task_update(
+                {
+                    "status": "awaiting_user",
+                    "progress": container.progress,
+                    "current_stage": "awaiting_user",
+                    "resume_from_stage": result.get("resume_from_stage") or "research",
+                }
+            )
+            await record_state(
+                task_id,
+                build_container_state(
+                    status="awaiting_user",
+                    progress=container.progress,
+                    current_stage="awaiting_user",
+                    container=container,
+                    active_role=container.metadata.get("active_role"),
+                    current_task=container.current_task,
+                ),
+            )
+            logger.info("Task %s paused awaiting user chat input", task_id)
+            return
 
         if result.get("status") == "needs_input":
             if result.get("awaiting_manual_step"):

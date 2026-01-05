@@ -309,53 +309,7 @@ class AIResearcher(AIAgent):
         
         # В реальной системе здесь был бы вызов LLM
         # Для MVP создаем фиктивные требования
-        
-        requirements = {
-            "user_task": user_task,
-            "analyzed_at": datetime.now().isoformat(),
-            "requirements": [
-                {
-                    "id": "REQ-001",
-                    "description": "Система должна предоставлять REST API",
-                    "priority": "high",
-                    "category": "functional"
-                },
-                {
-                    "id": "REQ-002",
-                    "description": "API должен поддерживать CRUD операции",
-                    "priority": "high",
-                    "category": "functional"
-                },
-                {
-                    "id": "REQ-003",
-                    "description": "Должна быть базовая аутентификация",
-                    "priority": "medium",
-                    "category": "security"
-                }
-            ],
-            "user_stories": [
-                "Как пользователь, я хочу создавать новые элементы через API",
-                "Как пользователь, я хочу получать список всех элементов",
-                "Как пользователь, я хочу обновлять существующие элементы",
-                "Как пользователь, я хочу удалять элементы"
-            ],
-            "assumptions": [
-                "Используется Python и FastAPI",
-                "Данные хранятся в памяти для MVP",
-                "Документация будет в OpenAPI формате"
-            ],
-            "questions_to_user": [
-                "Нужна ли пагинация для списков?",
-                "Какие поля должны быть у элементов?",
-                "Нужна ли расширенная аутентификация?"
-            ],
-            "technical_constraints": [
-                "Python 3.11+",
-                "FastAPI framework",
-                "Pydantic для валидации",
-                "Uvicorn для сервера"
-            ]
-        }
+        requirements = self._build_requirements(user_task)
         
         # Добавляем артефакты в контейнер
         container.add_artifact(
@@ -367,7 +321,7 @@ class AIResearcher(AIAgent):
         # Создаем файлы с требованиями
         container.add_file(
             "requirements.md",
-            self._generate_markdown(requirements)
+            self._generate_markdown(requirements),
         )
         
         container.add_file(
@@ -381,8 +335,65 @@ class AIResearcher(AIAgent):
         })
         
         return requirements
+
+    @staticmethod
+    def _build_requirements(
+        user_task: str,
+        *,
+        user_inputs: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        requirements = {
+            "user_task": user_task,
+            "analyzed_at": datetime.now().isoformat(),
+            "requirements": [
+                {
+                    "id": "REQ-001",
+                    "description": "Система должна предоставлять REST API",
+                    "priority": "high",
+                    "category": "functional",
+                },
+                {
+                    "id": "REQ-002",
+                    "description": "API должен поддерживать CRUD операции",
+                    "priority": "high",
+                    "category": "functional",
+                },
+                {
+                    "id": "REQ-003",
+                    "description": "Должна быть базовая аутентификация",
+                    "priority": "medium",
+                    "category": "security",
+                },
+            ],
+            "user_stories": [
+                "Как пользователь, я хочу создавать новые элементы через API",
+                "Как пользователь, я хочу получать список всех элементов",
+                "Как пользователь, я хочу обновлять существующие элементы",
+                "Как пользователь, я хочу удалять элементы",
+            ],
+            "assumptions": [
+                "Используется Python и FastAPI",
+                "Данные хранятся в памяти для MVP",
+                "Документация будет в OpenAPI формате",
+            ],
+            "questions_to_user": [
+                "Нужна ли пагинация для списков?",
+                "Какие поля должны быть у элементов?",
+                "Нужна ли расширенная аутентификация?",
+            ],
+            "technical_constraints": [
+                "Python 3.11+",
+                "FastAPI framework",
+                "Pydantic для валидации",
+                "Uvicorn для сервера",
+            ],
+        }
+        if user_inputs:
+            requirements["user_inputs"] = user_inputs
+        return requirements
     
-    def _generate_markdown(self, requirements: Dict[str, Any]) -> str:
+    @staticmethod
+    def _generate_markdown(requirements: Dict[str, Any]) -> str:
         """Генерировать Markdown из требований"""
         md = f"""# Requirements Analysis
 
@@ -408,14 +419,145 @@ class AIResearcher(AIAgent):
         md += "\n\n## Assumptions\n"
         for assumption in requirements["assumptions"]:
             md += f"\n- {assumption}"
-        
+
         md += "\n\n## Questions for Clarification\n"
         for question in requirements["questions_to_user"]:
             md += f"\n- {question}"
+
+        user_inputs = requirements.get("user_inputs")
+        if user_inputs:
+            md += "\n\n## User Inputs\n"
+            for entry in user_inputs:
+                md += f"\n- {entry}"
         
         md += f"\n\n---\n*Analyzed at: {requirements['analyzed_at']}*"
         
         return md
+
+
+class AIInterviewer(AIAgent):
+    """ИИ-интервьюер: интерактивное исследование с вопросами пользователю"""
+
+    QUESTION_SETS = [
+        [
+            "Кто основная целевая аудитория?",
+            "Какие услуги/оффер нужно подчеркнуть?",
+            "На какую географию ориентируемся?",
+            "Какие контакты должны быть на странице (телефон, почта, мессенджеры)?",
+            "Нужен ли адрес/карта или часы работы?",
+        ],
+        [
+            "Какой стиль или настроение важны (строго/минималистично/ярко)?",
+            "Есть ли бренд‑гайд, логотип или фирменные цвета?",
+            "Нужны ли референсы/примеры сайтов, которые нравятся?",
+            "Какие ключевые блоки должны быть на лендинге?",
+        ],
+        [
+            "Есть ли ограничения по объёму (только одна страница, минимум текста)?",
+            "Какие обязательные призывы к действию?",
+            "Нужны ли формы заявок или кнопки в мессенджеры?",
+            "Какие материалы уже есть (тексты, фото, иконки)?",
+        ],
+    ]
+
+    def __init__(self, codex: Dict[str, Any]):
+        super().__init__(codex, "interviewer")
+
+    async def execute(self, user_task: str, container: Container) -> Dict[str, Any]:
+        self._log_action("start_interactive_research", {"task": user_task[:100]})
+
+        round_index = self._resolve_round(container)
+        if round_index < len(self.QUESTION_SETS):
+            questions = self.QUESTION_SETS[round_index]
+            message = self._format_questions(round_index + 1, questions)
+            self._store_chat_message(
+                container,
+                {"role": "assistant", "content": message, "round": round_index + 1},
+            )
+            next_round = round_index + 1
+            container.metadata["research_round"] = next_round
+            container.add_artifact("research_round", {"round": next_round}, self.role_name)
+            return {
+                "status": "needs_user_input",
+                "message": message,
+                "questions": questions,
+                "round": next_round,
+            }
+
+        user_inputs = self._collect_user_inputs(container)
+        if len(user_inputs) < len(self.QUESTION_SETS):
+            message = "Пожалуйста, ответьте на вопросы, чтобы завершить исследование."
+            self._store_chat_message(
+                container,
+                {"role": "assistant", "content": message, "round": round_index},
+            )
+            return {
+                "status": "needs_user_input",
+                "message": message,
+                "questions": [],
+                "round": round_index,
+            }
+
+        requirements = AIResearcher._build_requirements(user_task, user_inputs=user_inputs)
+        container.add_artifact("requirements", requirements, self.role_name)
+        container.add_file("requirements.md", AIResearcher._generate_markdown(requirements))
+        container.add_file(
+            "user_stories.md",
+            "## User Stories\n\n" + "\n".join(f"- {story}" for story in requirements["user_stories"]),
+        )
+        self._log_action(
+            "interactive_research_completed",
+            {
+                "requirements_count": len(requirements["requirements"]),
+                "user_stories_count": len(requirements["user_stories"]),
+            },
+        )
+        return requirements
+
+    @staticmethod
+    def _format_questions(round_number: int, questions: List[str]) -> str:
+        formatted = "\n".join([f"{index + 1}. {question}" for index, question in enumerate(questions)])
+        return f"Раунд {round_number}/3. Ответьте, пожалуйста, на вопросы:\n{formatted}"
+
+    @staticmethod
+    def _store_chat_message(container: Container, message: Dict[str, Any]) -> None:
+        chat_log = container.metadata.get("research_chat")
+        if not isinstance(chat_log, list):
+            chat_log = []
+        chat_log.append(message)
+        container.metadata["research_chat"] = chat_log
+        container.add_artifact("research_chat", message, "interviewer")
+
+    @staticmethod
+    def _resolve_round(container: Container) -> int:
+        metadata_round = container.metadata.get("research_round")
+        if isinstance(metadata_round, int):
+            return max(metadata_round, 0)
+        chat_artifacts = container.artifacts.get("research_chat", [])
+        assistant_rounds = [
+            item.content.get("round")
+            for item in chat_artifacts
+            if isinstance(item.content, dict) and item.content.get("role") == "assistant"
+        ]
+        valid_rounds = [value for value in assistant_rounds if isinstance(value, int)]
+        return max(valid_rounds, default=0)
+
+    @staticmethod
+    def _collect_user_inputs(container: Container) -> List[str]:
+        messages = []
+        metadata_chat = container.metadata.get("research_chat")
+        if isinstance(metadata_chat, list):
+            messages.extend(metadata_chat)
+        else:
+            for artifact in container.artifacts.get("research_chat", []):
+                content = artifact.content
+                if isinstance(content, dict):
+                    messages.append(content)
+        user_inputs = []
+        for entry in messages:
+            if isinstance(entry, dict) and entry.get("role") == "user":
+                user_inputs.append(str(entry.get("content") or "").strip())
+        return [message for message in user_inputs if message]
 
 
 class AIDesigner(AIAgent):
@@ -663,6 +805,85 @@ class AIDesigner(AIAgent):
 - Documentation is complete and accurate
 """
         return md
+
+
+class AIPlanner(AIAgent):
+    """ИИ-планировщик: формирует план реализации после дизайна"""
+
+    def __init__(self, codex: Dict[str, Any]):
+        super().__init__(codex, "planner")
+
+    async def execute(self, container: Container) -> Dict[str, Any]:
+        self._log_action("start_planning", {})
+
+        requirements = self._latest_artifact(container, "requirements")
+        architecture = self._latest_artifact(container, "architecture")
+        review_report = self._latest_artifact(container, "review_report")
+        plan_version = int(container.metadata.get("plan_version") or 0) + 1
+
+        steps = [
+            {
+                "id": "PLAN-001",
+                "goal": "Создать структуру проекта и базовые файлы",
+                "files": ["README.md", "index.html", "styles.css", "app.js"],
+                "acceptance_criteria": ["Базовая структура проекта создана"],
+                "checks": ["ruff check .", "python -m pytest -q"],
+            },
+            {
+                "id": "PLAN-002",
+                "goal": "Сгенерировать страницы и основные блоки UI",
+                "files": ["index.html", "styles.css", "app.js"],
+                "acceptance_criteria": ["Страницы отображаются корректно"],
+                "checks": ["ruff check .", "python -m pytest -q"],
+            },
+            {
+                "id": "PLAN-003",
+                "goal": "Проверить линтер и тесты, исправить замечания",
+                "files": [],
+                "acceptance_criteria": ["Все проверки проходят без ошибок"],
+                "checks": ["ruff check .", "python -m pytest -q"],
+            },
+        ]
+
+        if isinstance(review_report, dict):
+            errors = review_report.get("errors") or review_report.get("issues") or []
+            if errors:
+                steps.insert(
+                    0,
+                    {
+                        "id": "PLAN-000",
+                        "goal": "Устранить замечания ревью",
+                        "files": [],
+                        "acceptance_criteria": ["Замечания ревью устранены"],
+                        "checks": review_report.get("commands") or ["ruff check .", "python -m pytest -q"],
+                        "context": {"errors": errors, "summary": review_report.get("summary")},
+                    },
+                )
+
+        implementation_plan = {
+            "version": plan_version,
+            "created_at": datetime.now().isoformat(),
+            "requirements": requirements,
+            "architecture": architecture,
+            "steps": steps,
+            "order": [step["id"] for step in steps],
+        }
+
+        container.metadata["plan_version"] = plan_version
+        container.metadata["plan_step_index"] = 0
+        container.add_artifact("implementation_plan", implementation_plan, self.role_name)
+        container.add_artifact("plan_version", {"version": plan_version}, self.role_name)
+        container.add_artifact("plan_step_index", {"index": 0}, self.role_name)
+
+        self._log_action("planning_completed", {"plan_version": plan_version, "steps": len(steps)})
+        return implementation_plan
+
+    @staticmethod
+    def _latest_artifact(container: Container, artifact_type: str) -> Optional[Dict[str, Any]]:
+        artifacts = container.artifacts.get(artifact_type, [])
+        if not artifacts:
+            return None
+        return artifacts[-1].content
 
 
 class AICoder(AIAgent):
@@ -2375,14 +2596,22 @@ class AIReviewer(AIAgent):
             status = "rejected"
             message = f"Found {len(errors)} critical issues"
 
+        commands = []
+        for report in (ruff_report, pytest_report, compileall_report):
+            command = report.get("command") if isinstance(report, dict) else None
+            if command:
+                commands.append(command)
+
         review_result = {
             "status": status,
             "passed": passed,
             "message": message,
+            "summary": message,
             "timestamp": datetime.now().isoformat(),
             "issues": issues,
             "warnings": warnings,
             "errors": errors,
+            "commands": commands,
             "passed_checks": passed_checks,
             "files_reviewed": len(container.files),
             "checklist_used": checklist,
@@ -2390,7 +2619,7 @@ class AIReviewer(AIAgent):
             "pytest": pytest_report,
             "compileall": compileall_report,
             "command_timeout": timed_out,
-            "summary": {
+            "summary_details": {
                 "total_files": len(container.files),
                 "total_issues": len(issues),
                 "total_warnings": len(warnings),

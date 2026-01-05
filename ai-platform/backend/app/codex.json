@@ -46,6 +46,22 @@
         "technology_stack": ["python", "fastapi", "react"]
       }
     },
+
+    "planner": {
+      "purpose": "Детализировать план реализации с учётом требований, архитектуры и ревью",
+      "responsibilities": [
+        "Разбить реализацию на шаги",
+        "Определить порядок выполнения и критерии приёмки",
+        "Учитывать замечания ревью при пересборке плана"
+      ],
+      "constraints": [
+        "Не менять требования без согласования",
+        "Не писать код",
+        "Указывать критерии приёмки и команды проверки"
+      ],
+      "required_outputs": ["implementation_plan"],
+      "success_criteria": "План покрывает требования и корректирует замечания ревью"
+    },
     
     "coder": {
       "purpose": "Реализация системы согласно архитектуре",
@@ -123,7 +139,7 @@
   },
   
   "workflow": {
-    "stages": ["research", "design", "implementation", "review"],
+    "stages": ["research", "design", "planning", "implementation", "review"],
     "max_iterations": 12,
     "require_review": true,
     "review_required": true,
@@ -136,6 +152,7 @@
     "timeouts": {
       "research": 300,
       "design": 600,
+      "planning": 300,
       "implementation": 1800,
       "review": 300
     }
