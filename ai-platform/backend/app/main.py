@@ -79,6 +79,7 @@ class TaskRequest(BaseModel):
     template_id: Optional[str] = None
     project_id: Optional[str] = None
     manual_step: Optional[bool] = None
+    auto_start: Optional[bool] = True
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -210,6 +211,9 @@ FILE_PERSISTENCE_REASON = ""
 def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(task_data.get("id"), uuid.UUID):
         task_data["id"] = str(task_data["id"])
+    interactive_enabled = parse_bool_env(os.getenv("ORCH_INTERACTIVE_RESEARCH"))
+    if interactive_enabled is None:
+        interactive_enabled = False
     container = resolve_container(task_id)
     if container:
         task_data["files_count"] = len(container.files)
@@ -249,9 +253,26 @@ def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
                 task_data["last_question_text"] = last_assistant_message
         else:
             task_data.setdefault("research_chat", [])
-        interactive_enabled = parse_bool_env(os.getenv("ORCH_INTERACTIVE_RESEARCH"))
-        if interactive_enabled is not None:
-            task_data["interactive_research_enabled"] = interactive_enabled
+        requirements_artifacts = container.artifacts.get("requirements", [])
+        requirements_payloads = [
+            normalize_payload(artifact.content)
+            for artifact in requirements_artifacts
+            if hasattr(artifact, "content")
+        ]
+        task_data["artifacts"] = {
+            "research_chat": task_data.get("research_chat", []),
+            "requirements": requirements_payloads,
+        }
+    if "interactive_research_enabled" not in task_data:
+        task_data["interactive_research_enabled"] = interactive_enabled
+    if "artifacts" not in task_data:
+        task_data["artifacts"] = {
+            "research_chat": task_data.get("research_chat", []),
+            "requirements": [],
+        }
+    if task_data.get("can_start") is None:
+        status_value = str(task_data.get("status") or "").lower()
+        task_data["can_start"] = status_value in {"intake_complete", "ready_to_start"} or not interactive_enabled
     time_taken_seconds = compute_time_taken_seconds(task_data)
     if time_taken_seconds is not None:
         task_data["time_taken_seconds"] = time_taken_seconds
@@ -1530,6 +1551,48 @@ async def resolve_container_with_db(task_id: str) -> Optional[Container]:
     return None
 
 
+def is_interactive_research_enabled() -> bool:
+    env_value = parse_bool_env(os.getenv("ORCH_INTERACTIVE_RESEARCH"))
+    return bool(env_value) if env_value is not None else False
+
+
+async def get_or_create_task_container(
+    task_id: str,
+    task_data: Dict[str, Any],
+    template_info: Optional["TemplateInfo"],
+) -> Container:
+    container = await resolve_container_with_db(task_id)
+    orchestrator = AIOrchestrator()
+    if not container:
+        container = orchestrator.initialize_project(f"Task-{task_id[:8]}")
+        if template_info:
+            for path, content in template_info.files.items():
+                container.add_file(path, content)
+            container.metadata["template_id"] = template_info.template_id
+            container.metadata["template_hash"] = template_info.hash
+            container.metadata["template_manifest"] = template_info.manifest
+        baseline_files = capture_baseline_files(container)
+        container.metadata["baseline_files"] = baseline_files
+    else:
+        orchestrator.attach_container(container)
+        if template_info and not container.metadata.get("template_manifest"):
+            container.metadata["template_manifest"] = template_info.manifest
+
+    owner_key_hash = task_data.get("owner_key_hash")
+    owner_user_id = task_data.get("owner_user_id")
+    manual_step_enabled = task_data.get("manual_step_enabled")
+    if owner_key_hash:
+        container.metadata["owner_key_hash"] = owner_key_hash
+    if owner_user_id:
+        container.metadata["owner_user_id"] = owner_user_id
+    if isinstance(manual_step_enabled, bool):
+        container.metadata["manual_step_enabled"] = manual_step_enabled
+
+    await persist_container_snapshot(task_id, container)
+    storage.containers[task_id] = container
+    return container
+
+
 async def load_container_from_db(task_id: str) -> Optional[Container]:
     if not db.is_enabled():
         return None
@@ -2684,6 +2747,7 @@ async def create_task(request: TaskRequest, req: Request):
     template_id = request.template_id.strip() if request.template_id else None
     project_id = request.project_id.strip() if request.project_id else None
     template_hash = None
+    auto_start = True if request.auto_start is None else bool(request.auto_start)
     env_manual = parse_bool_env(MANUAL_STEP_ENABLED_ENV)
     manual_step_enabled = request.manual_step if request.manual_step is not None else (
         env_manual if env_manual is not None else False
@@ -2716,13 +2780,15 @@ async def create_task(request: TaskRequest, req: Request):
     
         client_ip = req.client.host if req.client else None
 
+        initial_status = "queued" if auto_start else "draft"
+        can_start = not is_interactive_research_enabled() if not auto_start else False
         if db.is_enabled():
             await db.create_task_row(
                 task_id=task_id,
                 user_id=user_id,
                 owner_user_id=owner_user_id,
                 description=request.description,
-                status="queued",
+                status=initial_status,
                 progress=0.0,
                 current_stage=None,
                 codex_version=request.codex_version,
@@ -2732,6 +2798,7 @@ async def create_task(request: TaskRequest, req: Request):
                 client_ip=client_ip,
                 owner_key_hash=owner_key_hash,
                 manual_step_enabled=manual_step_enabled,
+                can_start=can_start,
             )
         else:
             # Сохраняем задачу
@@ -2740,7 +2807,7 @@ async def create_task(request: TaskRequest, req: Request):
                 "id": task_id,
                 "description": request.description,
                 "user_id": user_id,
-                "status": "queued",
+                "status": initial_status,
                 "progress": 0.0,
                 "created_at": now,
                 "updated_at": now,
@@ -2766,6 +2833,7 @@ async def create_task(request: TaskRequest, req: Request):
                 "resume_phase": None,
                 "resume_iteration": None,
                 "resume_payload": None,
+                "can_start": can_start,
             }
             
             # Сохраняем связь пользователь -> задача
@@ -2796,22 +2864,31 @@ async def create_task(request: TaskRequest, req: Request):
             ),
         )
         
-        # Запускаем обработку в очереди
-        await task_governor.enqueue(
-            QueueItem(
-                task_id=task_id,
-                description=request.description,
-                template_id=template_id,
-                request_id=request_id,
+        if auto_start:
+            # Запускаем обработку в очереди
+            await task_governor.enqueue(
+                QueueItem(
+                    task_id=task_id,
+                    description=request.description,
+                    template_id=template_id,
+                    request_id=request_id,
+                )
             )
-        )
-        
+
+            return TaskResponse(
+                task_id=task_id,
+                status="queued",
+                message="Task queued for processing",
+                progress=0.0,
+                estimated_time=60  # Примерное время в секундах
+            )
+
         return TaskResponse(
             task_id=task_id,
-            status="queued",
-            message="Task queued for processing",
+            status=initial_status,
+            message="Task created",
             progress=0.0,
-            estimated_time=60  # Примерное время в секундах
+            estimated_time=None,
         )
     finally:
         reset_task_id(task_token)
@@ -2825,6 +2902,130 @@ async def get_task_status(task_id: str, request: Request):
         if db.is_enabled():
             await resolve_container_with_db(task_id)
         return enrich_task_data(task_id, task_data)
+    finally:
+        reset_task_id(task_token)
+
+
+@app.post("/api/tasks/{task_id}/intake/start")
+async def start_task_intake(task_id: str, request: Request):
+    """Start interactive research intake without running the full pipeline."""
+    task_token = set_task_id(task_id)
+    try:
+        task_data = await ensure_task_owner(task_id, request)
+        if not is_interactive_research_enabled():
+            raise HTTPException(status_code=409, detail="Interactive research is disabled")
+        status_value = str(task_data.get("status") or "").lower()
+        if status_value in {"processing", "queued"}:
+            raise HTTPException(status_code=409, detail="Task already started")
+        if status_value in {"awaiting_user", "intake_complete"}:
+            return enrich_task_data(task_id, task_data)
+
+        template_id = task_data.get("template_id")
+        template_info = resolve_template(template_id) if template_id else None
+        container = await get_or_create_task_container(task_id, task_data, template_info)
+        orchestrator = AIOrchestrator()
+        orchestrator.attach_container(container)
+        interviewer = orchestrator.roles["interviewer"]
+        interviewer_result = await interviewer.execute(
+            task_data.get("description") or "",
+            container,
+        )
+
+        assistant_message = None
+        if isinstance(interviewer_result, dict) and interviewer_result.get("status") == "needs_user_input":
+            assistant_message = interviewer_result.get("message")
+            if assistant_message:
+                assistant_payload = {
+                    "role": "assistant",
+                    "content": assistant_message,
+                    "round": interviewer_result.get("round"),
+                    "questions": interviewer_result.get("questions"),
+                }
+                await record_artifact(
+                    task_id,
+                    "research_chat",
+                    normalize_payload(assistant_payload),
+                    produced_by="assistant",
+                )
+                await record_event(
+                    task_id,
+                    "chat_message",
+                    normalize_payload(assistant_payload),
+                )
+
+        update_fields = {
+            "status": "awaiting_user",
+            "current_stage": "awaiting_user",
+            "can_start": False,
+            "updated_at": db.now_utc(),
+        }
+        if db.is_enabled():
+            task_data = await db.update_task_row(task_id, update_fields) or task_data
+        else:
+            task_data.update(update_fields)
+        await record_state(
+            task_id,
+            build_container_state(
+                status="awaiting_user",
+                progress=task_data.get("progress", 0.0) or 0.0,
+                current_stage="awaiting_user",
+                container=container,
+                active_role=container.metadata.get("active_role"),
+                current_task=container.current_task,
+            ),
+        )
+        await persist_container_snapshot(task_id, container)
+        return enrich_task_data(task_id, task_data)
+    finally:
+        reset_task_id(task_token)
+
+
+@app.post("/api/tasks/{task_id}/start")
+async def start_task_processing(task_id: str, request: Request):
+    """Start processing an existing task after intake is complete."""
+    task_token = set_task_id(task_id)
+    try:
+        task_data = await ensure_task_owner(task_id, request)
+        status_value = str(task_data.get("status") or "").lower()
+        if status_value == "awaiting_user":
+            raise HTTPException(status_code=409, detail="Intake not complete")
+        if status_value in {"processing", "queued"}:
+            raise HTTPException(status_code=409, detail="Task already started")
+        if status_value in {"completed", "failed", "error"}:
+            raise HTTPException(status_code=409, detail="Task already completed")
+        if not bool(task_data.get("can_start")):
+            raise HTTPException(status_code=409, detail="Intake not complete")
+
+        resume_stage = task_data.get("resume_from_stage") or "design"
+        update_fields = {
+            "status": "queued",
+            "current_stage": "queued",
+            "resume_from_stage": resume_stage,
+            "can_start": False,
+            "updated_at": db.now_utc(),
+        }
+        if db.is_enabled():
+            task_data = await db.update_task_row(task_id, update_fields) or task_data
+        else:
+            task_data.update(update_fields)
+        await record_state(
+            task_id,
+            build_container_state(
+                status="queued",
+                progress=task_data.get("progress", 0.0) or 0.0,
+                current_stage="queued",
+            ),
+        )
+        await task_governor.enqueue(
+            QueueItem(
+                task_id=task_id,
+                description=task_data.get("description"),
+                template_id=task_data.get("template_id"),
+                request_id=task_data.get("request_id") or get_request_id(),
+                resume_from_stage=resume_stage,
+            )
+        )
+        return {"task_id": task_id, "status": "queued", "resume_from_stage": resume_stage}
     finally:
         reset_task_id(task_token)
 
@@ -3124,13 +3325,18 @@ async def submit_task_input(task_id: str, payload: TaskInputRequest, request: Re
 
 @app.post("/api/tasks/{task_id}/chat")
 async def submit_task_chat(task_id: str, payload: ChatMessageRequest, request: Request):
-    """Submit a chat message for interactive research and resume if needed."""
+    """Submit a chat message for interactive research intake."""
     task_token = set_task_id(task_id)
     try:
         task_data = await ensure_task_owner(task_id, request)
+        if not is_interactive_research_enabled():
+            raise HTTPException(status_code=409, detail="Interactive research is disabled")
         message = (payload.message or "").strip()
         if not message:
             raise HTTPException(status_code=400, detail="Message cannot be empty")
+        status_value = str(task_data.get("status") or "").lower()
+        if status_value != "awaiting_user":
+            raise HTTPException(status_code=409, detail="Task is not awaiting intake input")
         container = await resolve_container_with_db(task_id)
         if not container:
             raise HTTPException(status_code=404, detail="Container not found")
@@ -3159,53 +3365,86 @@ async def submit_task_chat(task_id: str, payload: ChatMessageRequest, request: R
         )
         await persist_container_snapshot(task_id, container)
 
-        updated_status = task_data.get("status")
-        resume_stage = None
-        if str(task_data.get("status")).lower() == "awaiting_user":
-            resume_stage = "research"
-            update_fields = {
-                "status": "queued",
-                "current_stage": "research",
-                "resume_from_stage": resume_stage,
-                "updated_at": db.now_utc(),
-            }
-            if db.is_enabled():
-                await db.update_task_row(task_id, update_fields)
-            else:
-                task_data.update(update_fields)
-            await record_state(
-                task_id,
-                build_container_state(
-                    status="queued",
-                    progress=task_data.get("progress", 0.0) or 0.0,
-                    current_stage="research",
-                ),
-            )
-            await task_governor.enqueue(
-                QueueItem(
-                    task_id=task_id,
-                    description=task_data.get("description"),
-                    template_id=task_data.get("template_id"),
-                    request_id=task_data.get("request_id"),
-                    resume_from_stage=resume_stage,
-                )
-            )
-            updated_status = "queued"
+        orchestrator = AIOrchestrator()
+        orchestrator.attach_container(container)
+        interviewer = orchestrator.roles["interviewer"]
+        interviewer_result = await interviewer.execute(
+            task_data.get("description") or "",
+            container,
+        )
 
         assistant_message = None
-        assistant_messages = [
-            artifact.content
-            for artifact in container.artifacts.get("research_chat", [])
-            if isinstance(artifact.content, dict) and artifact.content.get("role") == "assistant"
-        ]
-        if assistant_messages:
-            assistant_message = assistant_messages[-1]
+        updated_status = "awaiting_user"
+        can_start = False
+        resume_stage = None
+        if isinstance(interviewer_result, dict) and interviewer_result.get("status") == "needs_user_input":
+            assistant_message = interviewer_result.get("message")
+            if assistant_message:
+                assistant_payload = {
+                    "role": "assistant",
+                    "content": assistant_message,
+                    "round": interviewer_result.get("round"),
+                    "questions": interviewer_result.get("questions"),
+                }
+                await record_artifact(
+                    task_id,
+                    "research_chat",
+                    normalize_payload(assistant_payload),
+                    produced_by="assistant",
+                )
+                await record_event(
+                    task_id,
+                    "chat_message",
+                    normalize_payload(assistant_payload),
+                )
+        else:
+            requirements = interviewer_result if isinstance(interviewer_result, dict) else {}
+            await record_artifact(
+                task_id,
+                "requirements",
+                normalize_payload(requirements),
+                produced_by="interviewer",
+            )
+            await record_event(
+                task_id,
+                "ArtifactAdded",
+                normalize_payload({"type": "requirements"}),
+            )
+            await persist_all_container_files(task_id, container)
+            updated_status = "intake_complete"
+            can_start = True
+            resume_stage = "design"
+
+        update_fields = {
+            "status": updated_status,
+            "current_stage": updated_status,
+            "resume_from_stage": resume_stage,
+            "can_start": can_start,
+            "updated_at": db.now_utc(),
+        }
+        if db.is_enabled():
+            await db.update_task_row(task_id, update_fields)
+        else:
+            task_data.update(update_fields)
+        await record_state(
+            task_id,
+            build_container_state(
+                status=updated_status,
+                progress=task_data.get("progress", 0.0) or 0.0,
+                current_stage=updated_status,
+                container=container,
+                active_role=container.metadata.get("active_role"),
+                current_task=container.current_task,
+            ),
+        )
+        await persist_container_snapshot(task_id, container)
 
         return {
             "task_id": task_id,
             "status": updated_status,
             "resume_from_stage": resume_stage,
             "assistant_message": assistant_message,
+            "can_start": can_start,
         }
     finally:
         reset_task_id(task_token)

@@ -1,12 +1,7 @@
-import uuid
-import asyncio
-
 import pytest
 from fastapi.testclient import TestClient
 
-from app import db
-from app.main import app, hash_api_key, process_task_background, storage
-import app.orchestrator as orchestrator_module
+from app.main import app, storage, task_governor
 
 
 client = TestClient(app)
@@ -21,106 +16,32 @@ def reset_storage() -> None:
     storage.containers.clear()
 
 
-def seed_interactive_task() -> tuple[str, str]:
-    task_id = str(uuid.uuid4())
-    api_key = "test-key"
-    owner_hash = hash_api_key(api_key)
-    now = db.now_utc()
-    storage.active_tasks[task_id] = {
-        "id": task_id,
-        "description": "Build a landing page for a cafe",
-        "user_id": "test-user",
-        "status": "queued",
-        "progress": 0.0,
-        "created_at": now,
-        "updated_at": now,
-        "owner_key_hash": owner_hash,
-        "owner_user_id": None,
-        "request_id": "req-123",
-        "failure_reason": None,
-        "pending_questions": [],
-        "provided_answers": {},
-        "resume_from_stage": None,
-        "manual_step_enabled": False,
-        "awaiting_manual_step": False,
-        "manual_step_stage": None,
-        "manual_step_options": None,
-        "last_review_status": None,
-        "last_review_report_artifact_id": None,
-        "next_task_preview": None,
-        "resume_phase": None,
-        "resume_iteration": None,
-        "resume_payload": None,
-    }
-    return task_id, api_key
-
-
-class DummyDesigner:
-    def __init__(self, codex):
-        self.codex = codex
-
-    async def execute(self, container):
-        return {"components": []}
-
-
-class DummyCoder:
-    def __init__(self, codex):
-        self.codex = codex
-
-    async def execute(self, task, container, **kwargs):
-        return {"files": []}
-
-
-class DummyPlanner:
-    def __init__(self, codex):
-        self.codex = codex
-
-    async def execute(self, container):
-        return {
-            "plan_version": 1,
-            "steps": [
-                {
-                    "id": "create_structure",
-                    "goal": "Create structure",
-                    "files": [],
-                    "acceptance_criteria": ["Structure exists"],
-                    "commands": ["pytest"],
-                }
-            ],
-            "order": ["create_structure"],
-        }
-
-
-class DummyReviewer:
-    def __init__(self, codex):
-        self.codex = codex
-
-    async def execute(self, container):
-        return {"status": "approved", "passed": True}
-
-
-def test_interactive_research_chat_flow(monkeypatch) -> None:
-    monkeypatch.setenv("ORCH_INTERACTIVE_RESEARCH", "true")
-    monkeypatch.setenv("ORCH_ENABLE_TRIAGE", "false")
-    monkeypatch.setattr(orchestrator_module, "AIDesigner", DummyDesigner)
-    monkeypatch.setattr(orchestrator_module, "AIPlanner", DummyPlanner)
-    monkeypatch.setattr(orchestrator_module, "AICoder", DummyCoder)
-    monkeypatch.setattr(orchestrator_module, "AIReviewer", DummyReviewer)
-
-    task_id, api_key = seed_interactive_task()
-    description = storage.active_tasks[task_id]["description"]
-
-    asyncio.run(process_task_background(task_id, description, request_id="req-123"))
-    assert storage.active_tasks[task_id]["status"] == "awaiting_user"
-
-    status_response = client.get(
-        f"/api/tasks/{task_id}",
+def create_task_for_intake(api_key: str) -> str:
+    response = client.post(
+        "/api/tasks",
+        json={
+            "description": "Build a landing page for a cafe",
+            "auto_start": False,
+        },
         headers={"X-API-Key": api_key},
     )
-    assert status_response.status_code == 200
-    payload = status_response.json()
-    assert isinstance(payload.get("research_chat"), list)
-    assert payload.get("last_question_text")
+    assert response.status_code == 200
+    return response.json()["task_id"]
+
+
+def test_intake_flow_creates_requirements(monkeypatch) -> None:
+    monkeypatch.setenv("ORCH_INTERACTIVE_RESEARCH", "true")
+    api_key = "test-key"
+    task_id = create_task_for_intake(api_key)
+
+    intake_response = client.post(
+        f"/api/tasks/{task_id}/intake/start",
+        headers={"X-API-Key": api_key},
+    )
+    assert intake_response.status_code == 200
+    payload = intake_response.json()
+    assert payload["status"] == "awaiting_user"
+    assert payload["artifacts"]["research_chat"]
 
     for round_index in range(3):
         response = client.post(
@@ -129,17 +50,53 @@ def test_interactive_research_chat_flow(monkeypatch) -> None:
             headers={"X-API-Key": api_key},
         )
         assert response.status_code == 200
-        asyncio.run(
-            process_task_background(
-                task_id,
-                description,
-                request_id="req-123",
-                resume_from_stage="research",
-            )
-        )
-        if round_index < 2:
-            assert storage.active_tasks[task_id]["status"] == "awaiting_user"
 
-    container = storage.containers[task_id]
-    assert container.artifacts["requirements"]
-    assert storage.active_tasks[task_id]["status"] != "awaiting_user"
+    status_response = client.get(
+        f"/api/tasks/{task_id}",
+        headers={"X-API-Key": api_key},
+    )
+    assert status_response.status_code == 200
+    payload = status_response.json()
+    assert payload["status"] == "intake_complete"
+    assert payload["can_start"] is True
+    assert payload["artifacts"]["requirements"]
+
+
+def test_start_requires_intake_complete(monkeypatch) -> None:
+    monkeypatch.setenv("ORCH_INTERACTIVE_RESEARCH", "true")
+    api_key = "test-key"
+    task_id = create_task_for_intake(api_key)
+
+    intake_response = client.post(
+        f"/api/tasks/{task_id}/intake/start",
+        headers={"X-API-Key": api_key},
+    )
+    assert intake_response.status_code == 200
+
+    start_response = client.post(
+        f"/api/tasks/{task_id}/start",
+        headers={"X-API-Key": api_key},
+    )
+    assert start_response.status_code == 409
+
+    for round_index in range(3):
+        response = client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": f"Ответ пользователя {round_index + 1}"},
+            headers={"X-API-Key": api_key},
+        )
+        assert response.status_code == 200
+
+    enqueued: list[dict] = []
+
+    async def fake_enqueue(item) -> None:
+        enqueued.append({"task_id": item.task_id, "resume_from_stage": item.resume_from_stage})
+
+    monkeypatch.setattr(task_governor, "enqueue", fake_enqueue)
+
+    start_response = client.post(
+        f"/api/tasks/{task_id}/start",
+        headers={"X-API-Key": api_key},
+    )
+    assert start_response.status_code == 200
+    assert enqueued

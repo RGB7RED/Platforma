@@ -42,6 +42,7 @@ async def init_db(database_url: str) -> None:
                 owner_user_id TEXT NULL,
                 description TEXT NOT NULL,
                 status TEXT NOT NULL,
+                can_start BOOLEAN NOT NULL DEFAULT FALSE,
                 progress DOUBLE PRECISION NOT NULL DEFAULT 0,
                 current_stage TEXT NULL,
                 codex_version TEXT NULL,
@@ -81,6 +82,9 @@ async def init_db(database_url: str) -> None:
         )
         await conn.execute(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS failure_reason TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS can_start BOOLEAN;"
         )
         await conn.execute(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS template_id TEXT;"
@@ -512,6 +516,7 @@ async def create_task_row(
     owner_user_id: Optional[str],
     description: str,
     status: str,
+    can_start: bool,
     progress: float,
     current_stage: Optional[str],
     codex_version: Optional[str],
@@ -534,6 +539,7 @@ async def create_task_row(
                 owner_user_id,
                 description,
                 status,
+                can_start,
                 progress,
                 current_stage,
                 codex_version,
@@ -545,7 +551,7 @@ async def create_task_row(
                 manual_step_enabled,
                 awaiting_manual_step
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             RETURNING *;
             """,
             _coerce_task_id(task_id),
@@ -553,6 +559,7 @@ async def create_task_row(
             owner_user_id,
             description,
             status,
+            can_start,
             progress,
             current_stage,
             codex_version,
@@ -1010,6 +1017,7 @@ async def update_task_row(task_id: str, fields: Dict[str, Any]) -> Optional[Dict
         "user_id",
         "description",
         "status",
+        "can_start",
         "progress",
         "current_stage",
         "codex_version",
