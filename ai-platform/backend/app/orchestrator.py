@@ -429,6 +429,26 @@ class AIOrchestrator:
             # Фаза 2: Проектирование
             if "design" in stage_indexes and start_index <= stage_indexes["design"]:
                 logger.info("Phase 2: Design")
+                if not self.container.artifacts.get("requirements"):
+                    logger.warning("Missing requirements before design; running research fallback.")
+                    await self._run_hook(
+                        callbacks.get("stage_started") if callbacks else None,
+                        {"stage": "research"},
+                    )
+                    self.container.update_state(ProjectState.RESEARCH, "Analyzing requirements")
+                    researcher_result = await self.roles["researcher"].execute(
+                        user_task,
+                        self.container,
+                    )
+                    await self._run_hook(
+                        callbacks.get("research_complete") if callbacks else None,
+                        {"result": researcher_result},
+                    )
+                    self.container.add_artifact(
+                        "research_summary",
+                        researcher_result,
+                        "researcher",
+                    )
                 await self._run_hook(
                     callbacks.get("stage_started") if callbacks else None,
                     {"stage": "design"},
