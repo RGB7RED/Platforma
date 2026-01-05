@@ -20,6 +20,7 @@ from .agents import (
     AIResearcher,
     AIInterviewer,
     AIDesigner,
+    AIPlanner,
     AICoder,
     AIReviewer,
     BudgetExceededError,
@@ -73,7 +74,7 @@ class AIOrchestrator:
                 "coder": {"testing_required": True}
             },
             "workflow": {
-                "stages": ["research", "design", "implementation", "review"],
+                "stages": ["research", "design", "planning", "implementation", "review"],
                 "max_iterations": 15,
                 "require_review": True,
                 "review_required": True
@@ -147,6 +148,7 @@ class AIOrchestrator:
             "researcher": AIResearcher(self.codex),
             "interviewer": AIInterviewer(self.codex),
             "designer": AIDesigner(self.codex),
+            "planner": AIPlanner(self.codex),
             "coder": AICoder(self.codex),
             "reviewer": AIReviewer(self.codex),
         }
@@ -255,6 +257,15 @@ class AIOrchestrator:
         preview_keys = {"type", "description", "file", "component"}
         return {key: task.get(key) for key in preview_keys if task.get(key) is not None}
 
+    def _latest_artifact_content(self, key: str) -> Optional[Any]:
+        if not self.container:
+            return None
+        artifacts = self.container.artifacts.get(key) or []
+        if not artifacts:
+            return None
+        latest = artifacts[-1]
+        return latest.content if hasattr(latest, "content") else latest
+
     def _plan_clarification_questions(
         self,
         user_task: str,
@@ -348,6 +359,27 @@ class AIOrchestrator:
         result = callback(payload)
         if asyncio.iscoroutine(result):
             await result
+
+    async def _execute_planning_stage(
+        self,
+        callbacks: Optional[Dict[str, Callable[[Dict[str, Any]], Any]]],
+    ) -> Dict[str, Any]:
+        await self._run_hook(
+            callbacks.get("stage_started") if callbacks else None,
+            {"stage": "planning"},
+        )
+        self.container.update_state(ProjectState.DESIGN, "Planning implementation")
+        planner_result = await self.roles["planner"].execute(self.container)
+        await self._run_hook(
+            callbacks.get("planning_complete") if callbacks else None,
+            {"result": planner_result},
+        )
+        self.container.add_artifact(
+            "implementation_plan",
+            planner_result,
+            "planner",
+        )
+        return planner_result
 
     async def process_task(
         self,
@@ -504,6 +536,10 @@ class AIOrchestrator:
                     "designer"
                 )
 
+            if "planning" in stage_indexes and start_index <= stage_indexes["planning"]:
+                logger.info("Phase 3: Planning")
+                await self._execute_planning_stage(callbacks)
+
             if "implementation" in stage_indexes and start_index <= stage_indexes["implementation"]:
                 template_manifest = self.container.metadata.get("template_manifest")
                 clarification_questions = []
@@ -536,83 +572,133 @@ class AIOrchestrator:
                         "resume_from_stage": resume_stage,
                     }
             
-            # Фаза 3: Итеративная реализация
-            if "implementation" in stage_indexes and start_index <= stage_indexes["implementation"]:
-                logger.info("Phase 3: Implementation")
-                await self._run_hook(
-                    callbacks.get("stage_started") if callbacks else None,
-                    {"stage": "implementation"},
-                )
-                self.container.update_state(ProjectState.IMPLEMENTATION, "Implementing solution")
-            
-            iteration = 0
+            review_cycles = int(self.container.metadata.get("review_cycles", 0) or 0)
+            max_review_cycles = self._get_int_env("ORCH_MAX_REVIEW_CYCLES", 3)
             max_iterations = plan.max_iterations
             logger.info("Plan mode=%s max_iterations=%s", plan.mode.value, max_iterations)
-            failure_reason: Optional[str] = None
-            failure_stage: Optional[str] = None
-            next_task_override: Optional[Dict[str, Any]] = None
-            skip_manual_stage: Optional[str] = None
-            if isinstance(resume_payload, dict):
-                next_task_override = resume_payload.get("next_task_override")
-                skip_manual_stage = resume_payload.get("skip_manual_step_stage")
-            max_llm_calls = self._get_int_env("LLM_MAX_CALLS_PER_TASK", 10)
-            max_retries_per_step = self._get_int_env("LLM_MAX_RETRIES_PER_STEP", 1)
-            self.container.metadata.setdefault("llm_calls", 0)
-            self.container.metadata.setdefault("llm_retries", 0)
-            self.container.metadata["iterations"] = iteration
-            if plan.mode == TaskMode.micro_file:
-                micro_task = {
-                    "type": "micro_file",
-                    "description": user_task,
-                    "allowed_paths": plan.contract.allowed_paths or [],
-                    "output_contract": plan.contract.model_dump(),
-                }
-                if plan.contract.allowed_paths and len(plan.contract.allowed_paths) == 1:
-                    micro_task["file"] = plan.contract.allowed_paths[0]
-                next_task_override = micro_task
 
-            if "implementation" in stage_indexes and start_index <= stage_indexes["implementation"]:
-                while not self.container.is_complete() and iteration < max_iterations:
-                    iteration += 1
-                    self.container.metadata["iterations"] = iteration
-                    logger.info(f"Implementation iteration {iteration}")
+            while True:
+                # Фаза 3: Итеративная реализация
+                if "implementation" in stage_indexes and start_index <= stage_indexes["implementation"]:
+                    logger.info("Phase 3: Implementation")
+                    await self._run_hook(
+                        callbacks.get("stage_started") if callbacks else None,
+                        {"stage": "implementation"},
+                    )
+                    self.container.update_state(ProjectState.IMPLEMENTATION, "Implementing solution")
 
-                    # 3.1 Получаем следующую задачу от планировщика
-                    next_task = next_task_override or self._get_next_task()
-                    next_task_override = None
-                    if not next_task:
-                        logger.warning("No tasks to execute")
-                        break
+                iteration = 0
+                failure_reason: Optional[str] = None
+                failure_stage: Optional[str] = None
+                next_task_override: Optional[Dict[str, Any]] = None
+                skip_manual_stage: Optional[str] = None
+                if isinstance(resume_payload, dict):
+                    next_task_override = resume_payload.get("next_task_override")
+                    skip_manual_stage = resume_payload.get("skip_manual_step_stage")
+                max_llm_calls = self._get_int_env("LLM_MAX_CALLS_PER_TASK", 10)
+                max_retries_per_step = self._get_int_env("LLM_MAX_RETRIES_PER_STEP", 1)
+                self.container.metadata.setdefault("llm_calls", 0)
+                self.container.metadata.setdefault("llm_retries", 0)
+                self.container.metadata["iterations"] = iteration
+                if plan.mode == TaskMode.micro_file:
+                    micro_task = {
+                        "type": "micro_file",
+                        "description": user_task,
+                        "allowed_paths": plan.contract.allowed_paths or [],
+                        "output_contract": plan.contract.model_dump(),
+                    }
+                    if plan.contract.allowed_paths and len(plan.contract.allowed_paths) == 1:
+                        micro_task["file"] = plan.contract.allowed_paths[0]
+                    next_task_override = micro_task
 
-                    self.container.current_task = next_task["description"]
-                    self.container.metadata["active_role"] = "coder"
+                if "implementation" in stage_indexes and start_index <= stage_indexes["implementation"]:
+                    while iteration < max_iterations:
+                        iteration += 1
+                        self.container.metadata["iterations"] = iteration
+                        logger.info(f"Implementation iteration {iteration}")
 
-                    # 3.2 Кодер выполняет задачу
-                    coder_result = None
-                    correction_prompt = None
-                    retries_used = 0
-                    for attempt in range(max_retries_per_step + 1):
-                        try:
-                            max_tokens_per_task = self._get_int_env(
-                                "LLM_MAX_TOTAL_TOKENS_PER_TASK",
-                                5000,
+                        # 3.1 Получаем следующую задачу от планировщика
+                        next_task = (
+                            next_task_override
+                            or self._get_next_plan_task()
+                            or self._get_next_task()
+                        )
+                        next_task_override = None
+                        if not next_task:
+                            logger.warning("No tasks to execute")
+                            break
+
+                        self.container.current_task = next_task["description"]
+                        self.container.metadata["active_role"] = "coder"
+                        plan_step_id = next_task.get("plan_step_id")
+                        plan_step_index = next_task.get("plan_step_index")
+                        if plan_step_id is not None:
+                            await self._run_hook(
+                                callbacks.get("plan_step_started") if callbacks else None,
+                                {
+                                    "plan_step_id": plan_step_id,
+                                    "plan_step_index": plan_step_index,
+                                    "plan_version": next_task.get("plan_version"),
+                                    "description": next_task.get("description"),
+                                },
                             )
-                            if max_tokens_per_task > 0:
-                                used_tokens = self._get_task_token_usage(
-                                    next_task.get("description")
+
+                        # 3.2 Кодер выполняет задачу
+                        coder_result = None
+                        correction_prompt = None
+                        retries_used = 0
+                        for attempt in range(max_retries_per_step + 1):
+                            try:
+                                max_tokens_per_task = self._get_int_env(
+                                    "LLM_MAX_TOTAL_TOKENS_PER_TASK",
+                                    5000,
                                 )
-                                if used_tokens >= max_tokens_per_task:
+                                if max_tokens_per_task > 0:
+                                    used_tokens = self._get_task_token_usage(
+                                        next_task.get("description")
+                                    )
+                                    if used_tokens >= max_tokens_per_task:
+                                        await self._run_hook(
+                                            callbacks.get("stage_failed") if callbacks else None,
+                                            {
+                                                "stage": "implementation",
+                                                "reason": "llm_budget_exceeded",
+                                                "error": "llm_budget_exceeded",
+                                            },
+                                        )
+                                        self.container.update_state(
+                                            ProjectState.ERROR,
+                                            "llm_budget_exceeded",
+                                        )
+                                        return {
+                                            "status": "failed",
+                                            "container_id": self.container.project_id,
+                                            "state": self.container.state.value,
+                                            "progress": self.container.progress,
+                                            "files_count": len(self.container.files),
+                                            "artifacts_count": sum(
+                                                len(a) for a in self.container.artifacts.values()
+                                            ),
+                                            "iterations": iteration,
+                                            "max_iterations": max_iterations,
+                                            "history": self.task_history[-5:],
+                                            "failure_reason": "llm_budget_exceeded",
+                                        }
+                                if (
+                                    max_llm_calls > 0
+                                    and self.container.metadata.get("llm_calls", 0) >= max_llm_calls
+                                ):
                                     await self._run_hook(
                                         callbacks.get("stage_failed") if callbacks else None,
                                         {
                                             "stage": "implementation",
-                                            "reason": "llm_budget_exceeded",
-                                            "error": "llm_budget_exceeded",
+                                            "reason": "llm_budget_exhausted",
+                                            "error": "llm_budget_exhausted",
                                         },
                                     )
                                     self.container.update_state(
                                         ProjectState.ERROR,
-                                        "llm_budget_exceeded",
+                                        "llm_budget_exhausted",
                                     )
                                     return {
                                         "status": "failed",
@@ -626,23 +712,111 @@ class AIOrchestrator:
                                         "iterations": iteration,
                                         "max_iterations": max_iterations,
                                         "history": self.task_history[-5:],
-                                        "failure_reason": "llm_budget_exceeded",
+                                        "failure_reason": "llm_budget_exhausted",
                                     }
-                            if (
-                                max_llm_calls > 0
-                                and self.container.metadata.get("llm_calls", 0) >= max_llm_calls
-                            ):
+                                self.container.metadata["llm_calls"] = (
+                                    self.container.metadata.get("llm_calls", 0) + 1
+                                )
+                                coder_result = await self.roles["coder"].execute(
+                                    next_task,
+                                    self.container,
+                                    correction_prompt=correction_prompt,
+                                )
+                                break
+                            except LLMResponseParseError as exc:
+                                parse_retry_limit = min(max_retries_per_step, 1)
+                                if retries_used < parse_retry_limit:
+                                    retries_used += 1
+                                    self.container.metadata["llm_retries"] = (
+                                        self.container.metadata.get("llm_retries", 0) + 1
+                                    )
+                                    correction_prompt = (
+                                        "OUTPUT JSON ONLY. "
+                                        "No markdown. "
+                                        "No extra keys. "
+                                        "Must be a single JSON object."
+                                    )
+                                    continue
+                                reason_label = exc.reason or "llm_invalid_json"
+                                reason_detail = (exc.error or reason_label).strip()
+                                if len(reason_detail) > 200:
+                                    reason_detail = f"{reason_detail[:200].rstrip()}..."
                                 await self._run_hook(
                                     callbacks.get("stage_failed") if callbacks else None,
                                     {
                                         "stage": "implementation",
-                                        "reason": "llm_budget_exhausted",
-                                        "error": "llm_budget_exhausted",
+                                        "reason": reason_label,
+                                        "error": exc.error or str(exc),
+                                    },
+                                )
+                                self.container.update_state(ProjectState.ERROR, reason_label)
+                                return {
+                                    "status": "failed",
+                                    "container_id": self.container.project_id,
+                                    "state": self.container.state.value,
+                                    "progress": self.container.progress,
+                                    "files_count": len(self.container.files),
+                                    "artifacts_count": sum(
+                                        len(a) for a in self.container.artifacts.values()
+                                    ),
+                                    "iterations": iteration,
+                                    "max_iterations": max_iterations,
+                                    "history": self.task_history[-5:],
+                                    "failure_reason": f"{reason_label}: {reason_detail}",
+                                }
+                            except BudgetExceededError:
+                                await self._run_hook(
+                                    callbacks.get("stage_failed") if callbacks else None,
+                                    {
+                                        "stage": "implementation",
+                                        "reason": "quota_exceeded",
+                                        "error": "quota_exceeded",
+                                    },
+                                )
+                                self.container.update_state(ProjectState.ERROR, "quota_exceeded")
+                                return {
+                                    "status": "failed",
+                                    "container_id": self.container.project_id,
+                                    "state": self.container.state.value,
+                                    "progress": self.container.progress,
+                                    "files_count": len(self.container.files),
+                                    "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
+                                    "iterations": iteration,
+                                    "max_iterations": max_iterations,
+                                    "history": self.task_history[-5:],
+                                    "failure_reason": "quota_exceeded",
+                                }
+                            except LLMOutputTruncatedError as exc:
+                                if retries_used < max_retries_per_step:
+                                    retries_used += 1
+                                    self.container.metadata["llm_retries"] = (
+                                        self.container.metadata.get("llm_retries", 0) + 1
+                                    )
+                                    correction_prompt = (
+                                        "Previous response was truncated. "
+                                        "Respond concisely and fit within the token limits. "
+                                        "OUTPUT JSON ONLY. No markdown. No extra keys."
+                                    )
+                                    logger.warning(
+                                        "LLM output truncated; retrying step (%s/%s).",
+                                        retries_used,
+                                        max_retries_per_step,
+                                    )
+                                    continue
+                                reason = str(exc) or "llm_output_truncated"
+                                if not reason.startswith("llm_output_"):
+                                    reason = "llm_output_truncated"
+                                await self._run_hook(
+                                    callbacks.get("stage_failed") if callbacks else None,
+                                    {
+                                        "stage": "implementation",
+                                        "reason": reason,
+                                        "error": str(exc),
                                     },
                                 )
                                 self.container.update_state(
                                     ProjectState.ERROR,
-                                    "llm_budget_exhausted",
+                                    reason,
                                 )
                                 return {
                                     "status": "failed",
@@ -656,229 +830,153 @@ class AIOrchestrator:
                                     "iterations": iteration,
                                     "max_iterations": max_iterations,
                                     "history": self.task_history[-5:],
-                                    "failure_reason": "llm_budget_exhausted",
+                                    "failure_reason": reason,
                                 }
-                            self.container.metadata["llm_calls"] = (
-                                self.container.metadata.get("llm_calls", 0) + 1
+                            except LLMProviderError as exc:
+                                await self._run_hook(
+                                    callbacks.get("stage_failed") if callbacks else None,
+                                    {
+                                        "stage": "implementation",
+                                        "reason": "llm_provider_error",
+                                        "error": str(exc),
+                                    },
+                                )
+                                await self._run_hook(
+                                    callbacks.get("llm_error") if callbacks else None,
+                                    {
+                                        "stage": "implementation",
+                                        "error": str(exc),
+                                    },
+                                )
+                                raise
+                        if coder_result is None:
+                            raise RuntimeError("Coder result missing after LLM retry attempts.")
+
+                        if isinstance(coder_result, dict) and coder_result.get("llm_usage"):
+                            await self._run_hook(
+                                callbacks.get("llm_usage") if callbacks else None,
+                                {
+                                    "stage": "implementation",
+                                    "usage": coder_result.get("llm_usage"),
+                                    "usage_report": coder_result.get("usage_report"),
+                                },
                             )
-                            coder_result = await self.roles["coder"].execute(
-                                next_task,
+                        await self._run_hook(
+                            callbacks.get("coder_finished") if callbacks else None,
+                            {"task": next_task, "result": coder_result, "iteration": iteration},
+                        )
+                        if plan_step_id is not None:
+                            next_index = int(plan_step_index or 0) + 1
+                            self.container.metadata["plan_step_index"] = next_index
+                            self.container.add_artifact(
+                                "plan_step_index",
+                                {
+                                    "index": next_index,
+                                    "plan_step_id": plan_step_id,
+                                    "plan_version": next_task.get("plan_version"),
+                                },
+                                "orchestrator",
+                            )
+                            await self._run_hook(
+                                callbacks.get("plan_step_finished") if callbacks else None,
+                                {
+                                    "plan_step_id": plan_step_id,
+                                    "plan_step_index": plan_step_index,
+                                    "plan_version": next_task.get("plan_version"),
+                                    "description": next_task.get("description"),
+                                },
+                            )
+
+                        if plan.mode == TaskMode.micro_file:
+                            self.container.update_state(ProjectState.COMPLETE, "Micro task completed")
+                            self.container.update_progress(1.0)
+                            break
+
+                        if plan.use_review:
+                            # 3.3 Ревьюер проверяет результат
+                            self.container.metadata["active_role"] = "reviewer"
+                            await self._run_hook(
+                                callbacks.get("review_started") if callbacks else None,
+                                {"kind": "iteration", "iteration": iteration},
+                            )
+                            review_result = await self.roles["reviewer"].execute(
                                 self.container,
-                                correction_prompt=correction_prompt,
+                                workspace_path=workspace_path,
+                                command_runner=command_runner,
                             )
-                            break
-                        except LLMResponseParseError as exc:
-                            parse_retry_limit = min(max_retries_per_step, 1)
-                            if retries_used < parse_retry_limit:
-                                retries_used += 1
-                                self.container.metadata["llm_retries"] = (
-                                    self.container.metadata.get("llm_retries", 0) + 1
-                                )
-                                correction_prompt = (
-                                    "OUTPUT JSON ONLY. "
-                                    "No markdown. "
-                                    "No extra keys. "
-                                    "Must be a single JSON object."
-                                )
-                                continue
-                            reason_label = exc.reason or "llm_invalid_json"
-                            reason_detail = (exc.error or reason_label).strip()
-                            if len(reason_detail) > 200:
-                                reason_detail = f"{reason_detail[:200].rstrip()}..."
                             await self._run_hook(
-                                callbacks.get("stage_failed") if callbacks else None,
-                                {
-                                    "stage": "implementation",
-                                    "reason": reason_label,
-                                    "error": exc.error or str(exc),
-                                },
+                                callbacks.get("review_finished") if callbacks else None,
+                                {"result": review_result, "kind": "iteration", "iteration": iteration},
                             )
-                            self.container.update_state(ProjectState.ERROR, reason_label)
-                            return {
-                                "status": "failed",
-                                "container_id": self.container.project_id,
-                                "state": self.container.state.value,
-                                "progress": self.container.progress,
-                                "files_count": len(self.container.files),
-                                "artifacts_count": sum(
-                                    len(a) for a in self.container.artifacts.values()
-                                ),
-                                "iterations": iteration,
-                                "max_iterations": max_iterations,
-                                "history": self.task_history[-5:],
-                                "failure_reason": f"{reason_label}: {reason_detail}",
-                            }
-                        except BudgetExceededError:
                             await self._run_hook(
-                                callbacks.get("stage_failed") if callbacks else None,
-                                {
-                                    "stage": "implementation",
-                                    "reason": "quota_exceeded",
-                                    "error": "quota_exceeded",
-                                },
+                                callbacks.get("review_result") if callbacks else None,
+                                {"result": review_result, "kind": "iteration", "iteration": iteration},
                             )
-                            self.container.update_state(ProjectState.ERROR, "quota_exceeded")
-                            return {
-                                "status": "failed",
-                                "container_id": self.container.project_id,
-                                "state": self.container.state.value,
-                                "progress": self.container.progress,
-                                "files_count": len(self.container.files),
-                                "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
-                                "iterations": iteration,
-                                "max_iterations": max_iterations,
-                                "history": self.task_history[-5:],
-                                "failure_reason": "quota_exceeded",
-                            }
-                        except LLMOutputTruncatedError as exc:
-                            if retries_used < max_retries_per_step:
-                                retries_used += 1
-                                self.container.metadata["llm_retries"] = (
-                                    self.container.metadata.get("llm_retries", 0) + 1
-                                )
-                                correction_prompt = (
-                                    "Previous response was truncated. "
-                                    "Respond concisely and fit within the token limits. "
-                                    "OUTPUT JSON ONLY. No markdown. No extra keys."
-                                )
+
+                            if review_result.get("command_timeout"):
+                                failure_reason = "command_timeout"
+                                failure_stage = "implementation"
+                                logger.warning("Iteration %s halted due to command timeout", iteration)
+                                break
+                            if review_result.get("passed"):
+                                logger.info(f"Iteration {iteration} approved")
+                                self.container.update_progress(iteration / max_iterations)
+                            else:
                                 logger.warning(
-                                    "LLM output truncated; retrying step (%s/%s).",
-                                    retries_used,
-                                    max_retries_per_step,
+                                    f"Iteration {iteration} rejected: {review_result.get('issues', [])}"
                                 )
-                                continue
-                            reason = str(exc) or "llm_output_truncated"
-                            if not reason.startswith("llm_output_"):
-                                reason = "llm_output_truncated"
+                                next_task_override = self._build_fix_task(next_task, review_result)
+                            next_task_preview = self._preview_task(
+                                next_task_override or self._get_next_task()
+                            )
+                            next_actions = self._build_next_actions(
+                                stage="implementation",
+                                iteration=iteration,
+                                review_result=review_result,
+                                next_task_preview=next_task_preview,
+                            )
+                            self.container.add_artifact("next_actions", next_actions, "orchestrator")
                             await self._run_hook(
-                                callbacks.get("stage_failed") if callbacks else None,
-                                {
-                                    "stage": "implementation",
-                                    "reason": reason,
-                                    "error": str(exc),
-                                },
+                                callbacks.get("next_actions") if callbacks else None,
+                                {"payload": next_actions},
                             )
-                            self.container.update_state(
-                                ProjectState.ERROR,
-                                reason,
-                            )
-                            return {
-                                "status": "failed",
-                                "container_id": self.container.project_id,
-                                "state": self.container.state.value,
-                                "progress": self.container.progress,
-                                "files_count": len(self.container.files),
-                                "artifacts_count": sum(
-                                    len(a) for a in self.container.artifacts.values()
-                                ),
-                                "iterations": iteration,
-                                "max_iterations": max_iterations,
-                                "history": self.task_history[-5:],
-                                "failure_reason": reason,
-                            }
-                        except LLMProviderError as exc:
-                            await self._run_hook(
-                                callbacks.get("stage_failed") if callbacks else None,
-                                {
-                                    "stage": "implementation",
-                                    "reason": "llm_provider_error",
-                                    "error": str(exc),
-                                },
-                            )
-                            await self._run_hook(
-                                callbacks.get("llm_error") if callbacks else None,
-                                {
-                                    "stage": "implementation",
-                                    "error": str(exc),
-                                },
-                            )
-                            raise
-                    if coder_result is None:
-                        raise RuntimeError("Coder result missing after LLM retry attempts.")
-
-                    if isinstance(coder_result, dict) and coder_result.get("llm_usage"):
-                        await self._run_hook(
-                            callbacks.get("llm_usage") if callbacks else None,
-                            {
-                                "stage": "implementation",
-                                "usage": coder_result.get("llm_usage"),
-                                "usage_report": coder_result.get("usage_report"),
-                            },
-                        )
-                    await self._run_hook(
-                        callbacks.get("coder_finished") if callbacks else None,
-                        {"task": next_task, "result": coder_result, "iteration": iteration},
-                    )
-
-                    if plan.mode == TaskMode.micro_file:
-                        self.container.update_state(ProjectState.COMPLETE, "Micro task completed")
-                        self.container.update_progress(1.0)
-                        break
-
-                    if plan.use_review:
-                        # 3.3 Ревьюер проверяет результат
-                        self.container.metadata["active_role"] = "reviewer"
-                        await self._run_hook(
-                            callbacks.get("review_started") if callbacks else None,
-                            {"kind": "iteration", "iteration": iteration},
-                        )
-                        review_result = await self.roles["reviewer"].execute(
-                            self.container,
-                            workspace_path=workspace_path,
-                            command_runner=command_runner,
-                        )
-                        await self._run_hook(
-                            callbacks.get("review_finished") if callbacks else None,
-                            {"result": review_result, "kind": "iteration", "iteration": iteration},
-                        )
-                        await self._run_hook(
-                            callbacks.get("review_result") if callbacks else None,
-                            {"result": review_result, "kind": "iteration", "iteration": iteration},
-                        )
-
-                        if review_result.get("command_timeout"):
-                            failure_reason = "command_timeout"
-                            failure_stage = "implementation"
-                            logger.warning("Iteration %s halted due to command timeout", iteration)
-                            break
-                        if review_result.get("passed"):
-                            logger.info(f"Iteration {iteration} approved")
-                            self.container.update_progress(iteration / max_iterations)
-                        else:
-                            logger.warning(
-                                f"Iteration {iteration} rejected: {review_result.get('issues', [])}"
-                            )
-                            next_task_override = self._build_fix_task(next_task, review_result)
-                        next_task_preview = self._preview_task(
-                            next_task_override or self._get_next_task()
-                        )
-                        next_actions = self._build_next_actions(
-                            stage="implementation",
-                            iteration=iteration,
-                            review_result=review_result,
-                            next_task_preview=next_task_preview,
-                        )
-                        self.container.add_artifact("next_actions", next_actions, "orchestrator")
-                        await self._run_hook(
-                            callbacks.get("next_actions") if callbacks else None,
-                            {"payload": next_actions},
-                        )
-                        manual_stage = "post_iteration_review"
-                        if (
-                            self._manual_step_enabled(manual_step_enabled)
-                            and manual_stage != skip_manual_stage
-                        ):
-                            last_review_status = (
-                                review_result.get("status")
-                                if isinstance(review_result, dict)
-                                else None
-                            )
-                            self.container.metadata.update(
-                                {
+                            manual_stage = "post_iteration_review"
+                            if (
+                                self._manual_step_enabled(manual_step_enabled)
+                                and manual_stage != skip_manual_stage
+                            ):
+                                last_review_status = (
+                                    review_result.get("status")
+                                    if isinstance(review_result, dict)
+                                    else None
+                                )
+                                self.container.metadata.update(
+                                    {
+                                        "awaiting_manual_step": True,
+                                        "manual_step_stage": manual_stage,
+                                        "manual_step_options": ["continue", "stop", "retry"],
+                                        "last_review_status": last_review_status,
+                                        "next_task_preview": next_task_preview,
+                                        "resume_phase": "implementation",
+                                        "resume_iteration": iteration,
+                                        "resume_payload": {
+                                            "next_task_override": next_task_override,
+                                            "next_task_preview": next_task_preview,
+                                        },
+                                    }
+                                )
+                                return {
+                                    "status": "needs_input",
+                                    "container_id": self.container.project_id,
+                                    "state": self.container.state.value,
+                                    "progress": self.container.progress,
                                     "awaiting_manual_step": True,
                                     "manual_step_stage": manual_stage,
                                     "manual_step_options": ["continue", "stop", "retry"],
                                     "last_review_status": last_review_status,
+                                    "last_review_report_artifact_id": self.container.metadata.get(
+                                        "last_review_report_artifact_id"
+                                    ),
                                     "next_task_preview": next_task_preview,
                                     "resume_phase": "implementation",
                                     "resume_iteration": iteration,
@@ -887,170 +985,164 @@ class AIOrchestrator:
                                         "next_task_preview": next_task_preview,
                                     },
                                 }
-                            )
-                            return {
-                                "status": "needs_input",
-                                "container_id": self.container.project_id,
-                                "state": self.container.state.value,
-                                "progress": self.container.progress,
+                else:
+                    iteration = self.container.metadata.get("iterations", 0) or 0
+
+                if failure_reason:
+                    await self._run_hook(
+                        callbacks.get("stage_failed") if callbacks else None,
+                        {
+                            "stage": failure_stage or "implementation",
+                            "reason": failure_reason,
+                            "issues": [],
+                        },
+                    )
+                    self.container.update_state(ProjectState.ERROR, failure_reason)
+                    self.task_history.append(
+                        {
+                            "task": user_task,
+                            "status": self.container.state.value,
+                            "iterations": iteration,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
+                    status = "failed"
+                    return {
+                        "status": status,
+                        "container_id": self.container.project_id,
+                        "state": self.container.state.value,
+                        "progress": self.container.progress,
+                        "files_count": len(self.container.files),
+                        "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
+                        "iterations": iteration,
+                        "max_iterations": max_iterations,
+                        "history": self.task_history[-5:],
+                        "failure_reason": failure_reason,
+                    }
+
+                if iteration >= max_iterations and not self.container.is_complete():
+                    failure_reason = "max_iterations_exhausted"
+                    await self._run_hook(
+                        callbacks.get("stage_failed") if callbacks else None,
+                        {
+                            "stage": "implementation",
+                            "reason": failure_reason,
+                            "issues": [],
+                        },
+                    )
+                    self.container.update_state(ProjectState.ERROR, failure_reason)
+                    self.task_history.append(
+                        {
+                            "task": user_task,
+                            "status": self.container.state.value,
+                            "iterations": iteration,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
+                    status = "failed"
+                    return {
+                        "status": status,
+                        "container_id": self.container.project_id,
+                        "state": self.container.state.value,
+                        "progress": self.container.progress,
+                        "files_count": len(self.container.files),
+                        "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
+                        "iterations": iteration,
+                        "max_iterations": max_iterations,
+                        "history": self.task_history[-5:],
+                        "failure_reason": failure_reason,
+                    }
+
+                # Фаза 4: Финальное ревью
+                review_required = plan.use_review
+                if review_required and "review" in stage_indexes and start_index <= stage_indexes["review"]:
+                    manual_stage = "pre_final_review"
+                    if self._manual_step_enabled(manual_step_enabled) and manual_stage != skip_manual_stage:
+                        self.container.metadata.update(
+                            {
                                 "awaiting_manual_step": True,
                                 "manual_step_stage": manual_stage,
                                 "manual_step_options": ["continue", "stop", "retry"],
-                                "last_review_status": last_review_status,
-                                "last_review_report_artifact_id": self.container.metadata.get(
-                                    "last_review_report_artifact_id"
-                                ),
-                                "next_task_preview": next_task_preview,
-                                "resume_phase": "implementation",
+                                "resume_phase": "review",
                                 "resume_iteration": iteration,
-                                "resume_payload": {
-                                    "next_task_override": next_task_override,
-                                    "next_task_preview": next_task_preview,
-                                },
+                                "resume_payload": {},
                             }
-            else:
-                iteration = self.container.metadata.get("iterations", 0) or 0
-
-            if failure_reason:
-                await self._run_hook(
-                    callbacks.get("stage_failed") if callbacks else None,
-                    {
-                        "stage": failure_stage or "implementation",
-                        "reason": failure_reason,
-                        "issues": [],
-                    },
-                )
-                self.container.update_state(ProjectState.ERROR, failure_reason)
-                self.task_history.append(
-                    {
-                        "task": user_task,
-                        "status": self.container.state.value,
-                        "iterations": iteration,
-                        "timestamp": datetime.now().isoformat(),
-                    }
-                )
-                status = "failed"
-                return {
-                    "status": status,
-                    "container_id": self.container.project_id,
-                    "state": self.container.state.value,
-                    "progress": self.container.progress,
-                    "files_count": len(self.container.files),
-                    "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
-                    "iterations": iteration,
-                    "max_iterations": max_iterations,
-                    "history": self.task_history[-5:],
-                    "failure_reason": failure_reason,
-                }
-
-            if iteration >= max_iterations and not self.container.is_complete():
-                failure_reason = "max_iterations_exhausted"
-                await self._run_hook(
-                    callbacks.get("stage_failed") if callbacks else None,
-                    {
-                        "stage": "implementation",
-                        "reason": failure_reason,
-                        "issues": [],
-                    },
-                )
-                self.container.update_state(ProjectState.ERROR, failure_reason)
-                self.task_history.append(
-                    {
-                        "task": user_task,
-                        "status": self.container.state.value,
-                        "iterations": iteration,
-                        "timestamp": datetime.now().isoformat(),
-                    }
-                )
-                status = "failed"
-                return {
-                    "status": status,
-                    "container_id": self.container.project_id,
-                    "state": self.container.state.value,
-                    "progress": self.container.progress,
-                    "files_count": len(self.container.files),
-                    "artifacts_count": sum(len(a) for a in self.container.artifacts.values()),
-                    "iterations": iteration,
-                    "max_iterations": max_iterations,
-                    "history": self.task_history[-5:],
-                    "failure_reason": failure_reason,
-                }
-            
-            # Фаза 4: Финальное ревью
-            review_required = plan.use_review
-            if review_required and "review" in stage_indexes and start_index <= stage_indexes["review"]:
-                manual_stage = "pre_final_review"
-                if self._manual_step_enabled(manual_step_enabled) and manual_stage != skip_manual_stage:
-                    self.container.metadata.update(
-                        {
+                        )
+                        return {
+                            "status": "needs_input",
+                            "container_id": self.container.project_id,
+                            "state": self.container.state.value,
+                            "progress": self.container.progress,
                             "awaiting_manual_step": True,
                             "manual_step_stage": manual_stage,
                             "manual_step_options": ["continue", "stop", "retry"],
+                            "next_task_preview": None,
                             "resume_phase": "review",
                             "resume_iteration": iteration,
                             "resume_payload": {},
                         }
-                    )
-                    return {
-                        "status": "needs_input",
-                        "container_id": self.container.project_id,
-                        "state": self.container.state.value,
-                        "progress": self.container.progress,
-                        "awaiting_manual_step": True,
-                        "manual_step_stage": manual_stage,
-                        "manual_step_options": ["continue", "stop", "retry"],
-                        "next_task_preview": None,
-                        "resume_phase": "review",
-                        "resume_iteration": iteration,
-                        "resume_payload": {},
-                    }
-                logger.info("Phase 4: Final Review")
-                await self._run_hook(
-                    callbacks.get("stage_started") if callbacks else None,
-                    {"stage": "review"},
-                )
-                self.container.update_state(ProjectState.REVIEW, "Final quality check")
-                
-                await self._run_hook(
-                    callbacks.get("review_started") if callbacks else None,
-                    {"kind": "final"},
-                )
-                final_review = await self.roles["reviewer"].execute(
-                    self.container,
-                    workspace_path=workspace_path,
-                    command_runner=command_runner,
-                )
-                await self._run_hook(
-                    callbacks.get("review_finished") if callbacks else None,
-                    {"result": final_review, "kind": "final"},
-                )
-                await self._run_hook(
-                    callbacks.get("review_result") if callbacks else None,
-                    {"result": final_review, "kind": "final"},
-                )
-                
-                if final_review.get("passed"):
-                    self.container.update_state(ProjectState.COMPLETE, "Project completed")
-                    self.container.update_progress(1.0)
-                    logger.info("Project completed successfully")
-                else:
-                    failure_reason = "Final review failed"
-                    issues = final_review.get("issues")
+                    logger.info("Phase 4: Final Review")
                     await self._run_hook(
-                        callbacks.get("stage_failed") if callbacks else None,
-                        {
-                            "stage": "review",
-                            "reason": failure_reason,
-                            "issues": issues,
-                        },
+                        callbacks.get("stage_started") if callbacks else None,
+                        {"stage": "review"},
                     )
-                    logger.error(f"Project failed final review: {issues}")
-                    self.container.update_state(ProjectState.ERROR, "Failed final review")
-            else:
-                logger.info("Codex allows skipping final review stage")
-                self.container.update_state(ProjectState.COMPLETE, "Project completed (review skipped)")
-                self.container.update_progress(1.0)
-            
+                    self.container.update_state(ProjectState.REVIEW, "Final quality check")
+
+                    await self._run_hook(
+                        callbacks.get("review_started") if callbacks else None,
+                        {"kind": "final"},
+                    )
+                    final_review = await self.roles["reviewer"].execute(
+                        self.container,
+                        workspace_path=workspace_path,
+                        command_runner=command_runner,
+                    )
+                    await self._run_hook(
+                        callbacks.get("review_finished") if callbacks else None,
+                        {"result": final_review, "kind": "final"},
+                    )
+                    await self._run_hook(
+                        callbacks.get("review_result") if callbacks else None,
+                        {"result": final_review, "kind": "final"},
+                    )
+
+                    if final_review.get("passed"):
+                        self.container.update_state(ProjectState.COMPLETE, "Project completed")
+                        self.container.update_progress(1.0)
+                        logger.info("Project completed successfully")
+                        break
+
+                    review_cycles += 1
+                    self.container.metadata["review_cycles"] = review_cycles
+                    if review_cycles >= max_review_cycles:
+                        failure_reason = "Final review failed"
+                        issues = final_review.get("issues")
+                        await self._run_hook(
+                            callbacks.get("stage_failed") if callbacks else None,
+                            {
+                                "stage": "review",
+                                "reason": failure_reason,
+                                "issues": issues,
+                            },
+                        )
+                        logger.error(f"Project failed final review: {issues}")
+                        self.container.update_state(ProjectState.ERROR, "Failed final review")
+                        break
+
+                    logger.info(
+                        "Final review failed; rerouting to planning (cycle %s/%s).",
+                        review_cycles,
+                        max_review_cycles,
+                    )
+                    self.container.metadata["plan_step_index"] = 0
+                    await self._execute_planning_stage(callbacks)
+                    continue
+                else:
+                    logger.info("Codex allows skipping final review stage")
+                    self.container.update_state(ProjectState.COMPLETE, "Project completed (review skipped)")
+                    self.container.update_progress(1.0)
+                    break
+
             # Сохраняем историю задачи
             self.task_history.append({
                 "task": user_task,
@@ -1058,7 +1150,7 @@ class AIOrchestrator:
                 "iterations": iteration,
                 "timestamp": datetime.now().isoformat()
             })
-            
+
             status = "completed" if self.container.state == ProjectState.COMPLETE else "failed"
             return {
                 "status": status,
@@ -1142,6 +1234,37 @@ class AIOrchestrator:
         
         # Всё сделано
         return None
+
+    def _get_next_plan_task(self) -> Optional[Dict[str, Any]]:
+        if not self.container:
+            return None
+        plan = self._latest_artifact_content("implementation_plan")
+        if not isinstance(plan, dict):
+            return None
+        steps = plan.get("steps")
+        if not isinstance(steps, list) or not steps:
+            return None
+        order = plan.get("order")
+        if isinstance(order, list) and order:
+            id_to_step = {step.get("id"): step for step in steps if isinstance(step, dict)}
+            ordered_steps = [id_to_step.get(step_id) for step_id in order]
+            steps = [step for step in ordered_steps if isinstance(step, dict)]
+
+        step_index = int(self.container.metadata.get("plan_step_index", 0) or 0)
+        if step_index >= len(steps):
+            return None
+        step = steps[step_index]
+        goal = step.get("goal") or step.get("description") or "Execute plan step"
+        return {
+            "type": "plan_step",
+            "description": goal,
+            "plan_step_id": step.get("id"),
+            "plan_step_index": step_index,
+            "plan_version": plan.get("plan_version"),
+            "files": step.get("files"),
+            "acceptance_criteria": step.get("acceptance_criteria"),
+            "verification_commands": step.get("commands"),
+        }
 
     @staticmethod
     def _build_fix_task(previous_task: Dict[str, Any], review_result: Dict[str, Any]) -> Dict[str, Any]:

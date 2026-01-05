@@ -50,7 +50,7 @@ async def build_task_plan(
     allow_llm: bool = True,
 ) -> TaskPlan:
     workflow = codex_cfg.get("workflow", {}) if isinstance(codex_cfg, dict) else {}
-    default_stages = workflow.get("stages") or ["research", "design", "implementation", "review"]
+    default_stages = workflow.get("stages") or ["research", "design", "planning", "implementation", "review"]
     default_max_iterations = workflow.get("max_iterations", 15)
     review_required = workflow.get("review_required", workflow.get("require_review", True))
 
@@ -73,7 +73,7 @@ async def build_task_plan(
 
 def build_default_plan(codex_cfg: Dict[str, Any]) -> TaskPlan:
     workflow = codex_cfg.get("workflow", {}) if isinstance(codex_cfg, dict) else {}
-    default_stages = workflow.get("stages") or ["research", "design", "implementation", "review"]
+    default_stages = workflow.get("stages") or ["research", "design", "planning", "implementation", "review"]
     default_max_iterations = workflow.get("max_iterations", 15)
     review_required = workflow.get("review_required", workflow.get("require_review", True))
     fallback = {
@@ -222,7 +222,7 @@ def _finalize_plan(
         max_iterations = _get_int_env("ORCH_MICRO_MAX_ITERATIONS", 3)
         use_review = False
     elif mode == TaskMode.small_code:
-        stages = _filter_stages(default_stages, {"implementation", "review", "design"})
+        stages = _filter_stages(default_stages, {"implementation", "review", "design", "planning"})
         if not stages:
             stages = ["implementation", "review"]
         max_iterations = default_max_iterations
@@ -233,6 +233,7 @@ def _finalize_plan(
         use_review = review_required
 
     stages = _ensure_research_before_design(stages)
+    stages = _ensure_planning_after_design(stages)
 
     return TaskPlan(
         mode=mode,
@@ -271,6 +272,18 @@ def _ensure_research_before_design(stages: List[str]) -> List[str]:
         return stages
     design_index = stages.index("design")
     return stages[:design_index] + ["research"] + stages[design_index:]
+
+
+def _ensure_planning_after_design(stages: List[str]) -> List[str]:
+    if "planning" not in stages or "design" not in stages:
+        return stages
+    design_index = stages.index("design")
+    planning_index = stages.index("planning")
+    if planning_index > design_index:
+        return stages
+    reordered = [stage for stage in stages if stage != "planning"]
+    insert_at = reordered.index("design") + 1
+    return reordered[:insert_at] + ["planning"] + reordered[insert_at:]
 
 
 def _get_int_env(name: str, default: int) -> int:
