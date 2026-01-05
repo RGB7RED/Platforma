@@ -4,6 +4,22 @@ AI Platform is a FastAPI service that powers a Telegram Mini App for AI-assisted
 It exposes HTTP APIs for task creation, status tracking, and file retrieval, with optional
 Postgres persistence and Telegram bot integration.
 
+## Intake-first UX (chat before processing)
+
+The backend now supports an intake-first workflow where users can chat with AI before starting
+the design → planning → implementation → review pipeline:
+
+1. **Create a task without auto-starting the pipeline**:
+   - `POST /api/tasks` with `{ "description": "...", "auto_start": false }`.
+2. **Start intake to receive the first AI questions**:
+   - `POST /api/tasks/{task_id}/intake/start` (returns `status=awaiting_user` and `artifacts.research_chat`).
+3. **Continue the intake chat**:
+   - `POST /api/tasks/{task_id}/chat` (up to 3 rounds).
+   - After the third user response, the task transitions to `status=intake_complete`,
+     sets `can_start=true`, and stores `artifacts.requirements`.
+4. **Start the main pipeline**:
+   - `POST /api/tasks/{task_id}/start` kicks off processing once intake is complete.
+
 ## Local development (Python)
 
 1. Install dependencies:
