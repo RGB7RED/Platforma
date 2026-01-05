@@ -30,9 +30,13 @@ class TestAIOrchestrator:
             mock_designer = AsyncMock()
             mock_coder = AsyncMock()
             mock_reviewer = AsyncMock()
-            
+
             # Настраиваем возвращаемые значения
-            mock_researcher.execute.return_value = {"requirements": []}
+            async def _researcher_execute(task, container):
+                container.add_artifact("requirements", {"requirements": []}, "researcher")
+                return {"requirements": []}
+
+            mock_researcher.execute.side_effect = _researcher_execute
             mock_designer.execute.return_value = {
                 "components": [{"name": "Test", "files": ["test.py"]}]
             }
@@ -61,7 +65,13 @@ class TestAIOrchestrator:
         assert container is not None
         assert container.metadata["project_name"] == "Test Project"
         assert "started_at" in container.metadata
-        assert len(orchestrator.roles) == 4
+        assert {
+            "researcher",
+            "interviewer",
+            "designer",
+            "coder",
+            "reviewer",
+        }.issubset(set(orchestrator.roles))
     
     @pytest.mark.asyncio
     async def test_process_task_success(self, orchestrator, mock_agents):
