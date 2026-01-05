@@ -18,6 +18,7 @@ from .planning import TaskMode, build_default_plan, build_task_plan
 from .logging_utils import configure_logging
 from .agents import (
     AIResearcher,
+    AIInterviewer,
     AIDesigner,
     AICoder,
     AIReviewer,
@@ -144,6 +145,7 @@ class AIOrchestrator:
             return
         self.roles = {
             "researcher": AIResearcher(self.codex),
+            "interviewer": AIInterviewer(self.codex),
             "designer": AIDesigner(self.codex),
             "coder": AICoder(self.codex),
             "reviewer": AIReviewer(self.codex),
@@ -188,6 +190,10 @@ class AIOrchestrator:
     def _is_triage_enabled(self) -> bool:
         env_value = self._get_bool_env("ORCH_ENABLE_TRIAGE")
         return True if env_value is None else bool(env_value)
+
+    def _is_interactive_research_enabled(self) -> bool:
+        env_value = self._get_bool_env("ORCH_INTERACTIVE_RESEARCH")
+        return bool(env_value) if env_value is not None else False
 
     def _get_task_token_usage(self, task_description: Optional[str]) -> int:
         if not task_description:
@@ -410,11 +416,39 @@ class AIOrchestrator:
                     {"stage": "research"},
                 )
                 self.container.update_state(ProjectState.RESEARCH, "Analyzing requirements")
+                if self._is_interactive_research_enabled():
+                    researcher_result = await self.roles["interviewer"].execute(
+                        user_task,
+                        self.container,
+                    )
+                    if isinstance(researcher_result, dict) and researcher_result.get("status") == "needs_user_input":
+                        message = researcher_result.get("message")
+                        if message:
+                            await self._run_hook(
+                                callbacks.get("chat_message") if callbacks else None,
+                                {
+                                    "role": "assistant",
+                                    "content": message,
+                                    "round": researcher_result.get("round"),
+                                    "questions": researcher_result.get("questions"),
+                                },
+                            )
+                        self.container.update_state(ProjectState.AWAITING_USER, "Awaiting user input")
+                        return {
+                            "status": "awaiting_user",
+                            "container_id": self.container.project_id,
+                            "state": self.container.state.value,
+                            "progress": self.container.progress,
+                            "research_round": researcher_result.get("round"),
+                            "chat_message": message,
+                            "resume_from_stage": "research",
+                        }
+                else:
+                    researcher_result = await self.roles["researcher"].execute(
+                        user_task,
+                        self.container,
+                    )
 
-                researcher_result = await self.roles["researcher"].execute(
-                    user_task,
-                    self.container
-                )
                 await self._run_hook(
                     callbacks.get("research_complete") if callbacks else None,
                     {"result": researcher_result},
@@ -423,12 +457,32 @@ class AIOrchestrator:
                 self.container.add_artifact(
                     "research_summary",
                     researcher_result,
-                    "researcher"
+                    "researcher",
                 )
             
             # Фаза 2: Проектирование
             if "design" in stage_indexes and start_index <= stage_indexes["design"]:
                 logger.info("Phase 2: Design")
+                if not self.container.artifacts.get("requirements"):
+                    logger.warning("Missing requirements before design; running research fallback.")
+                    await self._run_hook(
+                        callbacks.get("stage_started") if callbacks else None,
+                        {"stage": "research"},
+                    )
+                    self.container.update_state(ProjectState.RESEARCH, "Analyzing requirements")
+                    researcher_result = await self.roles["researcher"].execute(
+                        user_task,
+                        self.container,
+                    )
+                    await self._run_hook(
+                        callbacks.get("research_complete") if callbacks else None,
+                        {"result": researcher_result},
+                    )
+                    self.container.add_artifact(
+                        "research_summary",
+                        researcher_result,
+                        "researcher",
+                    )
                 await self._run_hook(
                     callbacks.get("stage_started") if callbacks else None,
                     {"stage": "design"},

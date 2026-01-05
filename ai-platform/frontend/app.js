@@ -193,6 +193,10 @@
     clarificationForm: document.getElementById('clarificationForm'),
     submitClarificationBtn: document.getElementById('submitClarificationBtn'),
     resumeTaskBtn: document.getElementById('resumeTaskBtn'),
+    researchChatPanel: document.getElementById('researchChatPanel'),
+    researchChatHistory: document.getElementById('researchChatHistory'),
+    researchChatInput: document.getElementById('researchChatInput'),
+    researchChatSendBtn: document.getElementById('researchChatSendBtn'),
     manualStepPanel: document.getElementById('manualStepPanel'),
     manualStepMessage: document.getElementById('manualStepMessage'),
     manualStepStage: document.getElementById('manualStepStage'),
@@ -274,6 +278,7 @@
   let lastEventSignature = '';
   let lastArtifactSignature = '';
   let lastQuestionsSignature = '';
+  let lastResearchChatSignature = '';
   let artifactTypeFilter = '';
   let activeInspectorTab = 'state';
   let latestFilesTotal = null;
@@ -1687,7 +1692,13 @@
     }
     updateTimeTakenDisplay(normalized);
     refreshMetricsDisplay();
-    if (String(normalized.status).toLowerCase() === 'needs_input' && currentTaskId) {
+    const normalizedStatus = String(normalized.status).toLowerCase();
+    if (normalizedStatus === 'awaiting_user' && currentTaskId) {
+      setClarificationPanelVisible(false);
+      setManualStepPanelVisible(false);
+      loadResearchChat(currentTaskId);
+      setResearchChatPanelVisible(true);
+    } else if (normalizedStatus === 'needs_input' && currentTaskId) {
       if (normalized.awaiting_manual_step) {
         setClarificationPanelVisible(false);
         renderManualStepPanel(normalized);
@@ -1699,6 +1710,7 @@
     } else {
       setClarificationPanelVisible(false);
       setManualStepPanelVisible(false);
+      setResearchChatPanelVisible(false);
     }
   };
   const isTerminalState = (data) => {
@@ -1747,6 +1759,7 @@
       elements.clarificationForm.innerHTML = '';
     }
     setClarificationPanelVisible(false);
+    setResearchChatPanelVisible(false);
     setManualStepPanelVisible(false);
     if (elements.manualStepStage) {
       elements.manualStepStage.textContent = '-';
@@ -1756,6 +1769,12 @@
     }
     if (elements.manualStepPreview) {
       elements.manualStepPreview.textContent = '-';
+    }
+    if (elements.researchChatHistory) {
+      elements.researchChatHistory.innerHTML = '';
+    }
+    if (elements.researchChatInput) {
+      elements.researchChatInput.value = '';
     }
     resetFilePanel();
   };
@@ -1964,6 +1983,13 @@
     elements.clarificationPanel.classList.toggle('hidden', !isVisible);
   };
 
+  const setResearchChatPanelVisible = (isVisible) => {
+    if (!elements.researchChatPanel) {
+      return;
+    }
+    elements.researchChatPanel.classList.toggle('hidden', !isVisible);
+  };
+
   const setManualStepPanelVisible = (isVisible) => {
     if (!elements.manualStepPanel) {
       return;
@@ -2046,6 +2072,50 @@
     elements.clarificationMessage.textContent = requestedAt
       ? `Please answer the questions below. ${requestedAt}`
       : 'Please answer the questions below so the task can continue.';
+  };
+
+  const renderResearchChat = (artifacts) => {
+    if (!elements.researchChatHistory) {
+      return;
+    }
+    if (!Array.isArray(artifacts) || !artifacts.length) {
+      elements.researchChatHistory.innerHTML =
+        '<div class="task-lookup-hint">No chat messages yet.</div>';
+      return;
+    }
+    elements.researchChatHistory.innerHTML = artifacts
+      .map((artifact) => {
+        const payload = artifact?.payload || {};
+        const role = payload.role || 'assistant';
+        const content = payload.content || '';
+        const roundLabel = payload.round ? `Round ${payload.round}` : '';
+        const roleLabel = role === 'user' ? 'You' : 'Assistant';
+        return `
+          <div class="chat-message ${role}">
+            <div class="chat-meta">${roleLabel} ${roundLabel}</div>
+            <div class="chat-content">${content}</div>
+          </div>
+        `;
+      })
+      .join('');
+    elements.researchChatHistory.scrollTop = elements.researchChatHistory.scrollHeight;
+  };
+
+  const loadResearchChat = async (taskId) => {
+    if (!taskId) {
+      return;
+    }
+    const { data, error } = await fetchArtifacts(taskId, { type: 'research_chat', limit: 200, order: 'asc' });
+    if (error) {
+      return;
+    }
+    const artifacts = Array.isArray(data) ? data : data?.artifacts || data?.items || [];
+    const signature = JSON.stringify(artifacts.map(getArtifactKey));
+    if (signature === lastResearchChatSignature) {
+      return;
+    }
+    lastResearchChatSignature = signature;
+    renderResearchChat(artifacts);
   };
 
   const renderManualStepPanel = (payload) => {
@@ -2471,6 +2541,7 @@
     lastEventSignature = '';
     lastArtifactSignature = '';
     lastQuestionsSignature = '';
+    lastResearchChatSignature = '';
     pollTask(taskId);
     pollState(taskId);
     pollEvents(taskId);
@@ -2574,6 +2645,29 @@
       return { data: await response.json() };
     } catch (error) {
       return { error: error?.message || 'Unable to resume task.' };
+    }
+  };
+
+  const postResearchChatMessage = async (taskId, message) => {
+    try {
+      const response = await apiFetch(buildApiUrl(`/api/tasks/${taskId}/chat`), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ message })
+      });
+      if (!response.ok) {
+        const messageText = response.status === 401 || response.status === 403
+          ? 'Invalid credentials or no access to this task.'
+          : response.status === 400
+            ? 'Message cannot be empty.'
+            : `Request failed (${response.status})`;
+        throw new Error(messageText);
+      }
+      return { data: await response.json() };
+    } catch (error) {
+      return { error: error?.message || 'Unable to send chat message.' };
     }
   };
 
@@ -2771,6 +2865,27 @@
     startPolling(currentTaskId);
   };
 
+  const submitResearchChatMessage = async () => {
+    if (!currentTaskId || !elements.researchChatInput) {
+      return;
+    }
+    const message = elements.researchChatInput.value.trim();
+    if (!message) {
+      showToast('Please enter a message.', '⚠️');
+      return;
+    }
+    setLoading(true, 'Sending message...', 'Submitting your response');
+    const { error } = await postResearchChatMessage(currentTaskId, message);
+    setLoading(false);
+    if (error) {
+      showToast(error, '⚠️');
+      return;
+    }
+    elements.researchChatInput.value = '';
+    await loadResearchChat(currentTaskId);
+    await pollTask(currentTaskId);
+  };
+
   const continueManualStep = async () => {
     if (!currentTaskId) {
       showToast('No active task to continue.', 'ℹ️');
@@ -2925,6 +3040,10 @@
 
   if (elements.resumeTaskBtn) {
     elements.resumeTaskBtn.addEventListener('click', resumeClarification);
+  }
+
+  if (elements.researchChatSendBtn) {
+    elements.researchChatSendBtn.addEventListener('click', submitResearchChatMessage);
   }
 
   if (elements.nextStepBtn) {

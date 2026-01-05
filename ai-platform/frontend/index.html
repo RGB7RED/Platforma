@@ -285,6 +285,28 @@
                     </div>
                 </div>
 
+                <div class="task-form-card research-chat-panel hidden" id="researchChatPanel">
+                    <h3>Interactive research</h3>
+                    <p class="task-lookup-hint">
+                        Please answer the assistant questions below to continue the task.
+                    </p>
+                    <div class="chat-history" id="researchChatHistory"></div>
+                    <div class="form-group">
+                        <label for="researchChatInput">Your response</label>
+                        <textarea
+                            class="task-description-input"
+                            id="researchChatInput"
+                            rows="4"
+                            placeholder="Type your response here..."
+                        ></textarea>
+                    </div>
+                    <div class="form-actions">
+                        <button class="primary-btn" id="researchChatSendBtn" type="button">
+                            Send response
+                        </button>
+                    </div>
+                </div>
+
                 <div class="task-form-card manual-step-panel hidden" id="manualStepPanel">
                     <h3>Manual step required</h3>
                     <p class="task-lookup-hint" id="manualStepMessage">

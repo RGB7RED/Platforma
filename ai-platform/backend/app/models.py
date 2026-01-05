@@ -16,6 +16,7 @@ class ProjectState(Enum):
     DESIGN = "design"
     IMPLEMENTATION = "implementation"
     REVIEW = "review"
+    AWAITING_USER = "awaiting_user"
     NEEDS_INPUT = "needs_input"
     COMPLETE = "complete"
     ERROR = "error"
@@ -58,6 +59,8 @@ class Container:
             "usage_report": [],
             "clarification_questions": [],
             "next_actions": [],
+            "research_chat": [],
+            "research_round": [],
         }
         
         # Уровень 3: История изменений
@@ -84,6 +87,8 @@ class Container:
                 "by_stage": {},
                 "models": {},
             },
+            "research_round": 0,
+            "research_chat": [],
         }
         self.file_update_hook: Optional[Callable[[str, Optional[Any]], None]] = None
         
