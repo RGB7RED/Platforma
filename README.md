@@ -109,6 +109,7 @@ ruff check .
   - API ключ (`apikey`)
   - полноценная auth (`auth`)
   - комбинированный (`hybrid`)
+- Чтобы увидеть чат, включите `ORCH_INTERACTIVE_RESEARCH=true`.
 
 Конфигурация подставляется через:
 

@@ -113,6 +113,15 @@ def test_interactive_research_chat_flow(monkeypatch) -> None:
     asyncio.run(process_task_background(task_id, description, request_id="req-123"))
     assert storage.active_tasks[task_id]["status"] == "awaiting_user"
 
+    status_response = client.get(
+        f"/api/tasks/{task_id}",
+        headers={"X-API-Key": api_key},
+    )
+    assert status_response.status_code == 200
+    payload = status_response.json()
+    assert isinstance(payload.get("research_chat"), list)
+    assert payload.get("last_question_text")
+
     for round_index in range(3):
         response = client.post(
             f"/api/tasks/{task_id}/chat",

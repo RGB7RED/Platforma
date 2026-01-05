@@ -149,11 +149,11 @@
                     </div>
 
                     <div class="form-group">
-                        <label for="taskDescription">Task Description</label>
+                        <label for="taskDescription">Chat with AI</label>
                         <textarea 
                             id="taskDescription" 
                             class="task-description-input"
-                            placeholder="Describe what you want to create...&#10;Be specific about requirements, technologies, and features."
+                            placeholder="Start a conversation with the AI...&#10;Share goals, requirements, technologies, and any constraints."
                             rows="5"
                             maxlength="10000"></textarea>
                         <div class="char-counter">
@@ -269,6 +269,27 @@
                     <div class="status-row error-message hidden" id="taskError"></div>
                 </div>
 
+                <div class="status-panel debug-panel hidden" id="debugPanel">
+                    <div class="status-row">
+                        <strong>Debug API base URL:</strong> <span id="debugApiBaseUrl">-</span>
+                    </div>
+                    <div class="status-row">
+                        <strong>Task status:</strong> <span id="debugTaskStatus">-</span>
+                    </div>
+                    <div class="status-row">
+                        <strong>Task stage:</strong> <span id="debugTaskStage">-</span>
+                    </div>
+                    <div class="status-row">
+                        <strong>research_chat len:</strong> <span id="debugResearchChatCount">-</span>
+                    </div>
+                    <div class="status-row">
+                        <strong>Last assistant:</strong> <span id="debugLastAssistant">-</span>
+                    </div>
+                    <div class="status-row">
+                        <strong>Last user:</strong> <span id="debugLastUser">-</span>
+                    </div>
+                </div>
+
                 <div class="task-form-card clarification-panel hidden" id="clarificationPanel">
                     <h3>Clarification needed</h3>
                     <p class="task-lookup-hint" id="clarificationMessage">
@@ -287,7 +308,7 @@
 
                 <div class="task-form-card research-chat-panel hidden" id="researchChatPanel">
                     <h3>Interactive research</h3>
-                    <p class="task-lookup-hint">
+                    <p class="task-lookup-hint" id="researchChatHint">
                         Please answer the assistant questions below to continue the task.
                     </p>
                     <div class="chat-history" id="researchChatHistory"></div>

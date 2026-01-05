@@ -136,9 +136,13 @@
   const POLL_SLOW_INTERVAL_MS = 4000;
   const POLL_TIMEOUT_MS = 3 * 60 * 1000;
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'error']);
+  const RESEARCH_CHAT_STATUSES = new Set(['awaiting_user', 'waiting_for_user', 'needs_input']);
+  const AWAITING_USER_STATUSES = new Set(['awaiting_user', 'waiting_for_user']);
+  const RESEARCH_STAGES = new Set(['research', 'interactive_research']);
   const API_KEY_STORAGE_KEY = 'aiPlatformApiKey';
   const ACCESS_TOKEN_STORAGE_KEY = 'aiPlatformAccessToken';
   const REFRESH_TOKEN_STORAGE_KEY = 'aiPlatformRefreshToken';
+  const debugEnabled = new URLSearchParams(window.location.search).get('debug') === '1';
 
   const elements = {
     welcomeScreen: document.getElementById('welcomeScreen'),
@@ -197,6 +201,7 @@
     researchChatHistory: document.getElementById('researchChatHistory'),
     researchChatInput: document.getElementById('researchChatInput'),
     researchChatSendBtn: document.getElementById('researchChatSendBtn'),
+    researchChatHint: document.getElementById('researchChatHint'),
     manualStepPanel: document.getElementById('manualStepPanel'),
     manualStepMessage: document.getElementById('manualStepMessage'),
     manualStepStage: document.getElementById('manualStepStage'),
@@ -259,7 +264,14 @@
     tasksList: document.getElementById('tasksList'),
     tasksEmpty: document.getElementById('tasksEmpty'),
     createPrBtn: document.getElementById('createPrBtn'),
-    prCreateStatus: document.getElementById('prCreateStatus')
+    prCreateStatus: document.getElementById('prCreateStatus'),
+    debugPanel: document.getElementById('debugPanel'),
+    debugApiBaseUrl: document.getElementById('debugApiBaseUrl'),
+    debugTaskStatus: document.getElementById('debugTaskStatus'),
+    debugTaskStage: document.getElementById('debugTaskStage'),
+    debugResearchChatCount: document.getElementById('debugResearchChatCount'),
+    debugLastAssistant: document.getElementById('debugLastAssistant'),
+    debugLastUser: document.getElementById('debugLastUser')
   };
 
   let currentTaskId = null;
@@ -283,6 +295,7 @@
   let activeInspectorTab = 'state';
   let latestFilesTotal = null;
   let latestArtifactsTotal = null;
+  let researchChatEmptyMessage = 'No chat messages yet.';
   let activeFileCategory = 'all';
   let activeFilePath = '';
   let activeFileContent = '';
@@ -1664,6 +1677,118 @@
     return normalized;
   };
 
+  const parseBoolean = (value) => {
+    if (typeof value === 'boolean') {
+      return value;
+    }
+    if (typeof value === 'number') {
+      return value === 1;
+    }
+    if (typeof value !== 'string') {
+      return false;
+    }
+    return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+  };
+
+  const resolveInteractiveResearchEnabled = (taskData) => {
+    if (typeof taskData?.interactive_research_enabled === 'boolean') {
+      return taskData.interactive_research_enabled;
+    }
+    const configValue = window.__APP_CONFIG__?.ORCH_INTERACTIVE_RESEARCH;
+    if (parseBoolean(configValue)) {
+      return true;
+    }
+    const metaValue = document.querySelector('meta[name="orch-interactive-research"]')?.content;
+    return parseBoolean(metaValue);
+  };
+
+  const resolveResearchChatEntries = (taskData) => {
+    if (!taskData) {
+      return [];
+    }
+    if (Array.isArray(taskData.research_chat)) {
+      return taskData.research_chat;
+    }
+    if (Array.isArray(taskData?.artifacts?.research_chat)) {
+      return taskData.artifacts.research_chat;
+    }
+    return [];
+  };
+
+  const resolveLastMessageByRole = (messages, role) => {
+    if (!Array.isArray(messages)) {
+      return null;
+    }
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const entry = messages[index];
+      if (entry?.role === role && entry?.content) {
+        return entry.content;
+      }
+    }
+    return null;
+  };
+
+  const updateResearchChatHint = (normalizedStatus) => {
+    if (!elements.researchChatHint) {
+      return;
+    }
+    if (!normalizedStatus) {
+      elements.researchChatHint.textContent =
+        'Please answer the assistant questions below to continue the task.';
+      return;
+    }
+    const isAwaiting = AWAITING_USER_STATUSES.has(normalizedStatus);
+    if (!isAwaiting) {
+      elements.researchChatHint.textContent = 'ИИ формирует вопросы...';
+    } else {
+      elements.researchChatHint.textContent =
+        'Please answer the assistant questions below to continue the task.';
+    }
+  };
+
+  const shouldShowResearchChat = (normalizedStatus, normalizedStage, interactiveEnabled) => {
+    if (RESEARCH_CHAT_STATUSES.has(normalizedStatus)) {
+      return true;
+    }
+    if (interactiveEnabled && RESEARCH_STAGES.has(normalizedStage)) {
+      return true;
+    }
+    return false;
+  };
+
+  const updateDebugPanel = (taskData) => {
+    if (!elements.debugPanel) {
+      return;
+    }
+    elements.debugPanel.classList.toggle('hidden', !debugEnabled);
+    if (!debugEnabled) {
+      return;
+    }
+    const messages = resolveResearchChatEntries(taskData);
+    const lastAssistant = resolveLastMessageByRole(messages, 'assistant');
+    const lastUser = resolveLastMessageByRole(messages, 'user');
+    if (elements.debugApiBaseUrl) {
+      elements.debugApiBaseUrl.textContent = runtimeConfig.apiBaseUrl || '(relative)';
+    }
+    if (elements.debugTaskStatus) {
+      elements.debugTaskStatus.textContent = taskData?.status || '-';
+    }
+    if (elements.debugTaskStage) {
+      elements.debugTaskStage.textContent = taskData?.current_stage || '-';
+    }
+    if (elements.debugResearchChatCount) {
+      elements.debugResearchChatCount.textContent = Array.isArray(messages)
+        ? String(messages.length)
+        : '0';
+    }
+    if (elements.debugLastAssistant) {
+      elements.debugLastAssistant.textContent = lastAssistant || '-';
+    }
+    if (elements.debugLastUser) {
+      elements.debugLastUser.textContent = lastUser || '-';
+    }
+  };
+
   const updateStatusPanel = (data) => {
     if (!data) {
       return;
@@ -1693,12 +1818,22 @@
     updateTimeTakenDisplay(normalized);
     refreshMetricsDisplay();
     const normalizedStatus = String(normalized.status).toLowerCase();
-    if (normalizedStatus === 'awaiting_user' && currentTaskId) {
-      setClarificationPanelVisible(false);
-      setManualStepPanelVisible(false);
+    const normalizedStage = String(normalized.current_stage || '').toLowerCase();
+    const interactiveEnabled = resolveInteractiveResearchEnabled(normalized);
+    const showResearchChat = shouldShowResearchChat(
+      normalizedStatus,
+      normalizedStage,
+      interactiveEnabled
+    );
+    researchChatEmptyMessage = AWAITING_USER_STATUSES.has(normalizedStatus)
+      ? 'No chat messages yet.'
+      : 'ИИ формирует вопросы...';
+    updateResearchChatHint(normalizedStatus);
+    setResearchChatPanelVisible(showResearchChat);
+    if (showResearchChat && currentTaskId) {
       loadResearchChat(currentTaskId);
-      setResearchChatPanelVisible(true);
-    } else if (normalizedStatus === 'needs_input' && currentTaskId) {
+    }
+    if (normalizedStatus === 'needs_input' && currentTaskId) {
       if (normalized.awaiting_manual_step) {
         setClarificationPanelVisible(false);
         renderManualStepPanel(normalized);
@@ -1710,8 +1845,8 @@
     } else {
       setClarificationPanelVisible(false);
       setManualStepPanelVisible(false);
-      setResearchChatPanelVisible(false);
     }
+    updateDebugPanel(normalized);
   };
   const isTerminalState = (data) => {
     const progressInfo = formatProgress(data?.progress);
@@ -1776,6 +1911,9 @@
     if (elements.researchChatInput) {
       elements.researchChatInput.value = '';
     }
+    researchChatEmptyMessage = 'No chat messages yet.';
+    updateResearchChatHint('');
+    updateDebugPanel(null);
     resetFilePanel();
   };
 
@@ -2080,7 +2218,7 @@
     }
     if (!Array.isArray(artifacts) || !artifacts.length) {
       elements.researchChatHistory.innerHTML =
-        '<div class="task-lookup-hint">No chat messages yet.</div>';
+        `<div class="task-lookup-hint">${researchChatEmptyMessage}</div>`;
       return;
     }
     elements.researchChatHistory.innerHTML = artifacts
