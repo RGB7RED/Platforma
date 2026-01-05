@@ -105,3 +105,12 @@ Validation commands (from the `ai-platform` directory):
 ruff check .
 python -m pytest -q
 ```
+
+## Manual intake UI check
+
+1. Open the frontend in the browser.
+2. In **Intake Chat**, send the initial message.
+3. Confirm the assistant questions appear.
+4. Send three rounds of replies.
+5. Confirm the intake status shows complete and **Start AI Processing** becomes enabled.
+6. Click **Start AI Processing** and verify the pipeline status begins updating.

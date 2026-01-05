@@ -160,6 +160,14 @@
     refreshProgressBtn: document.getElementById('refreshProgressBtn'),
     taskDescription: document.getElementById('taskDescription'),
     charCount: document.getElementById('charCount'),
+    interactiveDisabledHint: document.getElementById('interactiveDisabledHint'),
+    legacyPromptGroup: document.getElementById('legacyPromptGroup'),
+    intakeChatPanel: document.getElementById('intakeChatPanel'),
+    intakeChatHistory: document.getElementById('intakeChatHistory'),
+    intakeChatInput: document.getElementById('intakeChatInput'),
+    intakeChatSendBtn: document.getElementById('intakeChatSendBtn'),
+    intakeChatHint: document.getElementById('intakeChatHint'),
+    intakeChatStatus: document.getElementById('intakeChatStatus'),
     codexVersion: document.getElementById('codexVersion'),
     templateSelect: document.getElementById('templateSelect'),
     templateWarning: document.getElementById('templateWarning'),
@@ -267,7 +275,9 @@
     prCreateStatus: document.getElementById('prCreateStatus'),
     debugPanel: document.getElementById('debugPanel'),
     debugApiBaseUrl: document.getElementById('debugApiBaseUrl'),
+    debugTaskId: document.getElementById('debugTaskId'),
     debugTaskStatus: document.getElementById('debugTaskStatus'),
+    debugCanStart: document.getElementById('debugCanStart'),
     debugTaskStage: document.getElementById('debugTaskStage'),
     debugResearchChatCount: document.getElementById('debugResearchChatCount'),
     debugLastAssistant: document.getElementById('debugLastAssistant'),
@@ -296,12 +306,14 @@
   let latestFilesTotal = null;
   let latestArtifactsTotal = null;
   let researchChatEmptyMessage = 'No chat messages yet.';
+  let intakeChatEmptyMessage = 'Напишите первое сообщение, чтобы начать.';
   let activeFileCategory = 'all';
   let activeFilePath = '';
   let activeFileContent = '';
   let activeSocket = null;
   let latestTaskSnapshot = null;
   let latestQuestionsPayload = null;
+  let intakeCanStart = false;
   let missingAuthMessage = 'Please sign in to continue.';
   let cachedProjects = [];
   let cachedTasks = [];
@@ -581,6 +593,8 @@
       updateAuthModeIndicator();
       updateAuthModeVisibility();
       updateMissingAuthMessage();
+      updateIntakeVisibility(resolveInteractiveResearchEnabled(latestTaskSnapshot));
+      updateStartProcessingState({ canStart: intakeCanStart, interactiveEnabled: resolveInteractiveResearchEnabled(latestTaskSnapshot) });
     }
   };
 
@@ -1715,6 +1729,96 @@
     return [];
   };
 
+  const resolveIntakeCanStart = (taskData) => {
+    if (!taskData) {
+      return false;
+    }
+    if (typeof taskData.can_start === 'boolean') {
+      return taskData.can_start;
+    }
+    const normalizedStatus = String(taskData.status || '').toLowerCase();
+    return ['intake_complete', 'ready_to_start'].includes(normalizedStatus);
+  };
+
+  const updateIntakeVisibility = (interactiveEnabled) => {
+    if (elements.intakeChatPanel) {
+      elements.intakeChatPanel.classList.toggle('hidden', !interactiveEnabled);
+    }
+    if (elements.legacyPromptGroup) {
+      elements.legacyPromptGroup.classList.toggle('hidden', interactiveEnabled);
+    }
+    if (elements.interactiveDisabledHint) {
+      elements.interactiveDisabledHint.classList.toggle('hidden', interactiveEnabled);
+    }
+  };
+
+  const updateIntakeStatusLabel = (status) => {
+    if (!elements.intakeChatStatus) {
+      return;
+    }
+    const normalizedStatus = String(status || '').toLowerCase();
+    const label =
+      normalizedStatus === 'intake_complete'
+        ? 'Intake: complete'
+        : normalizedStatus === 'awaiting_user'
+          ? 'Intake: waiting'
+          : normalizedStatus
+            ? `Intake: ${normalizedStatus}`
+            : 'Intake: waiting';
+    elements.intakeChatStatus.textContent = label;
+  };
+
+  const updateIntakeChatHint = (taskData) => {
+    if (!elements.intakeChatHint) {
+      return;
+    }
+    const normalizedStatus = String(taskData?.status || '').toLowerCase();
+    if (!currentTaskId) {
+      elements.intakeChatHint.textContent = 'Опишите задачу. Я задам 3 уточняющих вопроса…';
+      return;
+    }
+    if (normalizedStatus === 'intake_complete') {
+      elements.intakeChatHint.textContent = 'Intake complete. You can start AI processing.';
+      return;
+    }
+    elements.intakeChatHint.textContent = 'Ответьте на вопросы, чтобы завершить intake.';
+  };
+
+  const renderIntakeChat = (messages) => {
+    if (!elements.intakeChatHistory) {
+      return;
+    }
+    if (!Array.isArray(messages) || !messages.length) {
+      elements.intakeChatHistory.innerHTML =
+        `<div class="task-lookup-hint">${intakeChatEmptyMessage}</div>`;
+      return;
+    }
+    elements.intakeChatHistory.innerHTML = messages
+      .map((entry) => {
+        const role = entry?.role || 'assistant';
+        const content = entry?.content || '';
+        const roundLabel = entry?.round ? `Round ${entry.round}` : '';
+        const roleLabel = role === 'user' ? 'You' : 'Assistant';
+        return `
+          <div class="chat-message ${role}">
+            <div class="chat-meta">${roleLabel} ${roundLabel}</div>
+            <div class="chat-content">${content}</div>
+          </div>
+        `;
+      })
+      .join('');
+    elements.intakeChatHistory.scrollTop = elements.intakeChatHistory.scrollHeight;
+  };
+
+  const updateStartProcessingState = ({ canStart, interactiveEnabled } = {}) => {
+    const canStartValue = typeof canStart === 'boolean' ? canStart : intakeCanStart;
+    const interactiveValue =
+      typeof interactiveEnabled === 'boolean' ? interactiveEnabled : resolveInteractiveResearchEnabled(latestTaskSnapshot);
+    if (elements.submitTaskBtn) {
+      elements.submitTaskBtn.disabled = interactiveValue ? !canStartValue : false;
+    }
+  };
+
   const resolveLastMessageByRole = (messages, role) => {
     if (!Array.isArray(messages)) {
       return null;
@@ -1770,8 +1874,14 @@
     if (elements.debugApiBaseUrl) {
       elements.debugApiBaseUrl.textContent = runtimeConfig.apiBaseUrl || '(relative)';
     }
+    if (elements.debugTaskId) {
+      elements.debugTaskId.textContent = currentTaskId || '-';
+    }
     if (elements.debugTaskStatus) {
       elements.debugTaskStatus.textContent = taskData?.status || '-';
+    }
+    if (elements.debugCanStart) {
+      elements.debugCanStart.textContent = String(resolveIntakeCanStart(taskData));
     }
     if (elements.debugTaskStage) {
       elements.debugTaskStage.textContent = taskData?.current_stage || '-';
@@ -1846,6 +1956,17 @@
       setClarificationPanelVisible(false);
       setManualStepPanelVisible(false);
     }
+    intakeChatEmptyMessage = normalizedStatus === 'awaiting_user'
+      ? 'Waiting for your response...'
+      : normalizedStatus === 'intake_complete'
+        ? 'Intake complete.'
+        : 'Напишите первое сообщение, чтобы начать.';
+    intakeCanStart = resolveIntakeCanStart(normalized);
+    updateIntakeStatusLabel(normalized.status);
+    updateIntakeChatHint(normalized);
+    renderIntakeChat(resolveResearchChatEntries(normalized));
+    updateIntakeVisibility(interactiveEnabled);
+    updateStartProcessingState({ canStart: intakeCanStart, interactiveEnabled });
     updateDebugPanel(normalized);
   };
   const isTerminalState = (data) => {
@@ -1913,6 +2034,16 @@
     }
     researchChatEmptyMessage = 'No chat messages yet.';
     updateResearchChatHint('');
+    if (elements.intakeChatHistory) {
+      elements.intakeChatHistory.innerHTML = '';
+    }
+    if (elements.intakeChatInput) {
+      elements.intakeChatInput.value = '';
+    }
+    intakeChatEmptyMessage = 'Напишите первое сообщение, чтобы начать.';
+    updateIntakeStatusLabel('');
+    updateIntakeChatHint(null);
+    updateStartProcessingState({ canStart: false, interactiveEnabled: resolveInteractiveResearchEnabled(null) });
     updateDebugPanel(null);
     resetFilePanel();
   };
@@ -2832,6 +2963,93 @@
     }
   };
 
+  const buildTaskPayload = (description, { autoStart = true } = {}) => {
+    const payload = { description, auto_start: autoStart };
+    const codexValue = elements.codexVersion?.value?.trim();
+    if (codexValue) {
+      payload.codex_version = codexValue;
+    }
+    const templateValue = elements.templateSelect?.value?.trim();
+    if (templateValue) {
+      payload.template_id = templateValue;
+    }
+    const projectValue = elements.projectSelect?.value?.trim();
+    if (projectValue) {
+      payload.project_id = projectValue;
+    }
+    if (window.USER_ID) {
+      payload.user_id = window.USER_ID;
+    }
+    return payload;
+  };
+
+  const createTask = async (description, { autoStart = true } = {}) => {
+    const payload = buildTaskPayload(description, { autoStart });
+    try {
+      const response = await apiFetch(buildApiUrl('/api/tasks'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'Invalid credentials or no access to this task.'
+          : `Request failed (${response.status})`;
+        throw new Error(message);
+      }
+      return { data: await response.json() };
+    } catch (error) {
+      return { error: error?.message || 'Unable to create task.' };
+    }
+  };
+
+  const startTaskIntake = async (taskId) => {
+    try {
+      const response = await apiFetch(buildApiUrl(`/api/tasks/${taskId}/intake/start`), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+      if (!response.ok) {
+        const message = response.status === 409
+          ? 'Intake already started.'
+          : response.status === 401 || response.status === 403
+            ? 'Invalid credentials or no access to this task.'
+            : `Request failed (${response.status})`;
+        throw new Error(message);
+      }
+      return { data: await response.json() };
+    } catch (error) {
+      return { error: error?.message || 'Unable to start intake.' };
+    }
+  };
+
+  const startTaskProcessing = async (taskId) => {
+    try {
+      const response = await apiFetch(buildApiUrl(`/api/tasks/${taskId}/start`), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+      if (!response.ok) {
+        const message = response.status === 409
+          ? 'Intake not complete yet.'
+          : response.status === 401 || response.status === 403
+            ? 'Invalid credentials or no access to this task.'
+            : `Request failed (${response.status})`;
+        throw new Error(message);
+      }
+      return { data: await response.json() };
+    } catch (error) {
+      return { error: error?.message || 'Unable to start processing.' };
+    }
+  };
+
   const setActiveInspectorTab = (tab) => {
     activeInspectorTab = tab;
     if (elements.inspectorTabs) {
@@ -2870,6 +3088,36 @@
   };
 
   const submitTask = async () => {
+    const interactiveEnabled = resolveInteractiveResearchEnabled(latestTaskSnapshot);
+    if (interactiveEnabled) {
+      if (!currentTaskId) {
+        showToast('Complete intake before starting processing.', 'ℹ️');
+        return;
+      }
+      if (!intakeCanStart) {
+        showToast('Intake not complete yet.', '⚠️');
+        return;
+      }
+      if (!ensureAuthForAction()) {
+        return;
+      }
+      setSubmitDisabled(true);
+      setLoading(true, 'Starting processing...', 'Launching the AI pipeline');
+      const { error } = await startTaskProcessing(currentTaskId);
+      setLoading(false);
+      if (error) {
+        setSubmitDisabled(false);
+        showToast(error, '⚠️');
+        return;
+      }
+      if (elements.progressTime) {
+        elements.progressTime.textContent = 'Started: Just now';
+      }
+      activateTask(currentTaskId, { focusState: true });
+      updateStatusPanel({ status: 'queued', current_stage: 'starting', progress: 0 });
+      return;
+    }
+
     const description = elements.taskDescription?.value.trim();
     if (!description) {
       showToast('Please enter a task description.', '⚠️');
@@ -2883,61 +3131,32 @@
     resetResultPanel();
     setLoading(true, 'Creating task...', 'Submitting your request to the AI platform');
 
-    const payload = { description };
-    const codexValue = elements.codexVersion?.value?.trim();
-    if (codexValue) {
-      payload.codex_version = codexValue;
-    }
-    const templateValue = elements.templateSelect?.value?.trim();
-    if (templateValue) {
-      payload.template_id = templateValue;
-    }
-    const projectValue = elements.projectSelect?.value?.trim();
-    if (projectValue) {
-      payload.project_id = projectValue;
-    }
-    if (window.USER_ID) {
-      payload.user_id = window.USER_ID;
-    }
-
-    try {
-      const response = await apiFetch(buildApiUrl('/api/tasks'), {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (!response.ok) {
-        const message = response.status === 401 || response.status === 403
-          ? 'Invalid credentials or no access to this task.'
-          : `Request failed (${response.status})`;
-        throw new Error(message);
-      }
-
-      const data = await response.json();
-      const taskId = data.task_id || data.id;
-      if (!taskId) {
-        throw new Error('Task ID not returned from server');
-      }
-
-      if (elements.progressTime) {
-        elements.progressTime.textContent = 'Started: Just now';
-      }
-      activateTask(taskId, { focusState: true });
-      updateStatusPanel({ status: 'queued', current_stage: 'starting', progress: 0 });
-      setLoading(false);
-    } catch (error) {
+    const { data, error } = await createTask(description, { autoStart: true });
+    if (error) {
       setLoading(false);
       setSubmitDisabled(false);
-      const errorMessage = error?.message || 'Unable to create task. Please try again.';
       if (elements.taskError) {
-        elements.taskError.textContent = errorMessage;
+        elements.taskError.textContent = error;
         elements.taskError.classList.remove('hidden');
       }
-      showToast(errorMessage, '⚠️');
+      showToast(error, '⚠️');
+      return;
     }
+
+    const taskId = data?.task_id || data?.id;
+    if (!taskId) {
+      setLoading(false);
+      setSubmitDisabled(false);
+      showToast('Task ID not returned from server', '⚠️');
+      return;
+    }
+
+    if (elements.progressTime) {
+      elements.progressTime.textContent = 'Started: Just now';
+    }
+    activateTask(taskId, { focusState: true });
+    updateStatusPanel({ status: 'queued', current_stage: 'starting', progress: 0 });
+    setLoading(false);
   };
 
   const refreshStatus = () => {
@@ -3022,6 +3241,63 @@
     elements.researchChatInput.value = '';
     await loadResearchChat(currentTaskId);
     await pollTask(currentTaskId);
+  };
+
+  const submitIntakeChatMessage = async () => {
+    if (!elements.intakeChatInput) {
+      return;
+    }
+    if (!resolveInteractiveResearchEnabled(latestTaskSnapshot)) {
+      showToast('Interactive research disabled.', '⚠️');
+      return;
+    }
+    const message = elements.intakeChatInput.value.trim();
+    if (!message) {
+      showToast('Please enter a message.', '⚠️');
+      return;
+    }
+    if (!ensureAuthForAction()) {
+      return;
+    }
+
+    setLoading(true, 'Sending message...', 'Submitting your intake response');
+    let taskId = currentTaskId;
+    if (!taskId) {
+      resetResultPanel();
+      const createResult = await createTask(message, { autoStart: false });
+      if (createResult.error) {
+        setLoading(false);
+        showToast(createResult.error, '⚠️');
+        return;
+      }
+      taskId = createResult.data?.task_id || createResult.data?.id;
+      if (!taskId) {
+        setLoading(false);
+        showToast('Task ID not returned from server', '⚠️');
+        return;
+      }
+      currentTaskId = taskId;
+      const intakeResult = await startTaskIntake(taskId);
+      if (intakeResult.error) {
+        setLoading(false);
+        showToast(intakeResult.error, '⚠️');
+        return;
+      }
+    } else {
+      const chatResult = await postResearchChatMessage(taskId, message);
+      if (chatResult.error) {
+        setLoading(false);
+        showToast(chatResult.error, '⚠️');
+        return;
+      }
+    }
+
+    elements.intakeChatInput.value = '';
+    const { data } = await fetchTask(taskId);
+    setLoading(false);
+    if (data) {
+      updateStatusPanel(data);
+    }
   };
 
   const continueManualStep = async () => {
@@ -3182,6 +3458,10 @@
 
   if (elements.researchChatSendBtn) {
     elements.researchChatSendBtn.addEventListener('click', submitResearchChatMessage);
+  }
+
+  if (elements.intakeChatSendBtn) {
+    elements.intakeChatSendBtn.addEventListener('click', submitIntakeChatMessage);
   }
 
   if (elements.nextStepBtn) {
@@ -3535,6 +3815,8 @@
   updateApiBaseUrl();
   updateAuthModeIndicator();
   updateAuthModeVisibility();
+  updateIntakeVisibility(resolveInteractiveResearchEnabled(null));
+  updateStartProcessingState({ canStart: false, interactiveEnabled: resolveInteractiveResearchEnabled(null) });
   updateAuthStatus();
   syncAccessTokenFromHash();
   updateApiKeyInputs(getStoredApiKey());
