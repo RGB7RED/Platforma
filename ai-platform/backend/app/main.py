@@ -223,6 +223,35 @@ def enrich_task_data(task_id: str, task_data: Dict[str, Any]) -> Dict[str, Any]:
             result["artifacts_count"] = task_data["artifacts_count"]
             result["iterations"] = task_data.get("iterations", result.get("iterations"))
             result["max_iterations"] = task_data.get("max_iterations", result.get("max_iterations"))
+        research_chat = []
+        metadata_chat = container.metadata.get("research_chat")
+        if isinstance(metadata_chat, list) and metadata_chat:
+            research_chat = [
+                normalize_payload(entry) for entry in metadata_chat if isinstance(entry, dict)
+            ]
+        else:
+            research_chat = [
+                normalize_payload(artifact.content)
+                for artifact in container.artifacts.get("research_chat", [])
+                if isinstance(artifact.content, dict)
+            ]
+        if research_chat:
+            task_data["research_chat"] = research_chat
+            last_assistant_message = next(
+                (
+                    entry.get("content")
+                    for entry in reversed(research_chat)
+                    if entry.get("role") == "assistant" and entry.get("content")
+                ),
+                None,
+            )
+            if last_assistant_message:
+                task_data["last_question_text"] = last_assistant_message
+        else:
+            task_data.setdefault("research_chat", [])
+        interactive_enabled = parse_bool_env(os.getenv("ORCH_INTERACTIVE_RESEARCH"))
+        if interactive_enabled is not None:
+            task_data["interactive_research_enabled"] = interactive_enabled
     time_taken_seconds = compute_time_taken_seconds(task_data)
     if time_taken_seconds is not None:
         task_data["time_taken_seconds"] = time_taken_seconds

@@ -215,6 +215,16 @@ body {
     color: var(--text-primary);
 }
 
+.debug-panel {
+    margin-top: 16px;
+    border: 1px dashed var(--border-color);
+    background: var(--background-color);
+}
+
+.debug-panel .status-row {
+    font-size: 0.9rem;
+}
+
 .chat-history {
     max-height: 240px;
     overflow-y: auto;
