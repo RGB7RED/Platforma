@@ -2393,6 +2393,17 @@ async def get_runtime_config(request: Request) -> Dict[str, object]:
     }
 
 
+@app.get("/api/features")
+async def get_feature_flags() -> Dict[str, object]:
+    settings = get_auth_settings()
+    triage_env = parse_bool_env(os.getenv("ORCH_ENABLE_TRIAGE"))
+    return {
+        "interactive_research_enabled": is_interactive_research_enabled(),
+        "auth_mode": settings.mode,
+        "triage_enabled": bool(triage_env) if triage_env is not None else False,
+    }
+
+
 @app.get("/")
 async def root() -> PlainTextResponse:
     """Корневой endpoint для проверки работы"""

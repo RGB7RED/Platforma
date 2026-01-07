@@ -109,13 +109,17 @@ ruff check .
   - API ключ (`apikey`)
   - полноценная auth (`auth`)
   - комбинированный (`hybrid`)
-- Чтобы увидеть чат, включите `ORCH_INTERACTIVE_RESEARCH=true`.
 
 Конфигурация подставляется через:
 
 - `window.__APP_CONFIG__` или метатеги (`meta[name="api-base-url"]`).
 
-### 2.3 Инфраструктура и запуск
+### 2.3 Production flags
+
+- `ORCH_INTERACTIVE_RESEARCH=true` — включает интерактивный intake-чат.
+  - Проверка: `GET /api/features` (`interactive_research_enabled`).
+
+### 2.4 Инфраструктура и запуск
 
 - Docker Compose: `ai-platform/docker-compose.yml`
   - сервисы: `backend`, `frontend`, `nginx`
