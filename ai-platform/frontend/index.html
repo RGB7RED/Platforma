@@ -150,7 +150,15 @@
 
                     <div class="form-group hidden" id="interactiveDisabledHint">
                         <div class="task-lookup-hint warning-message">
-                            Interactive research disabled. Switch to the classic prompt flow to start processing.
+                            <div id="interactiveDisabledMessage">
+                                Interactive research disabled. Switch to the classic prompt flow to start processing.
+                            </div>
+                            <div class="task-lookup-hint">
+                                API_BASE_URL: <span id="interactiveDisabledApiBase">(relative)</span>
+                            </div>
+                            <button class="secondary-btn" id="interactiveFeatureRetryBtn" type="button">
+                                Retry feature check
+                            </button>
                         </div>
                     </div>
 

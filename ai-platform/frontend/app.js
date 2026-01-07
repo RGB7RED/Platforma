@@ -161,6 +161,9 @@
     taskDescription: document.getElementById('taskDescription'),
     charCount: document.getElementById('charCount'),
     interactiveDisabledHint: document.getElementById('interactiveDisabledHint'),
+    interactiveDisabledMessage: document.getElementById('interactiveDisabledMessage'),
+    interactiveDisabledApiBase: document.getElementById('interactiveDisabledApiBase'),
+    interactiveFeatureRetryBtn: document.getElementById('interactiveFeatureRetryBtn'),
     legacyPromptGroup: document.getElementById('legacyPromptGroup'),
     intakeChatPanel: document.getElementById('intakeChatPanel'),
     intakeChatHistory: document.getElementById('intakeChatHistory'),
@@ -593,7 +596,7 @@
       updateAuthModeIndicator();
       updateAuthModeVisibility();
       updateMissingAuthMessage();
-      updateIntakeVisibility(resolveInteractiveResearchEnabled(latestTaskSnapshot));
+      updateIntakeVisibility(getInteractiveFeatureState(latestTaskSnapshot));
       updateStartProcessingState({ canStart: intakeCanStart, interactiveEnabled: resolveInteractiveResearchEnabled(latestTaskSnapshot) });
     }
   };
@@ -1704,16 +1707,94 @@
     return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
   };
 
-  const resolveInteractiveResearchEnabled = (taskData) => {
+  const FEATURE_CACHE_TTL_MS = 45000;
+  const interactiveFeatureState = {
+    interactiveEnabled: null,
+    fetchedAt: 0,
+    authRequired: false,
+    pending: null
+  };
+
+  const requestInteractiveFeatureState = async ({ force = false } = {}) => {
+    const now = Date.now();
+    const cacheFresh = interactiveFeatureState.fetchedAt &&
+      now - interactiveFeatureState.fetchedAt < FEATURE_CACHE_TTL_MS;
+    if (!force && cacheFresh && typeof interactiveFeatureState.interactiveEnabled === 'boolean') {
+      return interactiveFeatureState.interactiveEnabled;
+    }
+    if (!force && interactiveFeatureState.pending) {
+      return interactiveFeatureState.pending;
+    }
+    interactiveFeatureState.pending = (async () => {
+      try {
+        const response = await apiFetch(buildApiUrl('/api/features'), {}, {
+          includeAuth: true,
+          retryOnUnauthorized: false
+        });
+        if (response.status === 401) {
+          interactiveFeatureState.authRequired = true;
+          interactiveFeatureState.interactiveEnabled = false;
+          interactiveFeatureState.fetchedAt = Date.now();
+          return false;
+        }
+        if (!response.ok) {
+          interactiveFeatureState.authRequired = false;
+          interactiveFeatureState.interactiveEnabled = false;
+          interactiveFeatureState.fetchedAt = Date.now();
+          return false;
+        }
+        const payload = await response.json().catch(() => null);
+        interactiveFeatureState.interactiveEnabled = Boolean(payload?.interactive_research_enabled);
+        interactiveFeatureState.authRequired = false;
+        interactiveFeatureState.fetchedAt = Date.now();
+        return interactiveFeatureState.interactiveEnabled;
+      } catch (error) {
+        interactiveFeatureState.authRequired = false;
+        interactiveFeatureState.interactiveEnabled = false;
+        interactiveFeatureState.fetchedAt = Date.now();
+        return false;
+      } finally {
+        interactiveFeatureState.pending = null;
+        updateIntakeVisibility(getInteractiveFeatureState(latestTaskSnapshot));
+        updateStartProcessingState({
+          interactiveEnabled: resolveInteractiveResearchEnabled(latestTaskSnapshot)
+        });
+      }
+    })();
+    return interactiveFeatureState.pending;
+  };
+
+  const getInteractiveFeatureState = (taskData) => {
     if (typeof taskData?.interactive_research_enabled === 'boolean') {
-      return taskData.interactive_research_enabled;
+      return { value: taskData.interactive_research_enabled, checked: true, authRequired: false };
     }
     const configValue = window.__APP_CONFIG__?.ORCH_INTERACTIVE_RESEARCH;
-    if (parseBoolean(configValue)) {
-      return true;
+    if (configValue !== undefined) {
+      return { value: parseBoolean(configValue), checked: true, authRequired: false };
     }
-    const metaValue = document.querySelector('meta[name="orch-interactive-research"]')?.content;
-    return parseBoolean(metaValue);
+    const metaElement = document.querySelector('meta[name="orch-interactive-research"]');
+    if (metaElement) {
+      return { value: parseBoolean(metaElement.content), checked: true, authRequired: false };
+    }
+    if (!taskData) {
+      if (!interactiveFeatureState.pending) {
+        requestInteractiveFeatureState();
+      }
+      if (typeof interactiveFeatureState.interactiveEnabled === 'boolean') {
+        return {
+          value: interactiveFeatureState.interactiveEnabled,
+          checked: true,
+          authRequired: interactiveFeatureState.authRequired
+        };
+      }
+      return { value: null, checked: false, authRequired: false };
+    }
+    return { value: null, checked: false, authRequired: false };
+  };
+
+  const resolveInteractiveResearchEnabled = (taskData) => {
+    const state = getInteractiveFeatureState(taskData);
+    return state.value === true;
   };
 
   const resolveResearchChatEntries = (taskData) => {
@@ -1740,7 +1821,8 @@
     return ['intake_complete', 'ready_to_start'].includes(normalizedStatus);
   };
 
-  const updateIntakeVisibility = (interactiveEnabled) => {
+  const updateIntakeVisibility = (featureState) => {
+    const interactiveEnabled = featureState?.value === true;
     if (elements.intakeChatPanel) {
       elements.intakeChatPanel.classList.toggle('hidden', !interactiveEnabled);
     }
@@ -1748,7 +1830,19 @@
       elements.legacyPromptGroup.classList.toggle('hidden', interactiveEnabled);
     }
     if (elements.interactiveDisabledHint) {
-      elements.interactiveDisabledHint.classList.toggle('hidden', interactiveEnabled);
+      const shouldShowDisabled = featureState?.checked
+        ? !interactiveEnabled
+        : false;
+      elements.interactiveDisabledHint.classList.toggle('hidden', !shouldShowDisabled);
+      if (elements.interactiveDisabledMessage) {
+        elements.interactiveDisabledMessage.textContent = featureState?.authRequired
+          ? 'Sign in required to check features.'
+          : 'Interactive research disabled on backend. Enable ORCH_INTERACTIVE_RESEARCH=true on Railway and restart.';
+      }
+      if (elements.interactiveDisabledApiBase) {
+        elements.interactiveDisabledApiBase.textContent =
+          runtimeConfig.apiBaseUrl || window.location.origin || '(relative)';
+      }
     }
   };
 
@@ -1965,7 +2059,7 @@
     updateIntakeStatusLabel(normalized.status);
     updateIntakeChatHint(normalized);
     renderIntakeChat(resolveResearchChatEntries(normalized));
-    updateIntakeVisibility(interactiveEnabled);
+    updateIntakeVisibility(getInteractiveFeatureState(normalized));
     updateStartProcessingState({ canStart: intakeCanStart, interactiveEnabled });
     updateDebugPanel(normalized);
   };
@@ -3472,6 +3566,13 @@
     elements.submitTaskBtn.addEventListener('click', submitTask);
   }
 
+  if (elements.interactiveFeatureRetryBtn) {
+    elements.interactiveFeatureRetryBtn.addEventListener('click', () => {
+      showToast('Checking interactive research...', 'ℹ️');
+      requestInteractiveFeatureState({ force: true });
+    });
+  }
+
   if (elements.projectSelect) {
     elements.projectSelect.addEventListener('change', applyProjectTemplate);
   }
@@ -3815,7 +3916,7 @@
   updateApiBaseUrl();
   updateAuthModeIndicator();
   updateAuthModeVisibility();
-  updateIntakeVisibility(resolveInteractiveResearchEnabled(null));
+  updateIntakeVisibility(getInteractiveFeatureState(null));
   updateStartProcessingState({ canStart: false, interactiveEnabled: resolveInteractiveResearchEnabled(null) });
   updateAuthStatus();
   syncAccessTokenFromHash();
