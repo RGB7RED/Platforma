@@ -118,6 +118,7 @@ ruff check .
 
 - `ORCH_INTERACTIVE_RESEARCH=true` — включает интерактивный intake-чат.
   - Проверка: `GET /api/features` (`interactive_research_enabled`).
+  - Интерактивный intake адаптивный: вопросы учитывают домен задачи и ответы пользователя.
 
 ### 2.4 Инфраструктура и запуск
 

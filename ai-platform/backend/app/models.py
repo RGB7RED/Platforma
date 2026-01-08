@@ -63,6 +63,8 @@ class Container:
             "next_actions": [],
             "research_chat": [],
             "research_round": [],
+            "research_facts": [],
+            "research_debug": [],
         }
         
         # Уровень 3: История изменений
