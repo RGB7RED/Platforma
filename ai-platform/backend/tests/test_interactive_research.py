@@ -2,6 +2,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app, storage, task_governor
+from app.agents import AIInterviewer
+from app.models import Container
 
 
 client = TestClient(app)
@@ -100,3 +102,48 @@ def test_start_requires_intake_complete(monkeypatch) -> None:
     )
     assert start_response.status_code == 200
     assert enqueued
+
+
+@pytest.mark.asyncio
+async def test_interviewer_landing_domain_questions() -> None:
+    interviewer = AIInterviewer({"rules": {}})
+    container = Container("landing-test")
+    result = await interviewer.execute("Сделай лендинг для кофейни", container)
+
+    questions = result.get("questions") or []
+    question_ids = {q.get("id") for q in questions if isinstance(q, dict)}
+    assert {"content", "cta", "contacts", "style"}.issubset(question_ids)
+    assert "endpoints" not in question_ids
+
+
+@pytest.mark.asyncio
+async def test_interviewer_backend_domain_questions() -> None:
+    interviewer = AIInterviewer({"rules": {}})
+    container = Container("backend-test")
+    result = await interviewer.execute("Сделай FastAPI CRUD сервис", container)
+
+    questions = result.get("questions") or []
+    question_ids = {q.get("id") for q in questions if isinstance(q, dict)}
+    assert {"data_models", "auth", "storage", "endpoints"}.issubset(question_ids)
+    assert "style" not in question_ids
+
+
+@pytest.mark.asyncio
+async def test_interviewer_dedupes_answered_fields() -> None:
+    interviewer = AIInterviewer({"rules": {}})
+    container = Container("dedupe-test")
+    await interviewer.execute("Сделай лендинг для кафе", container)
+
+    container.metadata.setdefault("research_chat", []).append(
+        {"role": "user", "content": "География СПб", "round": 1}
+    )
+    container.add_artifact(
+        "research_chat",
+        {"role": "user", "content": "География СПб", "round": 1},
+        "user",
+    )
+
+    result = await interviewer.execute("Сделай лендинг для кафе", container)
+    questions = result.get("questions") or []
+    question_ids = {q.get("id") for q in questions if isinstance(q, dict)}
+    assert "geo" not in question_ids

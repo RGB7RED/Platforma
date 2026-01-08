@@ -400,7 +400,51 @@ class AIResearcher(AIAgent):
 ## Original Task
 {requirements['user_task']}
 
-## Requirements
+"""
+
+        sections = requirements.get("sections")
+        if isinstance(sections, dict):
+            scope = sections.get("scope") or []
+            non_goals = sections.get("non_goals") or []
+            constraints = sections.get("constraints") or []
+            tech_choices = sections.get("tech_choices") or []
+            acceptance = sections.get("acceptance_criteria") or []
+
+            md += "## Scope\n"
+            for line in scope:
+                md += f"\n- {line}"
+
+            md += "\n\n## Non-goals\n"
+            if non_goals:
+                for line in non_goals:
+                    md += f"\n- {line}"
+            else:
+                md += "\n- Not specified"
+
+            md += "\n\n## Constraints\n"
+            if constraints:
+                for line in constraints:
+                    md += f"\n- {line}"
+            else:
+                md += "\n- Not specified"
+
+            md += "\n\n## Tech Choices\n"
+            if tech_choices:
+                for line in tech_choices:
+                    md += f"\n- {line}"
+            else:
+                md += "\n- Not specified"
+
+            md += "\n\n## Acceptance Criteria\n"
+            if acceptance:
+                for line in acceptance:
+                    md += f"\n- {line}"
+            else:
+                md += "\n- Not specified"
+
+            md += "\n\n"
+
+        md += """## Requirements
 """
         
         for req in requirements["requirements"]:
@@ -438,27 +482,172 @@ class AIResearcher(AIAgent):
 class AIInterviewer(AIAgent):
     """ИИ-интервьюер: интерактивное исследование с вопросами пользователю"""
 
-    QUESTION_SETS = [
-        [
-            "Кто основная целевая аудитория?",
-            "Какие услуги/оффер нужно подчеркнуть?",
-            "На какую географию ориентируемся?",
-            "Какие контакты должны быть на странице (телефон, почта, мессенджеры)?",
-            "Нужен ли адрес/карта или часы работы?",
+    MAX_ROUNDS = 3
+    HISTORY_LIMIT = 20
+    DOMAIN_FALLBACK = "website/landing"
+
+    DOMAIN_QUESTION_BANKS = {
+        "website/landing": [
+            {
+                "id": "audience",
+                "q": "Кто основная целевая аудитория?",
+                "why": "Аудитория определяет тональность и структуру лендинга.",
+            },
+            {
+                "id": "offer",
+                "q": "Какие услуги/оффер нужно подчеркнуть?",
+                "why": "Нужно выделить ключевую ценность для посетителей.",
+            },
+            {
+                "id": "content",
+                "q": "Какие материалы уже есть (тексты, фото, логотип)?",
+                "why": "Важно понять, что нужно подготовить до запуска.",
+            },
+            {
+                "id": "cta",
+                "q": "Какие обязательные призывы к действию нужны?",
+                "why": "CTA определяет цель страницы и конверсии.",
+            },
+            {
+                "id": "contacts",
+                "q": "Какие контакты должны быть на странице (телефон, почта, мессенджеры)?",
+                "why": "Контактные каналы влияют на доверие и конверсию.",
+            },
+            {
+                "id": "style",
+                "q": "Какой стиль или настроение важны (строго/минималистично/ярко)?",
+                "why": "Дизайн должен соответствовать бренду и ожиданиям аудитории.",
+            },
+            {
+                "id": "geo",
+                "q": "На какую географию ориентируемся?",
+                "why": "География влияет на язык, примеры и локальные данные.",
+            },
+            {
+                "id": "hosting",
+                "q": "Нужен ли домен/хостинг/CMS и кто будет поддерживать сайт?",
+                "why": "Технический контур влияет на выбор стека и сроков.",
+            },
         ],
-        [
-            "Какой стиль или настроение важны (строго/минималистично/ярко)?",
-            "Есть ли бренд‑гайд, логотип или фирменные цвета?",
-            "Нужны ли референсы/примеры сайтов, которые нравятся?",
-            "Какие ключевые блоки должны быть на лендинге?",
+        "backend/api": [
+            {
+                "id": "data_models",
+                "q": "Какие сущности/модели данных нужны (поля, связи)?",
+                "why": "От моделей зависит структура API и база данных.",
+            },
+            {
+                "id": "endpoints",
+                "q": "Какие эндпоинты/операции должны быть доступны?",
+                "why": "Нужно зафиксировать интерфейс API.",
+            },
+            {
+                "id": "auth",
+                "q": "Нужна ли аутентификация/авторизация? Какой тип?",
+                "why": "Без этого невозможно спроектировать безопасность.",
+            },
+            {
+                "id": "storage",
+                "q": "Какое хранилище данных использовать (Postgres, Redis и т.п.)?",
+                "why": "Выбор БД влияет на схему, миграции и деплой.",
+            },
+            {
+                "id": "integrations",
+                "q": "Нужны ли интеграции с внешними сервисами?",
+                "why": "Интеграции определяют дополнительные контракты.",
+            },
+            {
+                "id": "constraints",
+                "q": "Есть ли ограничения по нагрузке, SLA или инфраструктуре?",
+                "why": "Нужно понять нефункциональные требования.",
+            },
         ],
-        [
-            "Есть ли ограничения по объёму (только одна страница, минимум текста)?",
-            "Какие обязательные призывы к действию?",
-            "Нужны ли формы заявок или кнопки в мессенджеры?",
-            "Какие материалы уже есть (тексты, фото, иконки)?",
+        "mobile": [
+            {
+                "id": "platforms",
+                "q": "Для каких платформ нужно приложение (iOS/Android)?",
+                "why": "Определяет выбор стека и объём работы.",
+            },
+            {
+                "id": "core_features",
+                "q": "Какие ключевые сценарии/фичи должны быть в MVP?",
+                "why": "Нужно зафиксировать функциональный объём.",
+            },
+            {
+                "id": "backend",
+                "q": "Есть ли существующий backend или нужно разработать API?",
+                "why": "Влияет на архитектуру и сроки.",
+            },
+            {
+                "id": "auth",
+                "q": "Какой способ авторизации нужен (email, соцсети, SSO)?",
+                "why": "Авторизация влияет на UX и безопасность.",
+            },
+            {
+                "id": "design",
+                "q": "Есть ли дизайн-система или нужен дизайн с нуля?",
+                "why": "Определяет объём дизайн-работ.",
+            },
+            {
+                "id": "analytics",
+                "q": "Нужна ли аналитика/трекинг событий?",
+                "why": "Для оценки эффективности нужно понимать метрики.",
+            },
         ],
-    ]
+        "data/analysis": [
+            {
+                "id": "data_sources",
+                "q": "Какие источники данных нужно использовать?",
+                "why": "Определяет формат и объём данных.",
+            },
+            {
+                "id": "metrics",
+                "q": "Какие метрики/KPI нужно анализировать или отображать?",
+                "why": "Метрики формируют структуру отчётов.",
+            },
+            {
+                "id": "output",
+                "q": "Какой формат результата нужен (дашборд, отчёт, файл)?",
+                "why": "Формат влияет на инструменты и визуализацию.",
+            },
+            {
+                "id": "refresh",
+                "q": "Как часто нужно обновлять данные?",
+                "why": "Частота обновления влияет на архитектуру.",
+            },
+            {
+                "id": "access",
+                "q": "Кто будет пользоваться результатами и какие права доступа нужны?",
+                "why": "Нужны требования по доступу и ролям.",
+            },
+        ],
+        "automation": [
+            {
+                "id": "trigger",
+                "q": "Что должно запускать автоматизацию (событие, расписание)?",
+                "why": "Триггеры задают логику запуска.",
+            },
+            {
+                "id": "systems",
+                "q": "Какие системы или сервисы участвуют в процессе?",
+                "why": "Определяет интеграции и доступы.",
+            },
+            {
+                "id": "workflow",
+                "q": "Опишите шаги процесса, который нужно автоматизировать.",
+                "why": "Нужно зафиксировать бизнес-логику.",
+            },
+            {
+                "id": "error_handling",
+                "q": "Какая обработка ошибок/уведомления нужны?",
+                "why": "Без этого автоматизация может быть нестабильной.",
+            },
+            {
+                "id": "constraints",
+                "q": "Есть ли ограничения по времени выполнения или ресурсам?",
+                "why": "Ограничения важны для проектирования.",
+            },
+        ],
+    }
 
     def __init__(self, codex: Dict[str, Any]):
         super().__init__(codex, "interviewer")
@@ -467,56 +656,103 @@ class AIInterviewer(AIAgent):
         self._log_action("start_interactive_research", {"task": user_task[:100]})
 
         round_index = self._resolve_round(container)
-        if round_index < len(self.QUESTION_SETS):
-            questions = self.QUESTION_SETS[round_index]
-            message = self._format_questions(round_index + 1, questions)
-            self._store_chat_message(
-                container,
-                {"role": "assistant", "content": message, "round": round_index + 1},
+        facts = self._load_research_facts(container)
+        updated_facts = self._extract_research_facts(container, facts)
+        domain = self._resolve_domain(container, user_task, updated_facts)
+        missing_fields_all = self._missing_fields(domain, updated_facts)
+        asked_ids = self._asked_question_ids(container)
+        remaining_missing = [field_id for field_id in missing_fields_all if field_id not in asked_ids]
+        stop_early = self._should_stop_early(round_index, missing_fields_all)
+
+        if round_index >= self.MAX_ROUNDS or stop_early:
+            requirements = self._build_requirements(
+                user_task=user_task,
+                domain=domain,
+                facts=updated_facts,
             )
-            next_round = round_index + 1
+            container.add_artifact("requirements", requirements, self.role_name)
+            container.add_file("requirements.md", AIResearcher._generate_markdown(requirements))
+            container.add_file(
+                "user_stories.md",
+                "## User Stories\n\n" + "\n".join(f"- {story}" for story in requirements["user_stories"]),
+            )
+            self._log_action(
+                "interactive_research_completed",
+                {
+                    "requirements_count": len(requirements["requirements"]),
+                    "user_stories_count": len(requirements["user_stories"]),
+                    "stop_early": stop_early,
+                },
+            )
+            return requirements
+
+        next_round = round_index + 1
+        chat_history = self._collect_research_history(container)
+        questions_payload = await self._generate_questions(
+            domain=domain,
+            user_task=user_task,
+            round_number=next_round,
+            history=chat_history,
+            facts=updated_facts,
+            missing_fields=remaining_missing,
+            container=container,
+        )
+        questions = self._dedupe_questions(container, questions_payload["questions"], updated_facts)
+        remaining_missing = [
+            field_id
+            for field_id in questions_payload["missing_fields"]
+            if field_id not in updated_facts and field_id not in asked_ids
+        ]
+        if not questions and round_index < self.MAX_ROUNDS:
+            message = "Пожалуйста, ответьте на предыдущие вопросы, чтобы продолжить исследование."
+            assistant_payload = {
+                "role": "assistant",
+                "content": message,
+                "round": next_round,
+                "questions": [],
+            }
+            self._store_chat_message(container, assistant_payload)
             container.metadata["research_round"] = next_round
             container.add_artifact("research_round", {"round": next_round}, self.role_name)
             return {
                 "status": "needs_user_input",
                 "message": message,
-                "questions": questions,
+                "questions": [],
                 "round": next_round,
             }
 
-        user_inputs = self._collect_user_inputs(container)
-        if len(user_inputs) < len(self.QUESTION_SETS):
-            message = "Пожалуйста, ответьте на вопросы, чтобы завершить исследование."
-            self._store_chat_message(
-                container,
-                {"role": "assistant", "content": message, "round": round_index},
-            )
-            return {
-                "status": "needs_user_input",
-                "message": message,
-                "questions": [],
-                "round": round_index,
-            }
-
-        requirements = AIResearcher._build_requirements(user_task, user_inputs=user_inputs)
-        container.add_artifact("requirements", requirements, self.role_name)
-        container.add_file("requirements.md", AIResearcher._generate_markdown(requirements))
-        container.add_file(
-            "user_stories.md",
-            "## User Stories\n\n" + "\n".join(f"- {story}" for story in requirements["user_stories"]),
-        )
-        self._log_action(
-            "interactive_research_completed",
-            {
-                "requirements_count": len(requirements["requirements"]),
-                "user_stories_count": len(requirements["user_stories"]),
-            },
-        )
-        return requirements
+        message = self._format_questions(next_round, questions)
+        assistant_payload = {
+            "role": "assistant",
+            "content": message,
+            "round": next_round,
+            "questions": questions,
+        }
+        self._store_chat_message(container, assistant_payload)
+        container.metadata["research_round"] = next_round
+        container.add_artifact("research_round", {"round": next_round}, self.role_name)
+        debug_payload = {
+            "domain": domain,
+            "missing_fields": remaining_missing,
+            "question_ids": [question["id"] for question in questions],
+        }
+        container.metadata.setdefault("research_debug", []).append(debug_payload)
+        container.add_artifact("research_debug", debug_payload, self.role_name)
+        return {
+            "status": "needs_user_input",
+            "message": message,
+            "questions": questions,
+            "round": next_round,
+        }
 
     @staticmethod
-    def _format_questions(round_number: int, questions: List[str]) -> str:
-        formatted = "\n".join([f"{index + 1}. {question}" for index, question in enumerate(questions)])
+    def _format_questions(round_number: int, questions: List[Dict[str, Any]]) -> str:
+        formatted = "\n".join(
+            [
+                f"{index + 1}. {question['q'] if isinstance(question, dict) else question}"
+                for index, question in enumerate(questions)
+            ]
+        )
         return f"Раунд {round_number}/3. Ответьте, пожалуйста, на вопросы:\n{formatted}"
 
     @staticmethod
@@ -558,6 +794,383 @@ class AIInterviewer(AIAgent):
             if isinstance(entry, dict) and entry.get("role") == "user":
                 user_inputs.append(str(entry.get("content") or "").strip())
         return [message for message in user_inputs if message]
+
+    def _collect_research_history(self, container: Container) -> List[Dict[str, Any]]:
+        messages = []
+        metadata_chat = container.metadata.get("research_chat")
+        if isinstance(metadata_chat, list):
+            messages.extend(metadata_chat)
+        else:
+            for artifact in container.artifacts.get("research_chat", []):
+                content = artifact.content
+                if isinstance(content, dict):
+                    messages.append(content)
+        filtered = [
+            {"role": entry.get("role"), "content": entry.get("content")}
+            for entry in messages
+            if isinstance(entry, dict) and entry.get("content")
+        ]
+        return filtered[-self.HISTORY_LIMIT :]
+
+    def _load_research_facts(self, container: Container) -> Dict[str, str]:
+        facts = container.metadata.get("research_facts")
+        if isinstance(facts, dict):
+            return dict(facts)
+        artifacts = container.artifacts.get("research_facts", [])
+        if artifacts:
+            latest = artifacts[-1].content
+            if isinstance(latest, dict):
+                return dict(latest)
+        return {}
+
+    def _extract_research_facts(self, container: Container, facts: Dict[str, str]) -> Dict[str, str]:
+        latest_message = self._latest_user_message(container)
+        if not latest_message:
+            return facts
+        extracted = self._extract_facts_from_text(latest_message, facts)
+        if extracted != facts:
+            container.metadata["research_facts"] = extracted
+            container.add_artifact("research_facts", extracted, self.role_name)
+        return extracted
+
+    def _extract_facts_from_text(
+        self,
+        text: str,
+        existing: Dict[str, str],
+    ) -> Dict[str, str]:
+        updated = dict(existing)
+        lowered = text.lower()
+
+        def _set_if_missing(key: str, value: Optional[str]) -> None:
+            if not value:
+                return
+            if key not in updated:
+                updated[key] = value.strip()
+
+        geo_match = re.search(r"(географ\w*|город|регион)\s*[:\-]?\s*([^\n,.;]+)", lowered)
+        if geo_match:
+            _set_if_missing("geo", geo_match.group(2).strip())
+        elif "спб" in lowered or "санкт" in lowered:
+            _set_if_missing("geo", "Санкт-Петербург")
+
+        if any(token in lowered for token in ("аудитор", "целев", "target")):
+            _set_if_missing("audience", text.strip())
+        if any(token in lowered for token in ("оффер", "услуг", "offer", "продукт")):
+            _set_if_missing("offer", text.strip())
+        if any(token in lowered for token in ("контент", "текст", "фото", "материал")):
+            _set_if_missing("content", text.strip())
+        if any(token in lowered for token in ("cta", "призыв", "заявк", "форма")):
+            _set_if_missing("cta", text.strip())
+        if any(token in lowered for token in ("контакт", "телефон", "почта", "email", "telegram", "whatsapp")):
+            _set_if_missing("contacts", text.strip())
+        if any(token in lowered for token in ("стил", "бренд", "цвет", "дизайн")):
+            _set_if_missing("style", text.strip())
+        if any(token in lowered for token in ("домен", "хостинг", "cms")):
+            _set_if_missing("hosting", text.strip())
+        if any(token in lowered for token in ("fastapi", "django", "flask", "node", "react", "flutter")):
+            _set_if_missing("tech_stack", text.strip())
+        if any(token in lowered for token in ("auth", "jwt", "oauth", "авториза", "аутенти")):
+            _set_if_missing("auth", text.strip())
+        if any(token in lowered for token in ("postgres", "mysql", "sqlite", "redis", "s3", "database", "бд")):
+            _set_if_missing("storage", text.strip())
+        if any(token in lowered for token in ("endpoint", "эндпоинт", "ручк", "api")):
+            _set_if_missing("endpoints", text.strip())
+        if any(token in lowered for token in ("модел", "сущност", "entity", "таблиц")):
+            _set_if_missing("data_models", text.strip())
+        if any(token in lowered for token in ("огранич", "срок", "дедлайн", "deadline", "бюджет")):
+            _set_if_missing("constraints", text.strip())
+        return updated
+
+    @staticmethod
+    def _latest_user_message(container: Container) -> str:
+        metadata_chat = container.metadata.get("research_chat")
+        if isinstance(metadata_chat, list):
+            for entry in reversed(metadata_chat):
+                if isinstance(entry, dict) and entry.get("role") == "user":
+                    return str(entry.get("content") or "")
+        for artifact in reversed(container.artifacts.get("research_chat", [])):
+            content = artifact.content
+            if isinstance(content, dict) and content.get("role") == "user":
+                return str(content.get("content") or "")
+        return ""
+
+    def _resolve_domain(
+        self,
+        container: Container,
+        user_task: str,
+        facts: Dict[str, str],
+    ) -> str:
+        cached = container.metadata.get("research_domain")
+        if isinstance(cached, str) and cached:
+            return cached
+        context = " ".join([user_task, " ".join(facts.values())]).lower()
+        domain = self._classify_domain_heuristic(context)
+        container.metadata["research_domain"] = domain
+        return domain
+
+    def _classify_domain_heuristic(self, text: str) -> str:
+        if any(token in text for token in ("api", "backend", "fastapi", "crud", "rest", "graphql")):
+            return "backend/api"
+        if any(token in text for token in ("mobile", "ios", "android", "flutter", "react native")):
+            return "mobile"
+        if any(token in text for token in ("анализ", "аналит", "dashboard", "kpi", "data", "bi")):
+            return "data/analysis"
+        if any(token in text for token in ("автомат", "automation", "бот", "script", "скрипт")):
+            return "automation"
+        if any(token in text for token in ("лендинг", "landing", "сайт", "website", "web")):
+            return "website/landing"
+        return self.DOMAIN_FALLBACK
+
+    def _missing_fields(self, domain: str, facts: Dict[str, str]) -> List[str]:
+        bank = self.DOMAIN_QUESTION_BANKS.get(domain) or self.DOMAIN_QUESTION_BANKS[self.DOMAIN_FALLBACK]
+        return [entry["id"] for entry in bank if entry["id"] not in facts]
+
+    def _asked_question_ids(self, container: Container) -> set[str]:
+        asked: set[str] = set()
+        metadata_chat = container.metadata.get("research_chat")
+        if isinstance(metadata_chat, list):
+            messages = metadata_chat
+        else:
+            messages = [artifact.content for artifact in container.artifacts.get("research_chat", [])]
+        for entry in messages:
+            if not isinstance(entry, dict):
+                continue
+            questions = entry.get("questions") or []
+            if not isinstance(questions, list):
+                continue
+            for question in questions:
+                if isinstance(question, dict) and question.get("id"):
+                    asked.add(str(question["id"]))
+        return asked
+
+    def _dedupe_questions(
+        self,
+        container: Container,
+        questions: List[Dict[str, Any]],
+        facts: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        asked_ids = self._asked_question_ids(container)
+        deduped = []
+        for question in questions:
+            if not isinstance(question, dict):
+                continue
+            question_id = question.get("id")
+            if not question_id:
+                continue
+            if question_id in facts or question_id in asked_ids:
+                continue
+            deduped.append(question)
+        return deduped
+
+    def _should_stop_early(self, round_index: int, missing_fields: List[str]) -> bool:
+        if round_index < 1:
+            return False
+        return len(missing_fields) == 0
+
+    async def _generate_questions(
+        self,
+        *,
+        domain: str,
+        user_task: str,
+        round_number: int,
+        history: List[Dict[str, Any]],
+        facts: Dict[str, str],
+        missing_fields: List[str],
+        container: Container,
+    ) -> Dict[str, Any]:
+        settings = load_llm_settings()
+        provider = get_llm_provider(settings)
+        if provider.name == "mock":
+            return self._generate_questions_from_bank(domain, round_number, missing_fields)
+
+        try:
+            response = await self._generate_questions_with_llm(
+                provider=provider,
+                settings=settings,
+                domain=domain,
+                user_task=user_task,
+                round_number=round_number,
+                history=history,
+                facts=facts,
+                missing_fields=missing_fields,
+                container=container,
+            )
+            return response
+        except (LLMProviderError, LLMInvalidResponseError, LLMOutputTruncatedError, json.JSONDecodeError):
+            self._log_action("llm_failed", {"error": "question_generation_failed"})
+            return self._generate_questions_from_bank(domain, round_number, missing_fields)
+
+    async def _generate_questions_with_llm(
+        self,
+        *,
+        provider,
+        settings,
+        domain: str,
+        user_task: str,
+        round_number: int,
+        history: List[Dict[str, Any]],
+        facts: Dict[str, str],
+        missing_fields: List[str],
+        container: Container,
+    ) -> Dict[str, Any]:
+        prompt_payload = {
+            "task_description": user_task,
+            "domain": domain,
+            "round": round_number,
+            "known_fields": facts,
+            "missing_fields": missing_fields,
+            "history": history,
+            "output_contract": {
+                "round": "int",
+                "questions": [{"id": "string", "q": "string", "why": "string"}],
+                "missing_fields": ["string"],
+                "stop_early": "bool",
+            },
+            "instructions": (
+                "Return ONLY valid JSON. Provide 3-7 questions. "
+                "Use stable ids, avoid asking answered fields, and be domain-specific."
+            ),
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an adaptive intake interviewer. Respond with strict JSON only.",
+            },
+            {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)},
+        ]
+        response = await generate_with_retry(provider, messages, settings, require_json=True)
+        usage = response.get("usage", {}) or {}
+        container.record_llm_usage(
+            stage="research",
+            provider=provider.name,
+            model=settings.model,
+            tokens_in=int(usage.get("input_tokens", 0) or 0),
+            tokens_out=int(usage.get("output_tokens", 0) or 0),
+            metadata={"purpose": "interactive_questions"},
+        )
+        return self._parse_question_payload(
+            response.get("text", ""),
+            round_number=round_number,
+            missing_fields=missing_fields,
+        )
+
+    def _parse_question_payload(
+        self,
+        text: str,
+        *,
+        round_number: int,
+        missing_fields: List[str],
+    ) -> Dict[str, Any]:
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise json.JSONDecodeError("Expected JSON object", text, 0)
+        questions = payload.get("questions")
+        if not isinstance(questions, list):
+            raise json.JSONDecodeError("Invalid questions", text, 0)
+        normalized_questions = []
+        for entry in questions:
+            if not isinstance(entry, dict):
+                continue
+            question_id = entry.get("id")
+            question_text = entry.get("q")
+            if not question_id or not question_text:
+                continue
+            normalized_questions.append(
+                {
+                    "id": str(question_id),
+                    "q": str(question_text),
+                    "why": str(entry.get("why") or ""),
+                }
+            )
+        if not normalized_questions:
+            raise json.JSONDecodeError("Empty questions", text, 0)
+        selected_missing = payload.get("missing_fields")
+        if not isinstance(selected_missing, list):
+            selected_missing = missing_fields
+        return {
+            "round": int(payload.get("round") or round_number),
+            "questions": normalized_questions[:7],
+            "missing_fields": [str(field) for field in selected_missing],
+            "stop_early": bool(payload.get("stop_early")),
+        }
+
+    def _generate_questions_from_bank(
+        self,
+        domain: str,
+        round_number: int,
+        missing_fields: List[str],
+    ) -> Dict[str, Any]:
+        bank = self.DOMAIN_QUESTION_BANKS.get(domain) or self.DOMAIN_QUESTION_BANKS[self.DOMAIN_FALLBACK]
+        questions = [entry for entry in bank if entry["id"] in missing_fields]
+        if len(questions) < 3:
+            extra = [entry for entry in bank if entry["id"] not in missing_fields]
+            questions.extend(extra[: max(0, 3 - len(questions))])
+        return {
+            "round": round_number,
+            "questions": questions[:7],
+            "missing_fields": list(dict.fromkeys(missing_fields)),
+            "stop_early": False,
+        }
+
+    @staticmethod
+    def _build_requirements(
+        *,
+        user_task: str,
+        domain: str,
+        facts: Dict[str, str],
+    ) -> Dict[str, Any]:
+        scope_lines = [user_task]
+        if "offer" in facts:
+            scope_lines.append(f"Оффер/услуги: {facts['offer']}")
+        if "content" in facts:
+            scope_lines.append(f"Контент: {facts['content']}")
+        if "cta" in facts:
+            scope_lines.append(f"CTA: {facts['cta']}")
+        if "endpoints" in facts:
+            scope_lines.append(f"Эндпоинты: {facts['endpoints']}")
+        if "data_models" in facts:
+            scope_lines.append(f"Модели данных: {facts['data_models']}")
+        if "core_features" in facts:
+            scope_lines.append(f"Ключевые фичи: {facts['core_features']}")
+        if "workflow" in facts:
+            scope_lines.append(f"Процесс автоматизации: {facts['workflow']}")
+
+        constraints = []
+        if "constraints" in facts:
+            constraints.append(facts["constraints"])
+
+        tech_choices = []
+        if "tech_stack" in facts:
+            tech_choices.append(facts["tech_stack"])
+        if "storage" in facts:
+            tech_choices.append(f"Хранилище: {facts['storage']}")
+
+        acceptance = [
+            "Реализованный результат соответствует описанному scope.",
+        ]
+        if "cta" in facts:
+            acceptance.append("CTA и формы/контакты настроены и отображаются корректно.")
+        if "endpoints" in facts:
+            acceptance.append("Все заявленные API эндпоинты работают и документированы.")
+
+        return {
+            "user_task": user_task,
+            "domain": domain,
+            "analyzed_at": datetime.now().isoformat(),
+            "facts": facts,
+            "sections": {
+                "scope": scope_lines,
+                "non_goals": [],
+                "constraints": constraints,
+                "tech_choices": tech_choices,
+                "acceptance_criteria": acceptance,
+            },
+            "requirements": [],
+            "user_stories": [],
+            "assumptions": [],
+            "technical_constraints": constraints,
+            "questions_to_user": [],
+        }
 
 
 class AIDesigner(AIAgent):
